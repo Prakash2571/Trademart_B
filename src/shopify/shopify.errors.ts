@@ -9,6 +9,7 @@
  */
 
 import { AppError } from '../common/errors';
+import { redact } from '../common/logger';
 
 /** Shape of an entry in the top-level GraphQL `errors` array. */
 export interface ShopifyGraphqlError {
@@ -212,9 +213,18 @@ export function mapTokenFailure(
   body: { error?: unknown; error_description?: unknown },
 ): AppError {
   const error = typeof body.error === 'string' ? body.error : '';
-  const description =
+  const rawDescription =
     typeof body.error_description === 'string' ? body.error_description : '';
-  const combined = `${error} ${description}`.toLowerCase();
+
+  // Anything echoed back to the client is redacted first. Shopify does not
+  // normally include credentials in an error, but a message that is surfaced
+  // over HTTP must never be capable of leaking one.
+  const description = redact(rawDescription);
+
+  const combined = `${error} ${rawDescription}`.toLowerCase();
+  // Matched separately: joining `error` and the description can create
+  // accidental substrings (e.g. "invalid_client" + "secret").
+  const descriptionText = rawDescription.toLowerCase();
   const details = { status, error: error || undefined, description: description || undefined };
 
   // Documented response when the app has not been installed on the store.
@@ -231,15 +241,17 @@ export function mapTokenFailure(
 
   // Shopify names the offending field, e.g. "Missing or invalid client secret".
   // Pass that through with the specific remedy attached.
-  if (combined.includes('client secret')) {
+  if (descriptionText.includes('client secret')) {
+    // Shopify named the secret, which means it matched client_id to an app
+    // first - so the client id is fine and only the secret is wrong.
     return new AppError(
       'SHOPIFY_AUTH_FAILED',
-      'Shopify rejected the client secret ("Missing or invalid client secret"). Copy SHOPIFY_CLIENT_SECRET again from Dev Dashboard -> your app -> Settings, check for stray spaces or quotes in .env, and restart the backend.',
+      `Shopify rejected the client secret (HTTP ${status}: "${description}"). The client ID was accepted, so only SHOPIFY_CLIENT_SECRET is wrong. Regenerate or re-copy the client secret from the SAME app that owns this client ID, then restart the backend.`,
       { details },
     );
   }
 
-  if (combined.includes('client id') || combined.includes('client_id')) {
+  if (descriptionText.includes('client id') || descriptionText.includes('client_id')) {
     return new AppError(
       'SHOPIFY_AUTH_FAILED',
       'Shopify rejected the client ID. Copy SHOPIFY_CLIENT_ID again from Dev Dashboard -> your app -> Settings and restart the backend.',

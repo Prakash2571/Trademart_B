@@ -424,7 +424,9 @@ describe('mapTokenFailure', () => {
     assert.equal(error.code, 'SHOPIFY_AUTH_FAILED');
     assert.equal(error.retryable, false);
     assert.match(error.message, /SHOPIFY_CLIENT_SECRET/);
-    assert.match(error.message, /spaces or quotes/);
+    // The HTTP status is included so the failure mode is diagnosable.
+    assert.match(error.message, /HTTP 400/);
+    assert.match(error.message, /Missing or invalid client secret/);
   });
 
   it('gives a specific remedy for an invalid client id', () => {
@@ -460,5 +462,27 @@ describe('mapTokenFailure', () => {
       error_description: 'secret shpss_abc123 rejected',
     });
     assert.equal(error.message.includes('shpss_abc123'), false);
+  });
+
+  it('redacts a token-shaped value even when it names the client secret', () => {
+    // Guards the branch that quotes Shopify's description back to the caller.
+    const error = mapTokenFailure(400, {
+      error: 'invalid_request',
+      error_description: 'Missing or invalid client secret shpat_leakme123',
+    });
+
+    assert.equal(error.message.includes('shpat_leakme123'), false);
+    assert.match(error.message, /REDACTED/);
+  });
+
+  it('does not misclassify invalid_client as a client-secret problem', () => {
+    // "invalid_client" + "secret" must not join into the substring
+    // "client secret" and select the wrong branch.
+    const error = mapTokenFailure(401, {
+      error: 'invalid_client',
+      error_description: 'secret rejected',
+    });
+
+    assert.match(error.message, /Shopify rejected the app credentials/);
   });
 });
