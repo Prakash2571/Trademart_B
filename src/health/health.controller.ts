@@ -29,6 +29,7 @@ healthRouter.get('/health', (_req, res) => {
       },
       shopify: {
         configured: isShopifyConfigured(),
+        authStrategy: config.shopify.authStrategy,
         storeDomain: config.shopify.storeDomain,
         apiVersion: config.shopify.apiVersion,
       },

@@ -50,8 +50,9 @@ All secrets live here and **never** leave the server. Never commit `.env`.
 | `MONGODB_URI` | no in dev | — | Blank = run without persistence. Required when `NODE_ENV=production`. |
 | `SHOPIFY_STORE_DOMAIN` | **yes** | — | Must be the `.myshopify.com` domain. |
 | `SHOPIFY_API_VERSION` | no | `2026-07` | Format `YYYY-MM`. |
-| `SHOPIFY_ACCESS_TOKEN` | no in dev | — | Admin API token (`shpat_…`). Without it, Shopify routes return `SHOPIFY_NOT_CONFIGURED`. |
-| `SHOPIFY_CLIENT_ID` / `SHOPIFY_CLIENT_SECRET` | no | — | Only needed for merchant OAuth (not in this milestone). |
+| `SHOPIFY_CLIENT_ID` | no in dev, **yes in prod** | — | From the Dev Dashboard. Half a pair is a startup error. |
+| `SHOPIFY_CLIENT_SECRET` | no in dev, **yes in prod** | — | Paired with the client id. |
+| `SHOPIFY_ACCESS_TOKEN` | no | — | **Optional override.** Disables automatic refresh — see below. |
 | `SHOPIFY_WEBHOOK_SECRET` | no | — | Required before webhook deliveries are accepted. |
 
 Config is validated at boot. Structural mistakes (bad port, an
@@ -86,6 +87,20 @@ npm run typecheck    # tsc --noEmit
 npm test             # compile + run unit tests
 npm run shopify:ping # manual integration test against the real store
 ```
+
+### Minimum config to be useful
+
+Only three values, and nothing to paste by hand beyond the app credentials:
+
+```env
+SHOPIFY_STORE_DOMAIN=teststoremart-uk8mmby.myshopify.com
+SHOPIFY_CLIENT_ID=...
+SHOPIFY_CLIENT_SECRET=...
+```
+
+`SHOPIFY_STORE_DOMAIN` is the only variable that will stop the server booting if
+absent, and it is pre-filled in `.env.example`. Everything else defaults or
+degrades with a warning.
 
 Verify it is alive:
 
@@ -144,11 +159,96 @@ Shopify ids are stored as **strings** because they are GIDs
 The **Trademart** app already exists in the Shopify Dev Dashboard — this project
 does not create or modify it.
 
-1. Open your app in the Shopify Dev Dashboard.
-2. Confirm the Admin API scopes you need are enabled (see below).
-3. Install / update the app on the development store.
-4. Copy the **Admin API access token** into `SHOPIFY_ACCESS_TOKEN`.
+1. Open your app in the Shopify Dev Dashboard → **Settings**.
+2. Copy the **Client ID** and **Client secret** into `.env`.
+3. Confirm the Admin API scopes you need are enabled (see below).
+4. **Install / update the app on the development store** — the client
+   credentials grant only works on stores where the app is installed.
 5. Restart the backend.
+
+There is no access token to copy. See the next section for why.
+
+### Authentication: client credentials grant
+
+The backend authenticates itself using the app's own credentials, with no human
+interaction:
+
+```
+POST https://{shop}.myshopify.com/admin/oauth/access_token
+{ "client_id": "…", "client_secret": "…", "grant_type": "client_credentials" }
+
+→ { "access_token": "shpat_…", "scope": "read_products,read_orders", "expires_in": 86399 }
+```
+
+These tokens are **short-lived** — `expires_in` is typically 86399 (~24h) but
+3599 (~1h) also occurs — so the lifetime is always read from the response and
+never assumed. The backend:
+
+- caches the token in memory and reuses it across requests
+- refreshes it automatically ~5 minutes before expiry (capped at half the
+  lifetime, so very short-lived tokens can't cause a refresh loop)
+- **coalesces concurrent requests** into a single token request, so a burst of
+  traffic never triggers a stampede of token calls
+- on a `401` from the Admin API, discards the token and re-authenticates **once**
+  before surfacing the error — covering revoked or early-rotated tokens
+- never logs or returns the token value
+
+Reference:
+[client credentials grant](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/client-credentials-grant)
+·
+[Dev Dashboard tokens](https://shopify.dev/docs/apps/build/dev-dashboard/get-api-access-tokens)
+
+Inspect the live state any time — no secrets are returned:
+
+```bash
+curl http://localhost:4000/api/shopify/status | jq .data.token
+```
+
+```json
+{
+  "strategy": "CLIENT_CREDENTIALS",
+  "cached": true,
+  "expiresAt": "2026-08-13T08:12:44.000Z",
+  "expiresInSeconds": 86031,
+  "scopes": ["read_products", "read_orders", "read_inventory"],
+  "fetchCount": 1,
+  "lastFetchedAt": "2026-08-12T08:12:45.000Z",
+  "lastError": null
+}
+```
+
+`scopes` is a genuine bonus of this flow: Shopify reports what it actually
+granted, so a missing scope is visible before any query is attempted.
+
+### `SHOPIFY_ACCESS_TOKEN` — optional override
+
+Setting it makes the backend use that token verbatim and **disables automatic
+refresh** (`authStrategy` becomes `STATIC_TOKEN`, and a startup warning is
+logged). Leave it blank unless you specifically need it — for an admin-created
+custom app that issued a long-lived `shpat_` token, or to debug against a known
+token. If both it and the client credentials are set, the static token wins.
+
+### Adding merchant OAuth later
+
+Multi-merchant OAuth is deliberately **not** implemented, but the seam for it
+exists. Everything obtains tokens through `ShopifyTokenProvider`
+(`src/shopify/token/token.types.ts`), and every method is already keyed by
+**shop domain**:
+
+```ts
+interface ShopifyTokenProvider {
+  readonly strategy: 'CLIENT_CREDENTIALS' | 'STATIC_TOKEN' | 'OAUTH_OFFLINE';
+  readonly canRefresh: boolean;
+  getAccessToken(shopDomain: string): Promise<CachedToken>;
+  invalidate(shopDomain: string): void;
+  describe(shopDomain: string): TokenDiagnostics;
+}
+```
+
+To add per-merchant OAuth: implement an `OAUTH_OFFLINE` provider that resolves
+tokens per shop from the database (encrypted at rest) and return it from
+`src/shopify/token/index.ts`. The client, services and controllers need no
+changes — they already pass a shop domain and never see a credential.
 
 ### Scopes and what breaks without them
 
@@ -186,9 +286,11 @@ scope is immediately obvious:
 Trademart -> Shopify connection test
   store        : teststoremart-uk8mmby.myshopify.com
   api version  : 2026-07
-  token present: yes
+  auth strategy: CLIENT_CREDENTIALS
 
 Results
+  [PASS] access token (client credentials grant)
+         CLIENT_CREDENTIALS | expires in 86399s | granted scopes: read_products, read_orders
   [PASS] shop (connection test)
          Test Store Mart | teststoremart-uk8mmby.myshopify.com | plan=… | currency=…
   [PASS] products (read_products)
@@ -241,7 +343,8 @@ Envelopes are consistent:
 
 ### Error codes
 
-`SHOPIFY_NOT_CONFIGURED`, `SHOPIFY_UNAUTHORIZED`, `SHOPIFY_SCOPE_MISSING`,
+`SHOPIFY_NOT_CONFIGURED`, `SHOPIFY_AUTH_FAILED`, `SHOPIFY_APP_NOT_INSTALLED`,
+`SHOPIFY_UNAUTHORIZED`, `SHOPIFY_SCOPE_MISSING`,
 `SHOPIFY_THROTTLED`, `SHOPIFY_GRAPHQL_ERROR`, `SHOPIFY_USER_ERROR`,
 `SHOPIFY_HTTP_ERROR`, `SHOPIFY_NETWORK_ERROR`, `SHOPIFY_NOT_FOUND`,
 `VALIDATION_ERROR`, `NOT_FOUND`, `DATABASE_UNAVAILABLE`, `RATE_LIMITED`,
@@ -348,6 +451,7 @@ network required**. Shopify payloads are mocked.
 | Shopify error handling | `src/shopify/shopify.errors.test.ts` |
 | Retry / backoff policy | `src/shopify/shopify.throttle.test.ts` |
 | Environment / config validation | `src/config/env.validation.test.ts` |
+| Token caching, refresh, single-flight | `src/shopify/token/token.test.ts` |
 | Webhook HMAC verification | `src/webhooks/webhook.verify.test.ts` |
 | Supplier classification | `src/suppliers/supplier.registry.test.ts` |
 | Shopify → DTO mapping | `src/shopify/shopify.mappers.test.ts` |

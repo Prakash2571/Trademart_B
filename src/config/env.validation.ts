@@ -14,6 +14,14 @@
 
 export type NodeEnv = 'development' | 'test' | 'production';
 
+/**
+ * How the backend obtains an Admin API access token.
+ *  CLIENT_CREDENTIALS - exchange client id/secret automatically (preferred)
+ *  STATIC_TOKEN       - a pre-issued token supplied via SHOPIFY_ACCESS_TOKEN
+ *  NONE               - no credentials; Shopify routes report not configured
+ */
+export type ShopifyAuthStrategy = 'CLIENT_CREDENTIALS' | 'STATIC_TOKEN' | 'NONE';
+
 export interface ShopifyConfig {
   storeDomain: string;
   apiVersion: string;
@@ -21,8 +29,11 @@ export interface ShopifyConfig {
   clientId: string | null;
   clientSecret: string | null;
   webhookSecret: string | null;
+  authStrategy: ShopifyAuthStrategy;
   /** Fully-qualified GraphQL Admin API endpoint. */
   graphqlEndpoint: string;
+  /** Endpoint used by the client credentials grant. */
+  tokenEndpoint: string;
 }
 
 export interface AppConfig {
@@ -157,12 +168,48 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
   }
 
   // ---- Credentials -------------------------------------------------------
+  //
+  // Client credentials is the primary path: the app exchanges its own id and
+  // secret for a short-lived token automatically, so nothing is pasted by hand.
+  // SHOPIFY_ACCESS_TOKEN remains an explicit override for pre-issued tokens.
+  const clientId = read(env, 'SHOPIFY_CLIENT_ID');
+  const clientSecret = read(env, 'SHOPIFY_CLIENT_SECRET');
   const accessToken = read(env, 'SHOPIFY_ACCESS_TOKEN');
-  if (accessToken === null) {
+
+  const hasClientCredentials = clientId !== null && clientSecret !== null;
+
+  // Half-configured credentials are always a mistake, never a deliberate state.
+  if (clientId !== null && clientSecret === null) {
+    errors.push('SHOPIFY_CLIENT_SECRET is required when SHOPIFY_CLIENT_ID is set.');
+  }
+  if (clientSecret !== null && clientId === null) {
+    errors.push('SHOPIFY_CLIENT_ID is required when SHOPIFY_CLIENT_SECRET is set.');
+  }
+
+  let authStrategy: ShopifyAuthStrategy = 'NONE';
+  if (accessToken !== null) {
+    authStrategy = 'STATIC_TOKEN';
+    if (hasClientCredentials) {
+      warnings.push(
+        'Both SHOPIFY_ACCESS_TOKEN and client credentials are set - the static token takes precedence. Unset SHOPIFY_ACCESS_TOKEN to use automatic token refresh.',
+      );
+    } else {
+      warnings.push(
+        'Using the SHOPIFY_ACCESS_TOKEN override. Prefer SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET so tokens refresh automatically.',
+      );
+    }
+  } else if (hasClientCredentials) {
+    authStrategy = 'CLIENT_CREDENTIALS';
+  } else {
     const message =
-      'SHOPIFY_ACCESS_TOKEN not set - Shopify endpoints will return SHOPIFY_NOT_CONFIGURED until it is supplied.';
-    if (isProduction) errors.push('SHOPIFY_ACCESS_TOKEN is required when NODE_ENV=production.');
-    else warnings.push(message);
+      'No Shopify credentials set - Shopify endpoints will return SHOPIFY_NOT_CONFIGURED. Set SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET.';
+    if (isProduction) {
+      errors.push(
+        'Shopify authentication is required when NODE_ENV=production: set SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET.',
+      );
+    } else {
+      warnings.push(message);
+    }
   }
 
   const webhookSecret = read(env, 'SHOPIFY_WEBHOOK_SECRET');
@@ -187,10 +234,12 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
         storeDomain,
         apiVersion,
         accessToken,
-        clientId: read(env, 'SHOPIFY_CLIENT_ID'),
-        clientSecret: read(env, 'SHOPIFY_CLIENT_SECRET'),
+        clientId,
+        clientSecret,
         webhookSecret,
+        authStrategy,
         graphqlEndpoint: `https://${storeDomain}/admin/api/${apiVersion}/graphql.json`,
+        tokenEndpoint: `https://${storeDomain}/admin/oauth/access_token`,
       },
     },
     errors,

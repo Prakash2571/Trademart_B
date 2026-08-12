@@ -14,7 +14,9 @@
 
 import { AppError } from '../common/errors';
 import { logger } from '../common/logger';
-import { config, isShopifyConfigured } from '../config';
+import { config } from '../config';
+import { getTokenProvider } from './token';
+import type { ShopifyTokenProvider, TokenDiagnostics } from './token/token.types';
 import {
   mapGraphqlErrors,
   mapHttpFailure,
@@ -49,14 +51,22 @@ export function getLastThrottleStatus(): ShopifyCostExtension | null {
   return lastCost;
 }
 
-function assertConfigured(): string {
-  if (!isShopifyConfigured() || config.shopify.accessToken === null) {
+function requireTokenProvider(): ShopifyTokenProvider {
+  const provider = getTokenProvider();
+  if (provider === null) {
     throw new AppError(
       'SHOPIFY_NOT_CONFIGURED',
-      'Shopify is not configured. Set SHOPIFY_ACCESS_TOKEN in the backend .env file and restart the server.',
+      'Shopify is not configured. Set SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET in the backend .env file and restart the server.',
     );
   }
-  return config.shopify.accessToken;
+  return provider;
+}
+
+/** Non-secret token status for the diagnostics endpoints. */
+export function getTokenDiagnostics(): TokenDiagnostics | null {
+  const provider = getTokenProvider();
+  if (provider === null) return null;
+  return provider.describe(config.shopify.storeDomain);
 }
 
 async function executeOnce<T>(
@@ -143,10 +153,37 @@ export async function shopifyGraphql<T>(
   variables: Record<string, unknown> = {},
   meta: { operation: string } = { operation: 'anonymous' },
 ): Promise<GraphqlResult<T>> {
-  const accessToken = assertConfigured();
+  const provider = requireTokenProvider();
+  const shopDomain = config.shopify.storeDomain;
   let lastError: AppError | null = null;
+  // A 401 gets one free re-auth attempt; it must not consume a throttle retry.
+  let reauthenticated = false;
+  let attempt = 0;
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+  while (attempt < MAX_ATTEMPTS) {
+    attempt += 1;
+
+    // The provider serves a cached token and only contacts Shopify when the
+    // current one is missing or close to expiry.
+    let accessToken: string;
+    try {
+      const token = await provider.getAccessToken(shopDomain);
+      accessToken = token.accessToken;
+    } catch (error) {
+      const appError = error instanceof AppError ? error : mapNetworkFailure(error);
+      lastError = appError;
+      if (!appError.retryable || attempt === MAX_ATTEMPTS) {
+        logger.warn('Could not obtain a Shopify access token.', {
+          operation: meta.operation,
+          attempt,
+          code: appError.code,
+        });
+        throw appError;
+      }
+      await sleep(computeBackoffDelay(attempt));
+      continue;
+    }
+
     try {
       const result = await executeOnce<T>(query, variables, accessToken);
       if (attempt > 1) {
@@ -159,6 +196,24 @@ export async function shopifyGraphql<T>(
     } catch (error) {
       const appError = error instanceof AppError ? error : mapNetworkFailure(error);
       lastError = appError;
+
+      // Shopify rejected the token. If we can mint a new one (client
+      // credentials), the token was probably revoked or rotated early - discard
+      // it and try once more. A static token cannot be refreshed, so it falls
+      // through and surfaces the error.
+      if (
+        appError.code === 'SHOPIFY_UNAUTHORIZED' &&
+        provider.canRefresh &&
+        !reauthenticated
+      ) {
+        reauthenticated = true;
+        provider.invalidate(shopDomain);
+        logger.warn('Shopify rejected the access token; re-authenticating once.', {
+          operation: meta.operation,
+        });
+        attempt -= 1;
+        continue;
+      }
 
       // Permission/config errors are terminal - do not hammer Shopify.
       if (!appError.retryable || attempt === MAX_ATTEMPTS) {

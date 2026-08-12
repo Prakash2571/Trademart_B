@@ -197,6 +197,87 @@ export function mapUserErrors(
   });
 }
 
+/**
+ * Maps a failed POST /admin/oauth/access_token (client credentials grant).
+ *
+ * Shopify returns OAuth-style bodies: `{ error, error_description }`. The two
+ * failures that actually happen in practice are wrong client credentials and
+ * the app not being installed on the shop, which need very different fixes -
+ * so they are distinguished rather than collapsed into "unauthorized".
+ *
+ * None of these are retryable: retrying a bad secret forever is pointless.
+ */
+export function mapTokenFailure(
+  status: number,
+  body: { error?: unknown; error_description?: unknown },
+): AppError {
+  const error = typeof body.error === 'string' ? body.error : '';
+  const description =
+    typeof body.error_description === 'string' ? body.error_description : '';
+  const combined = `${error} ${description}`.toLowerCase();
+  const details = { status, error: error || undefined, description: description || undefined };
+
+  // Documented response when the app has not been installed on the store.
+  if (
+    combined.includes('cannot be performed on this shop') ||
+    combined.includes('not installed')
+  ) {
+    return new AppError(
+      'SHOPIFY_APP_NOT_INSTALLED',
+      'Shopify refused the client credentials grant because the Trademart app is not installed on this store. Install/update the app on the store, then retry.',
+      { details },
+    );
+  }
+
+  if (status === 401 || status === 403 || combined.includes('invalid_client')) {
+    return new AppError(
+      'SHOPIFY_AUTH_FAILED',
+      'Shopify rejected the app credentials. Check SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET match the app in the Dev Dashboard.',
+      { details },
+    );
+  }
+
+  if (combined.includes('unsupported_grant_type') || combined.includes('invalid_grant')) {
+    return new AppError(
+      'SHOPIFY_AUTH_FAILED',
+      'Shopify rejected the client credentials grant for this app. Confirm the app supports the client credentials grant in the Dev Dashboard.',
+      { details },
+    );
+  }
+
+  if (status === 404) {
+    return new AppError(
+      'SHOPIFY_AUTH_FAILED',
+      'The token endpoint returned 404. Verify SHOPIFY_STORE_DOMAIN is the .myshopify.com domain.',
+      { details },
+    );
+  }
+
+  if (status === 429) {
+    return new AppError(
+      'SHOPIFY_THROTTLED',
+      'Shopify throttled the access token request. Retrying shortly.',
+      { retryable: true, details },
+    );
+  }
+
+  if (status >= 500) {
+    return new AppError(
+      'SHOPIFY_AUTH_FAILED',
+      `Shopify returned ${status} while issuing an access token. This is usually temporary.`,
+      { retryable: true, details },
+    );
+  }
+
+  return new AppError(
+    'SHOPIFY_AUTH_FAILED',
+    description.length > 0
+      ? `Could not obtain a Shopify access token: ${description}`
+      : `Could not obtain a Shopify access token (HTTP ${status}).`,
+    { details },
+  );
+}
+
 /** Maps fetch/DNS/timeout failures. */
 export function mapNetworkFailure(error: unknown): AppError {
   const reason = error instanceof Error ? error.message : 'Unknown network error.';

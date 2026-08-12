@@ -20,6 +20,7 @@ import {
   listOrders,
   listProducts,
 } from '../shopify/shopify.service';
+import { getTokenProvider } from '../shopify/token';
 
 type CheckResult = { name: string; ok: boolean; detail: string };
 
@@ -43,15 +44,36 @@ async function main(): Promise<void> {
   console.log(`  store        : ${config.shopify.storeDomain}`);
   console.log(`  api version  : ${config.shopify.apiVersion}`);
   console.log(`  endpoint     : ${config.shopify.graphqlEndpoint}`);
-  console.log(`  token present: ${isShopifyConfigured() ? 'yes' : 'NO'}`);
+  console.log(`  auth strategy: ${config.shopify.authStrategy}`);
   console.log('');
 
   if (!isShopifyConfigured()) {
-    console.error('SHOPIFY_ACCESS_TOKEN is not set. Add it to .env and re-run.');
+    console.error(
+      'No Shopify credentials configured. Set SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET in .env and re-run.',
+    );
     process.exit(1);
   }
 
   const results: CheckResult[] = [];
+
+  // Proves the client credentials grant works before anything else is tried.
+  results.push(
+    await check('access token (client credentials grant)', async () => {
+      const provider = getTokenProvider();
+      if (provider === null) throw new Error('No token provider configured.');
+      await provider.getAccessToken(config.shopify.storeDomain);
+      const diagnostics = provider.describe(config.shopify.storeDomain);
+      const lifetime =
+        diagnostics.expiresInSeconds === null
+          ? 'no expiry reported'
+          : `expires in ${diagnostics.expiresInSeconds}s`;
+      const scopes =
+        diagnostics.scopes.length > 0
+          ? `granted scopes: ${diagnostics.scopes.join(', ')}`
+          : 'granted scopes not reported';
+      return `${diagnostics.strategy} | ${lifetime} | ${scopes}`;
+    }),
+  );
 
   results.push(
     await check('shop (connection test)', async () => {
@@ -111,7 +133,17 @@ async function main(): Promise<void> {
     console.log(`         ${result.detail}`);
   }
 
-  const shopCheck = results[0];
+  // Gate on authentication first, then the shop query - if the token could not
+  // be obtained, every later failure is just a consequence of that.
+  const tokenCheck = results[0];
+  if (!tokenCheck?.ok) {
+    console.error(
+      '\nConnection test FAILED - could not obtain an access token. Check SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET and that the app is installed on the store.',
+    );
+    process.exit(1);
+  }
+
+  const shopCheck = results[1];
   if (!shopCheck?.ok) {
     console.error('\nConnection test FAILED - the shop query did not succeed.');
     process.exit(1);

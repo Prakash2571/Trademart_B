@@ -9,7 +9,8 @@ import { validateEnv } from './env.validation';
 
 const VALID = {
   SHOPIFY_STORE_DOMAIN: 'teststoremart-uk8mmby.myshopify.com',
-  SHOPIFY_ACCESS_TOKEN: 'shpat_example',
+  SHOPIFY_CLIENT_ID: 'client-id-example',
+  SHOPIFY_CLIENT_SECRET: 'client-secret-example',
   MONGODB_URI: 'mongodb://127.0.0.1:27017/trademart',
   FRONTEND_URL: 'http://localhost:3000',
 } as const;
@@ -65,7 +66,7 @@ describe('validateEnv', () => {
   });
 
   it('requires the store domain', () => {
-    const result = validateEnv({ SHOPIFY_ACCESS_TOKEN: 'shpat_x' });
+    const result = validateEnv({ SHOPIFY_CLIENT_ID: 'x', SHOPIFY_CLIENT_SECRET: 'y' });
 
     assert.equal(result.config, null);
     assert.ok(result.errors.some((error) => error.includes('SHOPIFY_STORE_DOMAIN')));
@@ -99,18 +100,18 @@ describe('validateEnv', () => {
     assert.deepEqual(result.errors, []);
   });
 
-  it('warns but still boots when the token and Mongo URI are missing in development', () => {
+  it('warns but still boots when credentials and Mongo URI are missing in development', () => {
     const result = validateEnv({ SHOPIFY_STORE_DOMAIN: VALID.SHOPIFY_STORE_DOMAIN });
 
     assert.deepEqual(result.errors, []);
     assert.ok(result.config);
-    assert.equal(result.config.shopify.accessToken, null);
+    assert.equal(result.config.shopify.authStrategy, 'NONE');
     assert.equal(result.config.mongoUri, null);
-    assert.ok(result.warnings.some((warning) => warning.includes('SHOPIFY_ACCESS_TOKEN')));
+    assert.ok(result.warnings.some((warning) => warning.includes('SHOPIFY_CLIENT_ID')));
     assert.ok(result.warnings.some((warning) => warning.includes('MONGODB_URI')));
   });
 
-  it('requires the token and Mongo URI in production', () => {
+  it('requires credentials and a Mongo URI in production', () => {
     const result = validateEnv({
       NODE_ENV: 'production',
       SHOPIFY_STORE_DOMAIN: VALID.SHOPIFY_STORE_DOMAIN,
@@ -118,8 +119,73 @@ describe('validateEnv', () => {
     });
 
     assert.equal(result.config, null);
-    assert.ok(result.errors.some((error) => error.includes('SHOPIFY_ACCESS_TOKEN')));
+    assert.ok(result.errors.some((error) => error.includes('SHOPIFY_CLIENT_ID')));
     assert.ok(result.errors.some((error) => error.includes('MONGODB_URI')));
+  });
+
+  it('builds the client credentials token endpoint', () => {
+    const result = validateEnv(VALID);
+
+    assert.equal(
+      result.config?.shopify.tokenEndpoint,
+      'https://teststoremart-uk8mmby.myshopify.com/admin/oauth/access_token',
+    );
+  });
+
+  it('selects CLIENT_CREDENTIALS when a client id and secret are present', () => {
+    const result = validateEnv(VALID);
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.shopify.authStrategy, 'CLIENT_CREDENTIALS');
+    assert.equal(result.config?.shopify.accessToken, null);
+  });
+
+  it('rejects a half-configured credential pair', () => {
+    const missingSecret = validateEnv({
+      SHOPIFY_STORE_DOMAIN: VALID.SHOPIFY_STORE_DOMAIN,
+      SHOPIFY_CLIENT_ID: 'only-the-id',
+    });
+    assert.equal(missingSecret.config, null);
+    assert.ok(
+      missingSecret.errors.some((error) => error.includes('SHOPIFY_CLIENT_SECRET is required')),
+    );
+
+    const missingId = validateEnv({
+      SHOPIFY_STORE_DOMAIN: VALID.SHOPIFY_STORE_DOMAIN,
+      SHOPIFY_CLIENT_SECRET: 'only-the-secret',
+    });
+    assert.equal(missingId.config, null);
+    assert.ok(missingId.errors.some((error) => error.includes('SHOPIFY_CLIENT_ID is required')));
+  });
+
+  it('lets an explicit static token override client credentials, with a warning', () => {
+    const result = validateEnv({ ...VALID, SHOPIFY_ACCESS_TOKEN: 'shpat_override' });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.shopify.authStrategy, 'STATIC_TOKEN');
+    assert.ok(result.warnings.some((warning) => warning.includes('takes precedence')));
+  });
+
+  it('selects STATIC_TOKEN when only an access token is supplied', () => {
+    const result = validateEnv({
+      SHOPIFY_STORE_DOMAIN: VALID.SHOPIFY_STORE_DOMAIN,
+      SHOPIFY_ACCESS_TOKEN: 'shpat_only',
+    });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.shopify.authStrategy, 'STATIC_TOKEN');
+    assert.ok(result.warnings.some((warning) => warning.includes('refresh automatically')));
+  });
+
+  it('accepts client credentials in production', () => {
+    const result = validateEnv({
+      ...VALID,
+      NODE_ENV: 'production',
+      FRONTEND_URL: 'https://app.example.com',
+    });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.shopify.authStrategy, 'CLIENT_CREDENTIALS');
   });
 
   it('rejects an unknown NODE_ENV', () => {

@@ -41,8 +41,11 @@ export const config: AppConfig = Object.freeze(
   result.config ?? failFast(result.errors),
 );
 
-/** True when a Shopify Admin API token is available. */
-export const isShopifyConfigured = (): boolean => config.shopify.accessToken !== null;
+/**
+ * True when the backend can obtain an Admin API token - either from client
+ * credentials or from an explicit static token override.
+ */
+export const isShopifyConfigured = (): boolean => config.shopify.authStrategy !== 'NONE';
 
 /** True when a Mongo connection string was supplied. */
 export const isDatabaseConfigured = (): boolean => config.mongoUri !== null;

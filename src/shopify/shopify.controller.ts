@@ -10,7 +10,7 @@ import { Router } from 'express';
 import { asyncHandler, sendSuccess } from '../common/http';
 import { AppError } from '../common/errors';
 import { config, isShopifyConfigured } from '../config';
-import { getLastThrottleStatus } from './shopify.client';
+import { getLastThrottleStatus, getTokenDiagnostics } from './shopify.client';
 import { getShop } from './shopify.service';
 
 export const shopifyRouter = Router();
@@ -28,15 +28,19 @@ shopifyRouter.get(
   '/status',
   asyncHandler(async (_req, res) => {
     // Deliberately reports only booleans and non-secret identifiers.
+    // Reports credential PRESENCE and token lifetime only - never a value.
     const base = {
       configured: isShopifyConfigured(),
       storeDomain: config.shopify.storeDomain,
       apiVersion: config.shopify.apiVersion,
       graphqlEndpoint: config.shopify.graphqlEndpoint,
-      hasAccessToken: config.shopify.accessToken !== null,
-      hasWebhookSecret: config.shopify.webhookSecret !== null,
-      hasOauthCredentials:
+      tokenEndpoint: config.shopify.tokenEndpoint,
+      authStrategy: config.shopify.authStrategy,
+      hasClientCredentials:
         config.shopify.clientId !== null && config.shopify.clientSecret !== null,
+      hasStaticTokenOverride: config.shopify.accessToken !== null,
+      hasWebhookSecret: config.shopify.webhookSecret !== null,
+      token: getTokenDiagnostics(),
     };
 
     if (!isShopifyConfigured()) {
@@ -47,7 +51,7 @@ shopifyRouter.get(
         error: {
           code: 'SHOPIFY_NOT_CONFIGURED',
           message:
-            'SHOPIFY_ACCESS_TOKEN is not set in the backend .env file. Supply it and restart the server.',
+            'No Shopify credentials are configured. Set SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET in the backend .env file and restart the server.',
         },
       });
       return;

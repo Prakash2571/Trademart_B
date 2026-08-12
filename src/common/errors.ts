@@ -12,6 +12,8 @@ export type ErrorCode =
   // Shopify
   | 'SHOPIFY_NOT_CONFIGURED'
   | 'SHOPIFY_UNAUTHORIZED'
+  | 'SHOPIFY_AUTH_FAILED'
+  | 'SHOPIFY_APP_NOT_INSTALLED'
   | 'SHOPIFY_SCOPE_MISSING'
   | 'SHOPIFY_THROTTLED'
   | 'SHOPIFY_GRAPHQL_ERROR'
@@ -77,8 +79,10 @@ export function defaultStatusForCode(code: ErrorCode): number {
     case 'VALIDATION_ERROR':
       return 400;
     case 'SHOPIFY_UNAUTHORIZED':
+    case 'SHOPIFY_AUTH_FAILED':
       return 401;
     case 'SHOPIFY_SCOPE_MISSING':
+    case 'SHOPIFY_APP_NOT_INSTALLED':
       return 403;
     case 'WEBHOOK_INVALID_SIGNATURE':
       return 401;
