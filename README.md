@@ -225,6 +225,69 @@ curl http://localhost:4000/api/shopify/status | jq .data.token
 `scopes` is a genuine bonus of this flow: Shopify reports what it actually
 granted, so a missing scope is visible before any query is attempted.
 
+### Installing the app so the grant works
+
+The client credentials grant only issues tokens for stores where the app is
+**installed**, and per Shopify's docs it is *"only available for apps developed
+by your own organization and installed in stores that you own"* — so **the app
+and the store must belong to the same Shopify organization**.
+
+Trademart has no OAuth callback (by design), so a redirect-based install cannot
+complete: Shopify would redirect to the app's `application_url` and get
+`ERR_CONNECTION_REFUSED` if nothing is running there.
+
+Use **Shopify-managed installation** instead — Shopify installs the app and
+registers its scopes *without making any calls to your app*
+([docs](https://shopify.dev/docs/apps/build/authentication-authorization/app-installation)).
+In `shopify.app.toml`:
+
+```toml
+client_id = "your-client-id"
+name = "Trademart"
+
+# Trademart is a standalone dashboard, not embedded in the Shopify admin.
+# Shopify documents this placeholder for non-embedded apps.
+application_url = "https://shopify.dev/apps/default-app-home"
+embedded = false
+
+# REQUIRED for managed installation - Shopify cannot install the app without
+# knowing which scopes to grant. Do NOT set use_legacy_install_flow = true,
+# which forces the old redirect-based flow.
+[access_scopes]
+scopes = "read_products,read_orders,read_customers,read_inventory"
+
+[webhooks]
+api_version = "2026-07"
+```
+
+Then push the config and install:
+
+```bash
+shopify app deploy      # registers the scopes with Shopify
+```
+
+and install the app on the store from the Dev Dashboard. No backend restart is
+needed afterwards — a terminal auth failure is only suppressed for 30 seconds,
+so the dashboard recovers on its own within half a minute.
+
+Scope notes: `read_locations` may additionally be required for inventory
+*location* details, and `read_reports` is only useful if you intend to try
+ShopifyQL analytics (plan-dependent). Add scopes only as you need them.
+
+### Troubleshooting authentication
+
+| Symptom | Meaning | Fix |
+| --- | --- | --- |
+| `SHOPIFY_NOT_CONFIGURED` | No credentials loaded | Set `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET`, restart |
+| `SHOPIFY_AUTH_FAILED` · *"Missing or invalid client secret"* | Client ID was accepted, secret rejected | Re-copy or regenerate the secret **from the same app**, restart |
+| `SHOPIFY_AUTH_FAILED` · *"invalid client id"* | Client ID wrong | Re-copy the client ID |
+| `SHOPIFY_APP_NOT_INSTALLED` | Credentials are correct; app not installed on the store | Managed installation above; check app and store share one organization |
+| `ERR_CONNECTION_REFUSED` on `localhost:<port>` during install | Shopify tried a redirect-based install against `application_url` | Switch to managed installation (declare scopes + deploy) |
+| `SHOPIFY_SCOPE_MISSING` | Authentication works; a scope is absent | Add the scope, `shopify app deploy`, update the install |
+
+`npm run shopify:ping` prints credential **lengths** (never values), which
+catches a blank, truncated or duplicated credential.
+
 ### `SHOPIFY_ACCESS_TOKEN` — optional override
 
 Setting it makes the backend use that token verbatim and **disables automatic

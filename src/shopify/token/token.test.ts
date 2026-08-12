@@ -512,6 +512,31 @@ describe('mapTokenFailure', () => {
     assert.equal(error.code, 'SHOPIFY_APP_NOT_INSTALLED');
     assert.equal(error.retryable, false);
     assert.match(error.message, /not installed/);
+    // The remedy must name the managed-installation route, since Trademart has
+    // no OAuth callback to complete a redirect-based install.
+    assert.match(error.message, /shopify\.app\.toml/);
+    assert.match(error.message, /same Shopify organization/);
+  });
+
+  it('detects every documented not-installed wording', () => {
+    const wordings = [
+      'Client credentials cannot be performed on this shop.',
+      'The application is not installed on this shop.',
+    ];
+    for (const description of wordings) {
+      assert.equal(
+        mapTokenFailure(400, { error: 'invalid_request', error_description: description })
+          .code,
+        'SHOPIFY_APP_NOT_INSTALLED',
+        `failed for: ${description}`,
+      );
+    }
+
+    // Machine-readable form uses underscores, which a space-only match misses.
+    assert.equal(
+      mapTokenFailure(400, { error: 'app_not_installed' }).code,
+      'SHOPIFY_APP_NOT_INSTALLED',
+    );
   });
 
   it('detects bad client credentials', () => {

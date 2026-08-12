@@ -227,14 +227,18 @@ export function mapTokenFailure(
   const descriptionText = rawDescription.toLowerCase();
   const details = { status, error: error || undefined, description: description || undefined };
 
-  // Documented response when the app has not been installed on the store.
+  // Documented responses when the app has not been installed on the store.
+  // Shopify uses several wordings: "Client credentials cannot be performed on
+  // this shop.", "The application is not installed on this shop." and the
+  // machine code "app_not_installed".
   if (
     combined.includes('cannot be performed on this shop') ||
-    combined.includes('not installed')
+    combined.includes('not installed') ||
+    combined.includes('not_installed')
   ) {
     return new AppError(
       'SHOPIFY_APP_NOT_INSTALLED',
-      'Shopify refused the client credentials grant because the Trademart app is not installed on this store. Install/update the app on the store, then retry.',
+      'Shopify refused the client credentials grant: the app is not installed on this store. Install it on the store, then retry. For an app with no OAuth endpoint, declare [access_scopes] in shopify.app.toml and run "shopify app deploy" so Shopify can perform a managed installation. Note the grant also requires the app and the store to belong to the same Shopify organization.',
       { details },
     );
   }
