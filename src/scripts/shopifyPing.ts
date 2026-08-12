@@ -24,6 +24,39 @@ import { getTokenProvider } from '../shopify/token';
 
 type CheckResult = { name: string; ok: boolean; detail: string };
 
+/**
+ * Reports credential SHAPE, never content.
+ *
+ * A wrong secret is invisible, but a blank, truncated or accidentally swapped
+ * value shows up immediately in the length. Shopify client ids and secrets are
+ * normally 32 hex characters.
+ */
+function describeCredentials(): string {
+  const parts: string[] = [];
+  const { clientId, clientSecret, accessToken } = config.shopify;
+
+  parts.push(
+    clientId === null
+      ? 'client_id NOT SET'
+      : `client_id ${clientId.length} chars${clientId.length !== 32 ? ' (expected 32 - check for a truncated paste)' : ''}`,
+  );
+  parts.push(
+    clientSecret === null
+      ? 'client_secret NOT SET'
+      : `client_secret ${clientSecret.length} chars${clientSecret.length !== 32 ? ' (expected 32 - check for a truncated paste)' : ''}`,
+  );
+
+  // Catches pasting the same value into both fields.
+  if (clientId !== null && clientSecret !== null && clientId === clientSecret) {
+    parts.push('WARNING: client_id and client_secret are identical');
+  }
+  if (accessToken !== null) {
+    parts.push('static token override ACTIVE');
+  }
+
+  return parts.join(', ');
+}
+
 async function check(name: string, run: () => Promise<string>): Promise<CheckResult> {
   try {
     const detail = await run();
@@ -45,6 +78,9 @@ async function main(): Promise<void> {
   console.log(`  api version  : ${config.shopify.apiVersion}`);
   console.log(`  endpoint     : ${config.shopify.graphqlEndpoint}`);
   console.log(`  auth strategy: ${config.shopify.authStrategy}`);
+  // Lengths only - enough to spot a blank, truncated or swapped value without
+  // ever printing a credential.
+  console.log(`  credentials  : ${describeCredentials()}`);
   console.log('');
 
   if (!isShopifyConfigured()) {
