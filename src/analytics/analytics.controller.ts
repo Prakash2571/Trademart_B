@@ -32,6 +32,16 @@ analyticsRouter.get(
       truncated: result.meta.hasNextPage,
     });
 
+    // An empty store yields no currency from orders; use the shop's own so
+    // zero totals are still labelled. getShop() is cached, so this is cheap.
+    if (overview.currencyCode === null) {
+      try {
+        overview.currencyCode = (await getShop()).currencyCode;
+      } catch {
+        // Leave it null rather than guessing - the UI renders a bare number.
+      }
+    }
+
     sendSuccess(res, overview, result.meta.degraded ? { degraded: result.meta.degraded } : undefined);
   }),
 );
@@ -70,7 +80,7 @@ analyticsRouter.get(
         source: 'shopify',
         code: 'SHOPIFY_NOT_CONFIGURED',
         message:
-          'SHOPIFY_ACCESS_TOKEN is not set. Add it to the backend .env file and restart.',
+          'No Shopify credentials are configured. Set SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET in the backend .env file and restart.',
       });
       sendSuccess(res, summary);
       return;
@@ -78,8 +88,10 @@ analyticsRouter.get(
 
     // Each block degrades independently so one missing scope cannot blank the
     // entire dashboard.
+    let shopCurrencyCode: string | null = null;
     try {
       const shop = await getShop();
+      shopCurrencyCode = shop.currencyCode;
       summary['shopify'] = {
         configured: true,
         storeDomain: config.shopify.storeDomain,
@@ -108,7 +120,10 @@ analyticsRouter.get(
       const orders = await listOrders({ first: 100 });
       const overview = buildOverview(orders.items, { truncated: orders.meta.hasNextPage });
       summary['revenue'] = {
-        currencyCode: overview.currencyCode,
+        // With no orders there is nothing to infer a currency from, so fall
+        // back to the shop's own currency - otherwise a zero total renders as a
+        // bare "0.00" with no indication of what it is denominated in.
+        currencyCode: overview.currencyCode ?? shopCurrencyCode,
         total: overview.totalRevenue,
         averageOrderValue: overview.averageOrderValue,
         window: overview.window,
