@@ -229,6 +229,24 @@ export function mapTokenFailure(
     );
   }
 
+  // Shopify names the offending field, e.g. "Missing or invalid client secret".
+  // Pass that through with the specific remedy attached.
+  if (combined.includes('client secret')) {
+    return new AppError(
+      'SHOPIFY_AUTH_FAILED',
+      'Shopify rejected the client secret ("Missing or invalid client secret"). Copy SHOPIFY_CLIENT_SECRET again from Dev Dashboard -> your app -> Settings, check for stray spaces or quotes in .env, and restart the backend.',
+      { details },
+    );
+  }
+
+  if (combined.includes('client id') || combined.includes('client_id')) {
+    return new AppError(
+      'SHOPIFY_AUTH_FAILED',
+      'Shopify rejected the client ID. Copy SHOPIFY_CLIENT_ID again from Dev Dashboard -> your app -> Settings and restart the backend.',
+      { details },
+    );
+  }
+
   if (status === 401 || status === 403 || combined.includes('invalid_client')) {
     return new AppError(
       'SHOPIFY_AUTH_FAILED',

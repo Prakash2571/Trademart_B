@@ -414,6 +414,29 @@ describe('mapTokenFailure', () => {
     assert.equal(error.retryable, false);
   });
 
+  it('gives a specific remedy for "Missing or invalid client secret"', () => {
+    // Exact wording Shopify returns for a wrong/blank secret.
+    const error = mapTokenFailure(400, {
+      error: 'invalid_request',
+      error_description: 'Missing or invalid client secret',
+    });
+
+    assert.equal(error.code, 'SHOPIFY_AUTH_FAILED');
+    assert.equal(error.retryable, false);
+    assert.match(error.message, /SHOPIFY_CLIENT_SECRET/);
+    assert.match(error.message, /spaces or quotes/);
+  });
+
+  it('gives a specific remedy for an invalid client id', () => {
+    const error = mapTokenFailure(400, {
+      error: 'invalid_request',
+      error_description: 'Missing or invalid client id',
+    });
+
+    assert.equal(error.code, 'SHOPIFY_AUTH_FAILED');
+    assert.match(error.message, /SHOPIFY_CLIENT_ID/);
+  });
+
   it('detects an unsupported grant type', () => {
     const error = mapTokenFailure(400, { error: 'unsupported_grant_type' });
 

@@ -15,7 +15,7 @@
  *    needless polling of Shopify (rate-limit hygiene).
  */
 
-import { AppError } from '../common/errors';
+import { AppError, toAppError, type ErrorCode } from '../common/errors';
 import { logger } from '../common/logger';
 import { config } from '../config';
 import { shopifyGraphql } from './shopify.client';
@@ -272,12 +272,26 @@ export interface StoreCounts {
   customers: number | null;
 }
 
+/** A per-section failure, carrying the REAL error code rather than a guess. */
+export interface CountIssue {
+  source: string;
+  code: ErrorCode;
+  message: string;
+}
+
 /**
  * Counts are fetched independently so one missing scope (e.g. read_customers)
  * does not blank the whole dashboard.
+ *
+ * Each failure keeps its own error code: an auth failure and a missing scope
+ * need completely different fixes, so they must never be reported as the same
+ * thing.
  */
-export async function getCounts(): Promise<{ counts: StoreCounts; notes: string[] }> {
-  const notes: string[] = [];
+export async function getCounts(): Promise<{
+  counts: StoreCounts;
+  issues: CountIssue[];
+}> {
+  const issues: CountIssue[] = [];
   const counts: StoreCounts = { products: null, orders: null, customers: null };
 
   try {
@@ -288,8 +302,12 @@ export async function getCounts(): Promise<{ counts: StoreCounts; notes: string[
     counts.products = result.data.productsCount?.count ?? null;
     counts.orders = result.data.ordersCount?.count ?? null;
   } catch (error) {
-    const message = error instanceof AppError ? error.message : 'Count query failed.';
-    notes.push(`Product/order counts unavailable: ${message}`);
+    const appError = toAppError(error);
+    issues.push({
+      source: 'shopify.counts.products_orders',
+      code: appError.code,
+      message: `Product/order counts unavailable: ${appError.message}`,
+    });
   }
 
   try {
@@ -300,11 +318,15 @@ export async function getCounts(): Promise<{ counts: StoreCounts; notes: string[
     );
     counts.customers = result.data.customersCount?.count ?? null;
   } catch (error) {
-    const message = error instanceof AppError ? error.message : 'Count query failed.';
-    notes.push(`Customer count unavailable: ${message}`);
+    const appError = toAppError(error);
+    issues.push({
+      source: 'shopify.counts.customers',
+      code: appError.code,
+      message: `Customer count unavailable: ${appError.message}`,
+    });
   }
 
-  return { counts, notes };
+  return { counts, issues };
 }
 
 /** Clears the shop cache (used by tests and the manual ping script). */

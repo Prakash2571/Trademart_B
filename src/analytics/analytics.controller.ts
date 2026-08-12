@@ -96,10 +96,12 @@ analyticsRouter.get(
       });
     }
 
-    const { counts, notes } = await getCounts();
+    // Each count issue reports its own code - an auth failure must not be
+    // presented as a missing scope.
+    const { counts, issues } = await getCounts();
     summary['counts'] = counts;
-    for (const note of notes) {
-      errors.push({ source: 'shopify.counts', code: 'SHOPIFY_SCOPE_MISSING', message: note });
+    for (const issue of issues) {
+      errors.push({ source: issue.source, code: issue.code, message: issue.message });
     }
 
     try {

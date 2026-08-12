@@ -121,8 +121,11 @@ async function main(): Promise<void> {
 
   results.push(
     await check('counts', async () => {
-      const { counts, notes } = await getCounts();
-      const suffix = notes.length > 0 ? ` | notes: ${notes.length}` : '';
+      const { counts, issues } = await getCounts();
+      const suffix =
+        issues.length > 0
+          ? ` | issues: ${issues.map((issue) => issue.code).join(', ')}`
+          : '';
       return `products=${counts.products ?? 'n/a'} orders=${counts.orders ?? 'n/a'} customers=${counts.customers ?? 'n/a'}${suffix}`;
     }),
   );
