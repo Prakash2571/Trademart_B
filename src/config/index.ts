@@ -1,0 +1,50 @@
+/**
+ * Loads .env, validates it, and exposes a frozen config object.
+ *
+ * If validation fails the process exits immediately with a readable list of
+ * problems - a misconfigured server should never start and then fail
+ * mysteriously on the first Shopify call.
+ */
+
+import dotenv from 'dotenv';
+
+import { logger } from '../common/logger';
+import { validateEnv, type AppConfig } from './env.validation';
+
+dotenv.config();
+
+/**
+ * Reports the problems and terminates.
+ *
+ * Ends with a `throw` so the return type is provably `never` from control flow
+ * alone, rather than relying on `process.exit` being typed as `never`.
+ */
+function failFast(problems: string[]): never {
+  logger.error('Invalid environment configuration. Server will not start.', {
+    problems,
+  });
+  for (const problem of problems) {
+    console.error(`  - ${problem}`);
+  }
+  console.error('\nSee .env.example for the expected values.');
+  process.exit(1);
+  throw new Error('Invalid environment configuration.');
+}
+
+const result = validateEnv(process.env);
+
+for (const warning of result.warnings) {
+  logger.warn(warning);
+}
+
+export const config: AppConfig = Object.freeze(
+  result.config ?? failFast(result.errors),
+);
+
+/** True when a Shopify Admin API token is available. */
+export const isShopifyConfigured = (): boolean => config.shopify.accessToken !== null;
+
+/** True when a Mongo connection string was supplied. */
+export const isDatabaseConfigured = (): boolean => config.mongoUri !== null;
+
+export type { AppConfig } from './env.validation';
