@@ -271,11 +271,13 @@ describe('ClientCredentialsTokenProvider', () => {
     assert.ok(tokens.every((token) => token.accessToken === 'shpat_shared'));
   });
 
-  it('allows a new attempt after a failure instead of caching the error', async () => {
+  it('records the failure reason, then clears it once a token is obtained', async () => {
+    const time = clock();
     let calls = 0;
     const provider = new ClientCredentialsTokenProvider({
       clientId: 'id',
       clientSecret: 'secret',
+      now: time.now,
       fetcher: async () => {
         calls += 1;
         if (calls === 1) return { status: 401, body: { error: 'invalid_client' } };
@@ -288,9 +290,115 @@ describe('ClientCredentialsTokenProvider', () => {
     });
     assert.equal(provider.describe(SHOP).lastError !== null, true);
 
+    // Past the suppression window so a genuine retry happens.
+    time.advance(31_000);
     const token = await provider.getAccessToken(SHOP);
+
     assert.equal(token.accessToken, 'shpat_recovered');
     assert.equal(provider.describe(SHOP).lastError, null);
+    assert.equal(provider.describe(SHOP).cached, true);
+  });
+
+  it('suppresses repeat token requests after a terminal failure', async () => {
+    // Reproduces the observed behaviour: a dashboard load runs several
+    // operations, each of which used to trigger its own doomed token request.
+    const time = clock();
+    let calls = 0;
+    const provider = new ClientCredentialsTokenProvider({
+      clientId: 'id',
+      clientSecret: 'secret',
+      now: time.now,
+      fetcher: async () => {
+        calls += 1;
+        return {
+          status: 400,
+          body: {
+            error: 'invalid_request',
+            error_description: 'Client credentials cannot be performed on this shop.',
+          },
+        };
+      },
+    });
+
+    for (let i = 0; i < 5; i += 1) {
+      await assert.rejects(() => provider.getAccessToken(SHOP), (error: unknown) => {
+        return error instanceof AppError && error.code === 'SHOPIFY_APP_NOT_INSTALLED';
+      });
+    }
+
+    assert.equal(calls, 1, 'five operations should cause ONE token request');
+  });
+
+  it('retries once the failure suppression window expires', async () => {
+    const time = clock();
+    let calls = 0;
+    const provider = new ClientCredentialsTokenProvider({
+      clientId: 'id',
+      clientSecret: 'secret',
+      now: time.now,
+      fetcher: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return { status: 401, body: { error: 'invalid_client' } };
+        }
+        return okResponse('shpat_after_fix');
+      },
+    });
+
+    await assert.rejects(() => provider.getAccessToken(SHOP));
+    assert.equal(calls, 1);
+
+    // Still suppressed.
+    time.advance(29_000);
+    await assert.rejects(() => provider.getAccessToken(SHOP));
+    assert.equal(calls, 1);
+
+    // Window elapsed - self-heals without a restart.
+    time.advance(2_000);
+    const token = await provider.getAccessToken(SHOP);
+    assert.equal(token.accessToken, 'shpat_after_fix');
+    assert.equal(calls, 2);
+  });
+
+  it('does NOT suppress retryable failures', async () => {
+    const time = clock();
+    let calls = 0;
+    const provider = new ClientCredentialsTokenProvider({
+      clientId: 'id',
+      clientSecret: 'secret',
+      now: time.now,
+      fetcher: async () => {
+        calls += 1;
+        throw new Error('socket hang up');
+      },
+    });
+
+    await assert.rejects(() => provider.getAccessToken(SHOP));
+    await assert.rejects(() => provider.getAccessToken(SHOP));
+
+    assert.equal(calls, 2, 'transient failures must remain retryable');
+  });
+
+  it('clears failure suppression on invalidate()', async () => {
+    const time = clock();
+    let calls = 0;
+    const provider = new ClientCredentialsTokenProvider({
+      clientId: 'id',
+      clientSecret: 'secret',
+      now: time.now,
+      fetcher: async () => {
+        calls += 1;
+        if (calls === 1) return { status: 401, body: { error: 'invalid_client' } };
+        return okResponse('shpat_second');
+      },
+    });
+
+    await assert.rejects(() => provider.getAccessToken(SHOP));
+    provider.invalidate(SHOP);
+    const token = await provider.getAccessToken(SHOP);
+
+    assert.equal(token.accessToken, 'shpat_second');
+    assert.equal(calls, 2);
   });
 
   it('re-fetches after invalidate(), which is how a 401 is recovered', async () => {

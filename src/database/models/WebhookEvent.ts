@@ -9,8 +9,12 @@ const webhookEventSchema = new Schema(
   {
     shopDomain: { type: String, required: true, index: true },
     topic: { type: String, required: true, index: true },
-    /** Shopify's delivery id - used to make retries idempotent. */
-    webhookId: { type: String, default: null, index: true },
+    /**
+     * Shopify's delivery id - used to make retries idempotent.
+     * Indexed by the explicit partial unique index below, NOT with `index: true`
+     * here: declaring both makes Mongoose warn about a duplicate index.
+     */
+    webhookId: { type: String, default: null },
     receivedAt: { type: Date, required: true, default: () => new Date() },
     processed: { type: Boolean, required: true, default: false },
     processedAt: { type: Date, default: null },

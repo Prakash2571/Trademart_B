@@ -73,10 +73,25 @@ export const httpTokenFetcher: TokenFetcher = async ({
   }
 };
 
+/**
+ * How long a TERMINAL auth failure is remembered.
+ *
+ * Without this, every operation in a dashboard load independently asks Shopify
+ * for a token and independently fails - five doomed token requests per page
+ * while the app is misconfigured. Short enough to self-heal within seconds of
+ * the configuration being fixed.
+ */
+const FAILURE_CACHE_MS = 30_000;
+
 interface ProviderState {
   token: CachedToken | null;
   /** Shared promise so concurrent callers trigger only one token request. */
   inFlight: Promise<CachedToken> | null;
+  /**
+   * A non-retryable failure (bad secret, app not installed) and when to stop
+   * short-circuiting on it. Retryable failures are never cached here.
+   */
+  failure: { error: AppError; until: number } | null;
   fetchCount: number;
   lastFetchedAt: number | null;
   lastError: string | null;
@@ -108,7 +123,14 @@ export class ClientCredentialsTokenProvider implements ShopifyTokenProvider {
   private stateFor(shopDomain: string): ProviderState {
     let state = this.states.get(shopDomain);
     if (state === undefined) {
-      state = { token: null, inFlight: null, fetchCount: 0, lastFetchedAt: null, lastError: null };
+      state = {
+        token: null,
+        inFlight: null,
+        failure: null,
+        fetchCount: 0,
+        lastFetchedAt: null,
+        lastError: null,
+      };
       this.states.set(shopDomain, state);
     }
     return state;
@@ -121,6 +143,15 @@ export class ClientCredentialsTokenProvider implements ShopifyTokenProvider {
       return state.token as CachedToken;
     }
 
+    // Fail fast on a known-terminal misconfiguration rather than asking Shopify
+    // again for every single operation.
+    if (state.failure !== null) {
+      if (this.now() < state.failure.until) {
+        throw state.failure.error;
+      }
+      state.failure = null;
+    }
+
     // Single-flight: a burst of parallel requests must not each ask Shopify for
     // a token (that would waste calls and risk rate limiting).
     if (state.inFlight !== null) {
@@ -130,6 +161,15 @@ export class ClientCredentialsTokenProvider implements ShopifyTokenProvider {
     const request = this.requestToken(shopDomain, state)
       .catch((error: unknown) => {
         state.lastError = error instanceof Error ? error.message : 'Token request failed.';
+        // Only non-retryable failures are worth remembering. Network blips and
+        // 5xx must stay retryable.
+        if (error instanceof AppError && !error.retryable) {
+          state.failure = { error, until: this.now() + FAILURE_CACHE_MS };
+          logger.warn(
+            'Shopify authentication failed terminally; suppressing token requests briefly.',
+            { shopDomain, code: error.code, suppressedForMs: FAILURE_CACHE_MS },
+          );
+        }
         throw error;
       })
       .finally(() => {
@@ -187,6 +227,7 @@ export class ClientCredentialsTokenProvider implements ShopifyTokenProvider {
     state.fetchCount += 1;
     state.lastFetchedAt = issuedAt;
     state.lastError = null;
+    state.failure = null;
 
     // Log the lifetime and scopes, never the token itself.
     logger.info('Shopify access token obtained.', {
@@ -202,6 +243,8 @@ export class ClientCredentialsTokenProvider implements ShopifyTokenProvider {
     const state = this.states.get(shopDomain);
     if (state === undefined) return;
     state.token = null;
+    // An explicit invalidation is a deliberate "try again" signal.
+    state.failure = null;
     logger.warn('Discarded cached Shopify access token; a new one will be requested.', {
       shopDomain,
     });

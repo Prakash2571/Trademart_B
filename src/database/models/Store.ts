@@ -10,7 +10,9 @@ import { Schema, model, type InferSchemaType } from 'mongoose';
 
 const storeSchema = new Schema(
   {
-    shopDomain: { type: String, required: true, unique: true, index: true },
+    // `unique: true` already creates the index; adding `index: true` as well
+    // would declare it twice.
+    shopDomain: { type: String, required: true, unique: true },
     shopifyShopId: { type: String, default: null },
     name: { type: String, default: null },
     currencyCode: { type: String, default: null },

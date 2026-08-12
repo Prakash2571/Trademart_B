@@ -189,6 +189,11 @@ never assumed. The backend:
   lifetime, so very short-lived tokens can't cause a refresh loop)
 - **coalesces concurrent requests** into a single token request, so a burst of
   traffic never triggers a stampede of token calls
+- **suppresses repeat requests for 30s after a terminal auth failure** (bad
+  secret, app not installed), so a misconfigured setup makes one token request
+  per 30s instead of one per operation. Transient failures (network, 5xx,
+  throttling) are never suppressed, and the window self-heals — no restart
+  needed once the configuration is fixed
 - on a `401` from the Admin API, discards the token and re-authenticates **once**
   before surfacing the error — covering revoked or early-rotated tokens
 - never logs or returns the token value
