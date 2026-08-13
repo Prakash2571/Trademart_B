@@ -8,6 +8,60 @@
  */
 
 // ---------------------------------------------------------------------------
+// Shopify enums
+//
+// Only the enums Trademart actually reads. These were transcribed from
+// Shopify's documentation, NOT generated from the schema, so they are split by
+// how safe it is to treat them as exhaustive:
+//
+//   - CLOSED unions: small, long-stable enums. Safe to `switch` exhaustively.
+//   - OPEN unions (`| (string & {})`): enums Shopify has added members to over
+//     time. Known values still autocomplete, but callers MUST keep a default
+//     branch - a version bump can introduce a status we have never seen.
+//
+// Replace all of these with generated types if the codegen migration lands.
+// ---------------------------------------------------------------------------
+
+/** Documents the known members while still accepting anything Shopify sends. */
+type Open<TKnown extends string> = TKnown | (string & {});
+
+export type ProductStatus = 'ACTIVE' | 'ARCHIVED' | 'DRAFT';
+
+export type WeightUnit = 'GRAMS' | 'KILOGRAMS' | 'OUNCES' | 'POUNDS';
+
+export type CustomerState = 'DECLINED' | 'DISABLED' | 'ENABLED' | 'INVITED';
+
+export type CountPrecision = 'AT_LEAST' | 'EXACT';
+
+export type OrderFinancialStatus = Open<
+  | 'AUTHORIZED'
+  | 'EXPIRED'
+  | 'PAID'
+  | 'PARTIALLY_PAID'
+  | 'PARTIALLY_REFUNDED'
+  | 'PENDING'
+  | 'REFUNDED'
+  | 'VOIDED'
+>;
+
+export type OrderFulfillmentStatus = Open<
+  | 'FULFILLED'
+  | 'IN_PROGRESS'
+  | 'ON_HOLD'
+  | 'OPEN'
+  | 'PARTIALLY_FULFILLED'
+  | 'PENDING_FULFILLMENT'
+  | 'REQUEST_DECLINED'
+  | 'RESTOCKED'
+  | 'SCHEDULED'
+  | 'UNFULFILLED'
+>;
+
+export type FulfillmentStatus = Open<
+  'CANCELLED' | 'ERROR' | 'FAILURE' | 'OPEN' | 'PENDING' | 'SUCCESS'
+>;
+
+// ---------------------------------------------------------------------------
 // Raw Shopify shapes (only the fields Trademart requests)
 // ---------------------------------------------------------------------------
 
@@ -38,7 +92,7 @@ export interface RawShop {
   contactEmail?: string | null;
   currencyCode: string;
   ianaTimezone?: string | null;
-  weightUnit?: string | null;
+  weightUnit?: WeightUnit | null;
   primaryDomain?: { host: string; url: string } | null;
   plan?: {
     displayName?: string | null;
@@ -75,7 +129,7 @@ export interface RawProduct {
   handle: string;
   description?: string | null;
   descriptionHtml?: string | null;
-  status: string;
+  status: ProductStatus;
   vendor?: string | null;
   productType?: string | null;
   tags?: string[] | null;
@@ -110,7 +164,7 @@ export interface RawLineItem {
 
 export interface RawFulfillment {
   id: string;
-  status?: string | null;
+  status?: FulfillmentStatus | null;
   createdAt?: string | null;
   trackingInfo?: {
     company?: string | null;
@@ -125,8 +179,8 @@ export interface RawOrder {
   createdAt: string;
   processedAt?: string | null;
   updatedAt?: string | null;
-  displayFinancialStatus?: string | null;
-  displayFulfillmentStatus?: string | null;
+  displayFinancialStatus?: OrderFinancialStatus | null;
+  displayFulfillmentStatus?: OrderFulfillmentStatus | null;
   currencyCode: string;
   tags?: string[] | null;
   note?: string | null;
@@ -155,7 +209,7 @@ export interface RawCustomer {
   id: string;
   createdAt: string;
   updatedAt: string;
-  state?: string | null;
+  state?: CustomerState | null;
   numberOfOrders?: string | null;
   amountSpent?: RawMoney | null;
   tags?: string[] | null;
@@ -185,7 +239,7 @@ export interface RawInventoryItem {
     product?: {
       id: string;
       title?: string | null;
-      status?: string | null;
+      status?: ProductStatus | null;
       vendor?: string | null;
     } | null;
   } | null;
@@ -198,7 +252,7 @@ export interface RawInventoryItem {
 
 export interface RawCount {
   count: number;
-  precision?: string | null;
+  precision?: CountPrecision | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +289,7 @@ export interface ProductDto {
   title: string;
   handle: string;
   description: string | null;
-  status: string;
+  status: ProductStatus;
   vendor: string | null;
   productType: string | null;
   tags: string[];
@@ -265,7 +319,7 @@ export interface OrderLineItemDto {
 
 export interface FulfillmentDto {
   id: string;
-  status: string | null;
+  status: FulfillmentStatus | null;
   createdAt: string | null;
   trackingCompany: string | null;
   trackingNumber: string | null;
@@ -277,8 +331,8 @@ export interface OrderDto {
   name: string;
   createdAt: string;
   processedAt: string | null;
-  financialStatus: string | null;
-  fulfillmentStatus: string | null;
+  financialStatus: OrderFinancialStatus | null;
+  fulfillmentStatus: OrderFulfillmentStatus | null;
   currencyCode: string;
   customer: {
     shopifyCustomerId: string | null;
@@ -304,7 +358,7 @@ export interface CustomerDto {
   shopifyCustomerId: string;
   createdAt: string;
   updatedAt: string;
-  state: string | null;
+  state: CustomerState | null;
   ordersCount: number | null;
   amountSpent: Money | null;
   tags: string[];
@@ -341,12 +395,21 @@ export interface ShopDto {
   email: string | null;
   currencyCode: string;
   timezone: string | null;
-  weightUnit: string | null;
+  weightUnit: WeightUnit | null;
   planDisplayName: string | null;
   isDevelopmentStore: boolean | null;
   isShopifyPlus: boolean | null;
   country: string | null;
   apiVersion: string;
+  /**
+   * Fields Shopify refused, so the reduced document was used instead. Absent
+   * when nothing degraded.
+   *
+   * Without this, a withheld field is indistinguishable from a genuinely empty
+   * one - `country: null` would read as "this store has no country" rather than
+   * "we were not allowed to read it".
+   */
+  degraded?: string[];
 }
 
 export interface PageMeta {
