@@ -69,9 +69,22 @@ HTTP_PORT="$(env_get HTTP_PORT)"; HTTP_PORT="${HTTP_PORT:-80}"
 
 [ -n "$DOMAIN" ] || die "DOMAIN is not set in .env"
 
-if grep -q 'CHANGE_ME_BEFORE_DEPLOY' .env; then
-  die ".env still contains the CHANGE_ME_BEFORE_DEPLOY placeholder. Set a real MongoDB password (openssl rand -hex 24) in BOTH MONGO_INITDB_ROOT_PASSWORD and MONGODB_URI."
-fi
+MONGODB_URI="$(env_get MONGODB_URI)"
+[ -n "$MONGODB_URI" ] || die "MONGODB_URI is not set in .env. Point it at your MongoDB Atlas (or other) server, or enable the bundled database via COMPOSE_FILE (see the comments in .env.example)."
+case "$MONGODB_URI" in
+  *"<user>"*|*"<password>"*|*"<cluster>"*|*"<same password>"*|*CHANGE_ME*)
+    die "MONGODB_URI still contains a placeholder. Replace <user>/<password>/<cluster> with your real connection string." ;;
+esac
+
+# Sanity-check the two ways of running Mongo against each other.
+COMPOSE_FILE_VAL="$(env_get COMPOSE_FILE)"
+case "$MONGODB_URI" in
+  *"@mongo:"*)
+    case "$COMPOSE_FILE_VAL" in
+      *local-db*) : ;;
+      *) die "MONGODB_URI points at the internal 'mongo' host, but the local database is not enabled. Add to .env: COMPOSE_FILE=docker-compose.yml:docker-compose.local-db.yml" ;;
+    esac ;;
+esac
 
 FRONTEND_CONTEXT="$(env_get FRONTEND_CONTEXT)"; FRONTEND_CONTEXT="${FRONTEND_CONTEXT:-../../Trademart_F}"
 [ -f "$FRONTEND_CONTEXT/Dockerfile" ] \
@@ -135,25 +148,59 @@ else
   ok "existing certificate found (state: $CERT_STATE)"
 fi
 
-# --- 3. bring everything up --------------------------------------------------
+# --- 3. validate the nginx configuration before anything binds a port --------
+# Catches syntax errors and bad includes with a precise [emerg] line, instead of
+# a container that silently crash-loops. `nginx -t` does NOT open listening
+# sockets, so bind failures still surface only at startup - step 5 handles those.
+step "Validating the nginx configuration"
+if ! docker compose run --rm --no-deps --entrypoint /docker-entrypoint.sh nginx nginx -t; then
+  die "nginx rejected its configuration - see the [emerg] line above. Fix deploy/nginx/, then re-run: ./start.sh --skip-build"
+fi
+ok "nginx configuration valid"
+
+# --- 4. bring everything up --------------------------------------------------
 step "Starting the stack"
 docker compose up -d --remove-orphans
 ok "containers started"
 
-# --- 4. real certificate -----------------------------------------------------
+# --- 5. wait for nginx to actually serve -------------------------------------
+# A config that passes `nginx -t` can still die on startup (a port already in
+# use, or an address family the container does not support). Fail loudly here
+# rather than pressing on to certbot, which would burn a rate-limited attempt
+# against a server that is not listening.
+nginx_ready() {
+  docker compose exec -T nginx wget -q -O /dev/null http://127.0.0.1:8080/healthz 2>/dev/null
+}
+
+step "Waiting for nginx to accept requests"
+NGINX_UP=0
+for _ in $(seq 1 30); do
+  if nginx_ready; then NGINX_UP=1; break; fi
+  sleep 2
+done
+
+if [ "$NGINX_UP" -eq 0 ]; then
+  echo >&2
+  printf '%s---- docker compose logs nginx ----%s\n' "$BOLD" "$RESET" >&2
+  docker compose logs --tail=40 --no-color nginx >&2 || true
+  echo >&2
+  die "nginx is not serving (see the log above). The stack is up but the site is down, so TLS issuance was skipped. Fix the cause, then re-run: ./start.sh --skip-build"
+fi
+ok "nginx is serving"
+
+# Backend trouble is not fatal to the deploy - nginx keeps serving the site and
+# only /api is affected - but it should be impossible to miss.
+if ! docker compose exec -T backend node -e "process.exit(0)" 2>/dev/null; then
+  warn "the backend container is not running - /api will return 502."
+  warn "Under NODE_ENV=production the API exits 1 on incomplete config. The reason is in:"
+  warn "  docker compose logs backend | tail -30"
+fi
+
+# --- 6. real certificate -----------------------------------------------------
 if [ "$TLS_MODE" = "selfsigned" ]; then
   warn "TLS_MODE=selfsigned - browsers will show a certificate warning. Set TLS_MODE=letsencrypt and re-run once DNS points at this host."
 elif [ "$CERT_STATE" = "bootstrap" ] || [ "$FORCE_RENEW" -eq 1 ]; then
   step "Requesting a certificate from Let's Encrypt for $DOMAIN and www.$DOMAIN"
-
-  # Wait for nginx to actually answer the challenge path before asking the CA,
-  # so a slow start does not burn a rate-limited failure.
-  for _ in $(seq 1 30); do
-    if docker compose exec -T nginx wget -q -O /dev/null http://127.0.0.1:8080/healthz 2>/dev/null; then
-      break
-    fi
-    sleep 2
-  done
 
   CERTBOT_ARGS="certonly --webroot --webroot-path /var/www/certbot"
   CERTBOT_ARGS="$CERTBOT_ARGS --email $EMAIL --agree-tos --no-eff-email --non-interactive"
@@ -186,7 +233,7 @@ else
   ok "certificate already issued by a real CA - renewal is handled by the certbot service"
 fi
 
-# --- 5. report ---------------------------------------------------------------
+# --- 7. report ---------------------------------------------------------------
 echo
 step "Stack status"
 docker compose ps
@@ -197,4 +244,4 @@ echo "   webhooks https://$DOMAIN/api/webhooks/shopify"
 echo
 echo "   logs     docker compose logs -f"
 echo "   stop     docker compose stop     (containers stay stopped)"
-echo "   destroy  docker compose down     (add -v to delete the Mongo volume)"
+echo "   destroy  docker compose down     (add -v to also delete volumes)"

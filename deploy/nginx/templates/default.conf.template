@@ -8,6 +8,17 @@
 #
 # Edit this file, never conf.d/default.conf. Then: docker compose restart nginx
 #
+# IPv4-only `listen` directives on purpose. Docker bridge networks have IPv6
+# disabled unless you set enable_ipv6 on the network, and binding `[::]:80` in a
+# container without IPv6 is fatal, not a warning:
+#
+#   [emerg] socket() [::]:80 failed (97: Address family not supported by protocol)
+#
+# nginx then exits 1 and the container crash-loops. (This is exactly why the
+# official image ships 10-listen-on-ipv6-by-default.sh, which probes
+# /proc/net/if_inet6 before adding any IPv6 listener.) If you do enable IPv6 on
+# the compose network, add the matching `listen [::]:...` lines back here.
+#
 # Routing:
 #   /api/*         -> backend:4000   (Express mounts EVERYTHING under /api,
 #                                     so the prefix is passed through as-is)
@@ -40,10 +51,8 @@ server {
 # ssl_reject_handshake means this block needs no certificate of its own.
 # ---------------------------------------------------------------------------
 server {
-    listen      80  default_server;
-    listen [::]:80  default_server;
-    listen      443 ssl default_server;
-    listen [::]:443 ssl default_server;
+    listen 80 default_server;
+    listen 443 ssl default_server;
 
     ssl_reject_handshake on;
 
@@ -56,8 +65,7 @@ server {
 # HTTP: serve the ACME challenge, redirect everything else to HTTPS.
 # ---------------------------------------------------------------------------
 server {
-    listen      80;
-    listen [::]:80;
+    listen 80;
     server_name ${DOMAIN} www.${DOMAIN};
 
     # Let's Encrypt http-01. MUST stay on plain HTTP and must not be redirected.
@@ -77,8 +85,7 @@ server {
 # here because the backend's CORS allowlist holds a single FRONTEND_URL.
 # ---------------------------------------------------------------------------
 server {
-    listen      443 ssl;
-    listen [::]:443 ssl;
+    listen 443 ssl;
     http2 on;
 
     server_name www.${DOMAIN};
@@ -93,8 +100,7 @@ server {
 # HTTPS: the application.
 # ---------------------------------------------------------------------------
 server {
-    listen      443 ssl;
-    listen [::]:443 ssl;
+    listen 443 ssl;
     http2 on;
 
     server_name ${DOMAIN};

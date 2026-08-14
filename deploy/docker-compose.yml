@@ -4,6 +4,12 @@
 #   cp .env.example .env    # then fill it in
 #   ./start.sh              # builds, boots, and issues TLS certs
 #
+# The database is EXTERNAL by default - set MONGODB_URI to your Atlas (or other)
+# connection string and nothing here touches a Mongo image. To run Mongo inside
+# the stack instead, add this line to .env:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.local-db.yml
+#
 # Expects both repos cloned side by side:
 #
 #   <parent>/
@@ -12,8 +18,9 @@
 #
 # Override FRONTEND_CONTEXT in .env if the frontend lives somewhere else.
 #
-# Only nginx publishes ports. backend, frontend and mongo are reachable solely
-# on the internal `trademart` network.
+# Only nginx publishes ports. backend and frontend are reachable solely on the
+# internal `trademart` network. The database is external by default (Atlas);
+# the local-db overlay adds an internal-only `mongo` service.
 
 name: trademart
 
@@ -31,34 +38,6 @@ x-defaults: &defaults
       max-file: "5"
 
 services:
-  # --------------------------------------------------------------- mongo ------
-  mongo:
-    image: mongo:7
-    <<: *defaults
-    command:
-      - --wiredTigerCacheSizeGB
-      - "${MONGO_CACHE_SIZE_GB:-1}"
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:?set MONGO_INITDB_ROOT_USERNAME in deploy/.env}
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:?set MONGO_INITDB_ROOT_PASSWORD in deploy/.env}
-    volumes:
-      - mongo_data:/data/db
-      - mongo_config:/data/configdb
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - >-
-          mongosh --quiet
-          -u "$$MONGO_INITDB_ROOT_USERNAME"
-          -p "$$MONGO_INITDB_ROOT_PASSWORD"
-          --authenticationDatabase admin
-          --eval "db.adminCommand('ping').ok" | grep -q 1
-      interval: 20s
-      timeout: 5s
-      start_period: 40s
-      retries: 5
-    networks: [trademart]
-
   # ------------------------------------------------------------- backend ------
   backend:
     build:
@@ -76,6 +55,8 @@ services:
       FRONTEND_URL: ${FRONTEND_URL:?set FRONTEND_URL in deploy/.env}
 
       # Required when NODE_ENV=production - the process exits 1 without it.
+      # Point this at MongoDB Atlas (mongodb+srv://...) or any external server.
+      # To run Mongo inside the stack instead, see docker-compose.local-db.yml.
       MONGODB_URI: ${MONGODB_URI:?set MONGODB_URI in deploy/.env}
 
       SHOPIFY_STORE_DOMAIN: ${SHOPIFY_STORE_DOMAIN:?set SHOPIFY_STORE_DOMAIN in deploy/.env}
@@ -84,9 +65,8 @@ services:
       SHOPIFY_CLIENT_SECRET: ${SHOPIFY_CLIENT_SECRET:-}
       SHOPIFY_ACCESS_TOKEN: ${SHOPIFY_ACCESS_TOKEN:-}
       SHOPIFY_WEBHOOK_SECRET: ${SHOPIFY_WEBHOOK_SECRET:-}
-    depends_on:
-      mongo:
-        condition: service_healthy
+    # No depends_on: the database is external by default. The local-db override
+    # adds a depends_on for the bundled Mongo when you opt into it.
     expose:
       - "4000"
     networks: [trademart]
@@ -147,11 +127,16 @@ services:
       start_period: 10s
       retries: 3
     # Reload every 6h so renewed certificates are picked up without downtime.
+    #
+    # Deliberately plain POSIX sh: this image's /bin/sh is busybox ash, where
+    # `wait ${!}` is a "Bad substitution" syntax error that kills the whole
+    # script before nginx ever starts. A bare `sleep` needs no job-control
+    # plumbing because nginx, not this shell, is the process handling signals.
     command:
       - /bin/sh
       - -c
       - |
-        while :; do sleep 6h & wait $${!}; nginx -s reload; done &
+        while :; do sleep 6h; nginx -s reload; done &
         exec /docker-entrypoint.sh nginx -g 'daemon off;'
     networks: [trademart]
 
@@ -194,8 +179,6 @@ services:
     networks: [trademart]
 
 volumes:
-  mongo_data:
-  mongo_config:
   letsencrypt:
   letsencrypt_lib:
   certbot_www:

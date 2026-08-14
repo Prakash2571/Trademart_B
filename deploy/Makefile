@@ -31,8 +31,8 @@ restart: ## Restart containers in place
 down: ## Remove containers and the network, keeping all volumes/data
 	docker compose down --remove-orphans
 
-destroy: ## Remove containers AND volumes - DELETES THE DATABASE AND CERTIFICATES
-	@printf 'This deletes the Mongo volume and your TLS certificates. Type "yes" to continue: ' \
+destroy: ## Remove containers AND volumes - DELETES CERTIFICATES (and the local DB, if enabled)
+	@printf 'This deletes all volumes: your TLS certificates and, if the local database is enabled, its data. Type "yes" to continue: ' \
 	  && read ans && [ "$$ans" = "yes" ] || (echo "aborted"; exit 1)
 	docker compose down -v --remove-orphans
 
@@ -72,6 +72,8 @@ renew: ## Force a certificate renewal now
 shell-backend: ## Shell into the backend container
 	docker compose exec backend sh
 
-shell-mongo: ## Open a mongosh session against the database
+shell-mongo: ## Open a mongosh session against the LOCAL database (local-db mode only)
+	@docker compose ps --services 2>/dev/null | grep -qx mongo \
+	  || { echo "No local 'mongo' service - the database is external (Atlas). Use its own tools, e.g. the Atlas UI or 'mongosh \"$$MONGODB_URI\"'."; exit 1; }
 	docker compose exec mongo sh -c \
 	  'mongosh -u "$$MONGO_INITDB_ROOT_USERNAME" -p "$$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin'

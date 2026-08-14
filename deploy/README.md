@@ -1,8 +1,10 @@
 # Trademart deployment
 
 Single-host Docker Compose stack: nginx (TLS termination + reverse proxy) in
-front of the Next.js frontend and the Express API, with MongoDB and automatic
-Let's Encrypt renewal. Everything restarts on crash and on host boot.
+front of the Next.js frontend and the Express API, with automatic Let's Encrypt
+renewal. The database is **external by default** (MongoDB Atlas or any
+`mongodb+srv://` server); a bundled Mongo container is available as an opt-in
+overlay. Everything restarts on crash and on host boot.
 
 ```
                        :80 / :443
@@ -12,18 +14,39 @@ Let's Encrypt renewal. Everything restarts on crash and on host boot.
                     └──┬───────┬──┘
               /api/ ───┘       └─── /  and  /_next/static/
                    │                 │
-          ┌────────▼────────┐  ┌─────▼──────────┐
-          │ backend  :4000  │  │ frontend :3000 │
-          │ Express + TS    │  │ Next.js 15     │
+          ┌────────▼────────┐  ┌─────▼──────────┐   ┌──────────┐
+          │ backend  :4000  │  │ frontend :3000 │   │ certbot  │  renew, 12h
+          │ Express + TS    │  │ Next.js 15     │   └──────────┘
           └────────┬────────┘  └────────────────┘
                    │
-            ┌──────▼──────┐        ┌──────────┐
-            │ mongo :27017│        │ certbot  │  renew loop, every 12h
-            └─────────────┘        └──────────┘
+                   ▼
+        MONGODB_URI → external Atlas   (or the opt-in bundled mongo container,
+                                        see "Database" below)
 ```
 
-Only nginx publishes ports. `backend`, `frontend` and `mongo` are reachable
-solely on the internal `trademart` network.
+Only nginx publishes ports. `backend` and `frontend` are reachable solely on
+the internal `trademart` network.
+
+## Database
+
+**Default — external (Atlas).** The base `docker-compose.yml` has no database
+service, so nothing pulls a Mongo image. Set `MONGODB_URI` in `.env` to your
+`mongodb+srv://` connection string and you're done. Whitelist the host's public
+IP in the Atlas Network Access list.
+
+**Opt-in — bundled Mongo.** To run the database inside the stack instead, add
+one line to `.env`:
+
+```
+COMPOSE_FILE=docker-compose.yml:docker-compose.local-db.yml
+```
+
+then set `MONGO_INITDB_ROOT_USERNAME`, `MONGO_INITDB_ROOT_PASSWORD`, and
+`MONGODB_URI=mongodb://<user>:<password>@mongo:27017/trademart?authSource=admin`
+(all three are commented out in `.env.example`). Compose reads `COMPOSE_FILE`
+from `.env`, so every command — `./start.sh`, `make logs`, `docker compose ps` —
+picks up the overlay automatically. Data lives in the `trademart_mongo_data`
+volume, never published to the host.
 
 ## Prerequisites
 
@@ -52,8 +75,7 @@ git clone https://github.com/Prakash2571/Trademart_F.git
 
 cd Trademart_B/deploy
 cp .env.example .env
-openssl rand -hex 24          # paste into MONGO_INITDB_ROOT_PASSWORD *and* MONGODB_URI
-$EDITOR .env
+$EDITOR .env                  # set MONGODB_URI (Atlas), Shopify creds, LETSENCRYPT_EMAIL
 
 ./start.sh                    # or: make up
 ```
@@ -83,8 +105,8 @@ docker compose ps            # every service should read "healthy"
 | `make nginx-test` | Validate the *rendered* nginx config. |
 | `make renew` | Force certificate renewal now. |
 | `make stop` | Stop; stays stopped until `make start`. |
-| `make down` | Remove containers, **keep** data. |
-| `make destroy` | Remove containers **and volumes** — deletes the database. |
+| `make down` | Remove containers, **keep** volumes. |
+| `make destroy` | Remove containers **and volumes** — deletes certs and, in local-db mode, the database. |
 
 ### Deploying a new commit
 
@@ -94,8 +116,8 @@ git -C ../../Trademart_F  pull --ff-only
 cd Trademart_B/deploy && ./start.sh
 ```
 
-Compose recreates only the containers whose image changed, so nginx and mongo
-keep running.
+Compose recreates only the containers whose image changed, so nginx keeps
+running.
 
 ## Environment variables
 
@@ -113,9 +135,11 @@ Compose `.env` parsing has three gotchas worth repeating:
 Required — the stack refuses to start without them, by design, because
 `NODE_ENV=production` makes the API fail fast rather than boot degraded:
 
-`DOMAIN`, `FRONTEND_URL`, `MONGODB_URI`, `SHOPIFY_STORE_DOMAIN`,
-`MONGO_INITDB_ROOT_USERNAME`, `MONGO_INITDB_ROOT_PASSWORD`, plus
+`DOMAIN`, `FRONTEND_URL`, `MONGODB_URI`, `SHOPIFY_STORE_DOMAIN`, plus
 `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET` (or `SHOPIFY_ACCESS_TOKEN`).
+
+Only in **local-db mode** (`COMPOSE_FILE` overlay): also
+`MONGO_INITDB_ROOT_USERNAME` and `MONGO_INITDB_ROOT_PASSWORD`.
 
 Full per-variable reference for the API: [`../.env.example`](../.env.example).
 
@@ -138,10 +162,13 @@ $EDITOR .env
 docker compose up -d backend    # recreates just the API with the new env
 ```
 
-Rotating the Mongo password is different: `MONGO_INITDB_ROOT_*` only takes
-effect on an **empty** data volume. On an existing database, change it inside
-Mongo (`make shell-mongo`, then `db.changeUserPassword(...)`) and update
-`MONGODB_URI` to match.
+For an external database (Atlas), rotate the password in the provider's console
+and update `MONGODB_URI`, then `docker compose up -d backend`.
+
+In local-db mode it's different: `MONGO_INITDB_ROOT_*` only takes effect on an
+**empty** data volume. On an existing database, change it inside Mongo
+(`make shell-mongo`, then `db.changeUserPassword(...)`) and update `MONGODB_URI`
+to match.
 
 ## nginx
 
@@ -192,13 +219,13 @@ make nginx-test                # validate
 - `restart: unless-stopped` on every service — recovers from crashes, from OOM
   kills, and from a host reboot (as long as the Docker daemon is enabled:
   `sudo systemctl enable --now docker`). A deliberate `make stop` stays stopped.
-- **Healthchecks** on backend, frontend, mongo and nginx, visible in
-  `docker compose ps`.
+- **Healthchecks** on backend, frontend and nginx (plus mongo in local-db
+  mode), visible in `docker compose ps`.
 - **Capped logs** (10 MB × 5 per container). An unbounded `json-file` log
   filling the disk is the most common way a "never stops" stack actually dies.
 - **Graceful shutdown.** `dumb-init` is PID 1 in both app images, so `SIGTERM`
-  reaches Node and `src/server.ts` drains connections and closes Mongo instead
-  of being killed after the 10 s timeout.
+  reaches Node and `src/server.ts` drains connections and closes the DB
+  connection instead of being killed after the 10 s timeout.
 - **nginx survives a broken backend.** `depends_on` uses `service_started`, not
   `service_healthy`, so a bad env var takes down `/api` — not the whole site.
 - **Certificates renew themselves.** certbot checks every 12 h; nginx reloads
@@ -237,6 +264,16 @@ docker compose logs backend | tail -30
 Under `NODE_ENV=production` the API *requires* `MONGODB_URI`, a valid
 `SHOPIFY_STORE_DOMAIN`, and Shopify credentials.
 
+**`/api/health` shows the database disconnected (Atlas).** The connection
+itself is non-fatal — the API keeps serving Shopify reads and pricing — but if
+you expect persistence, check the URI is right and that the host's public IP is
+in Atlas's Network Access allowlist:
+
+```bash
+make health                       # inspect checks.database.status + .error
+curl -s http://169.254.169.254/latest/meta-data/public-ipv4   # IP to allowlist
+```
+
 **Frontend says "Could not reach the Trademart backend".** The value baked into
 the bundle is wrong. Confirm `NEXT_PUBLIC_API_BASE_URL=/api`, then rebuild —
 editing `.env` alone will not change an already-built bundle:
@@ -257,9 +294,10 @@ signs with; without it every delivery is refused. Register the endpoint as
 - **No lockfiles are committed** in either repo, so both Dockerfiles use
   `npm install` and builds are not byte-reproducible. Commit
   `package-lock.json` in both repos and switch the Dockerfiles to `npm ci`.
-- **Mongo runs unreplicated** with no automated backup. Before this carries real
-  data, add a `mongodump` sidecar or move to Atlas (set `MONGODB_URI` to the
-  `mongodb+srv://` string and drop the `mongo` service).
+- **Backups are your provider's job.** With external Atlas (the default),
+  backups and replication come from Atlas. In the opt-in local-db mode, Mongo
+  runs unreplicated with no automated backup — add a `mongodump` sidecar before
+  it carries real data, or just use Atlas.
 - **No Content-Security-Policy.** Next.js needs a nonce/hash strategy for its
   inline hydration script, which is an application change rather than an nginx
   one.
