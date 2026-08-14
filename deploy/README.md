@@ -108,6 +108,62 @@ docker compose ps            # every service should read "healthy"
 | `make down` | Remove containers, **keep** volumes. |
 | `make destroy` | Remove containers **and volumes** — deletes certs and, in local-db mode, the database. |
 
+## Starting, stopping, and changing `.env`
+
+You always edit the **same one file**: `~/trade/Trademart_B/deploy/.env`. (Not
+`.env.example`, not the repo-root `.env` — the containers only read
+`deploy/.env`.) Confirm what the containers will actually receive with:
+
+```bash
+docker compose config | grep -E 'MONGODB_URI|FRONTEND_URL|NEXT_PUBLIC'
+```
+
+### The verbs
+
+```bash
+make stop      # stop containers, keep them   (fastest; data + certs untouched)
+make start     # start again, no rebuild
+make down      # remove containers + network, KEEP volumes (certs, local DB)
+make up        # ./start.sh: build + boot + ensure TLS  (idempotent, always safe)
+```
+
+`make up` never deletes anything, so when in doubt just run it.
+
+### Which command after editing `.env` — by variable
+
+Different variables take effect in different ways, so match the command to what
+you changed:
+
+| You changed… | Run | Why |
+| --- | --- | --- |
+| `MONGODB_URI`, `SHOPIFY_*`, `FRONTEND_URL` (backend) | `docker compose up -d backend` | Runtime env — just recreate the API container. No rebuild. |
+| `NEXT_PUBLIC_API_BASE_URL` (frontend) | `docker compose build frontend && docker compose up -d frontend` | Next **bakes it in at build time**; editing `.env` alone changes nothing until you rebuild. |
+| `DOMAIN` | `docker compose up -d --force-recreate nginx` then `./start.sh --skip-build --force-renew` | Re-renders the nginx template, then issues a cert for the new name. |
+| `LETSENCRYPT_STAGING`, `LETSENCRYPT_EMAIL`, `TLS_MODE` | `./start.sh --skip-build --force-renew` | Only the certificate step is affected. |
+| `COMPOSE_FILE`, `MONGO_*` (switching the bundled DB on/off) | `docker compose up -d --remove-orphans` | Adds/removes the `mongo` service; `--remove-orphans` cleans up the one you dropped. |
+| Several things, or not sure | `make up` | Idempotent: rebuilds what changed, recreates what changed, re-checks TLS. |
+
+### Rule of thumb
+
+- **Backend var** → `docker compose up -d backend`
+- **Frontend URL** → `docker compose build frontend && docker compose up -d frontend`
+- **Domain / TLS** → `./start.sh --skip-build --force-renew`
+- **Anything else / unsure** → `make up`
+
+Prefer recreating a single service (`up -d <service>`) over a full
+`down`+`up` for routine edits — it's faster and the site keeps serving. Reach
+for `make down` only when you want a clean slate; `make destroy` only when you
+also want to discard certs and local data.
+
+### The safe iteration loop
+
+```bash
+nano .env
+make up               # or the targeted command from the table above
+docker compose ps     # every service healthy?
+make health           # /api/health payload — confirms DB + Shopify wiring
+```
+
 ### Deploying a new commit
 
 ```bash
