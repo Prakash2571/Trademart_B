@@ -3,6 +3,7 @@ dist/
 dist-test/
 
 # Environment - never commit real secrets
+# These patterns have no slash, so they match at any depth (including deploy/.env).
 .env
 .env.local
 .env.*.local
