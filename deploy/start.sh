@@ -202,21 +202,45 @@ if [ "$TLS_MODE" = "selfsigned" ]; then
 elif [ "$CERT_STATE" = "bootstrap" ] || [ "$FORCE_RENEW" -eq 1 ]; then
   step "Requesting a certificate from Let's Encrypt for $DOMAIN and www.$DOMAIN"
 
+  # Pass the ACME server EXPLICITLY. certbot stores the server URL in the
+  # renewal config on first issue and reuses it on every subsequent certonly,
+  # even with --force-renewal. So a cert first issued in staging keeps renewing
+  # from staging - flipping LETSENCRYPT_STAGING=0 alone does nothing - unless we
+  # override --server here.
+  if [ "$STAGING" = "1" ]; then
+    ACME_SERVER="https://acme-staging-v02.api.letsencrypt.org/directory"
+    warn "LETSENCRYPT_STAGING=1 - issuing an UNTRUSTED staging certificate. Set it to 0 and run './start.sh --skip-build --force-renew' for a real one."
+  else
+    ACME_SERVER="https://acme-v02.api.letsencrypt.org/directory"
+  fi
+
   CERTBOT_ARGS="certonly --webroot --webroot-path /var/www/certbot"
+  CERTBOT_ARGS="$CERTBOT_ARGS --server $ACME_SERVER"
   CERTBOT_ARGS="$CERTBOT_ARGS --email $EMAIL --agree-tos --no-eff-email --non-interactive"
   CERTBOT_ARGS="$CERTBOT_ARGS -d $DOMAIN -d www.$DOMAIN --key-type ecdsa"
-  if [ "$STAGING" = "1" ]; then
-    CERTBOT_ARGS="$CERTBOT_ARGS --staging"
-    warn "LETSENCRYPT_STAGING=1 - issuing an UNTRUSTED staging certificate. Set it to 0 and run './start.sh --skip-build --force-renew' for a real one."
-  fi
   # --force-renewal covers both cases: replacing the bootstrap cert, and an
   # explicit --force-renew. Passing it twice would make certbot complain.
   if [ "$CERT_STATE" = "bootstrap" ] || [ "$FORCE_RENEW" -eq 1 ]; then
     CERTBOT_ARGS="$CERTBOT_ARGS --force-renewal"
   fi
 
-  # The temporary certificate lives where certbot wants to write, so clear it.
-  if [ "$CERT_STATE" = "bootstrap" ]; then
+  # Decide whether the existing certificate lineage must be wiped first:
+  #  - bootstrap: it is our throwaway self-signed cert sitting where certbot
+  #    wants to write.
+  #  - server mismatch: the stored ACME server differs from the one we want now
+  #    (the staging -> production switch). Reusing the lineage would silently
+  #    renew from the OLD server; certbot would also refuse to change servers on
+  #    an existing lineage. Removing it forces a clean re-issue from $ACME_SERVER.
+  WIPE_LINEAGE=0
+  [ "$CERT_STATE" = "bootstrap" ] && WIPE_LINEAGE=1
+  STORED_SERVER="$(in_certbot "sed -n 's/^server *= *//p' /etc/letsencrypt/renewal/$DOMAIN.conf 2>/dev/null" 2>/dev/null | tr -d '\r' | head -n1)"
+  if [ -n "$STORED_SERVER" ] && [ "$STORED_SERVER" != "$ACME_SERVER" ]; then
+    step "ACME server changed - removing the old certificate lineage so it re-issues cleanly"
+    echo "    old: $STORED_SERVER"
+    echo "    new: $ACME_SERVER"
+    WIPE_LINEAGE=1
+  fi
+  if [ "$WIPE_LINEAGE" -eq 1 ]; then
     in_certbot "rm -rf /etc/letsencrypt/live/$DOMAIN /etc/letsencrypt/archive/$DOMAIN /etc/letsencrypt/renewal/$DOMAIN.conf" >/dev/null
   fi
 
