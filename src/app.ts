@@ -4,10 +4,14 @@
  * Middleware order matters here:
  *  1. security headers
  *  2. CORS restricted to the configured frontend origin
- *  3. webhook router FIRST, because HMAC verification needs the raw body and a
+ *  3. webhook RECEIVER first, because HMAC verification needs the raw body and a
  *     global JSON parser would consume it
  *  4. JSON parser + rate limiting for the normal API surface
  *  5. 404 handler, then the terminal error handler
+ *
+ * The webhook receiver and the webhook admin routes are deliberately two
+ * different routers: only the receiver needs the raw body, and mounting the
+ * admin routes before the JSON parser would leave them unable to read a body.
  */
 
 import cors from 'cors';
@@ -17,6 +21,7 @@ import helmet from 'helmet';
 
 import { errorHandler, notFoundHandler } from './common/errorHandler';
 import { analyticsRouter } from './analytics/analytics.controller';
+import { oauthRouter } from './auth/oauth.controller';
 import { config } from './config';
 import { customersRouter } from './customers/customers.controller';
 import { healthRouter } from './health/health.controller';
@@ -26,7 +31,10 @@ import { pricingRouter } from './pricing/pricing.controller';
 import { productsRouter } from './products/products.controller';
 import { shopifyRouter } from './shopify/shopify.controller';
 import { suppliersRouter } from './suppliers/suppliers.controller';
-import { webhooksRouter } from './webhooks/webhooks.controller';
+import {
+  webhookAdminRouter,
+  webhooksRouter,
+} from './webhooks/webhooks.controller';
 
 export function createApp(): Express {
   const app = express();
@@ -70,6 +78,12 @@ export function createApp(): Express {
   );
 
   app.use('/api', healthRouter);
+  // OAuth redirect flow. Mounted after the JSON parser (these are ordinary GET
+  // redirects, not raw-body routes) and inside the rate limiter.
+  app.use('/api/auth', oauthRouter);
+  // Webhook registration/admin routes. Separate from webhooksRouter because
+  // those must stay ahead of express.json() for raw-body HMAC verification.
+  app.use('/api', webhookAdminRouter);
   app.use('/api/shopify', shopifyRouter);
   app.use('/api/shopify', productsRouter);
   app.use('/api/shopify', ordersRouter);

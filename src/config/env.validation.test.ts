@@ -210,3 +210,187 @@ describe('validateEnv', () => {
     assert.equal(result.config?.shopify.accessToken, null);
   });
 });
+
+describe('validateEnv - APP_URL and derived callback URLs', () => {
+  it('leaves OAuth and webhook URLs null when APP_URL is unset', () => {
+    const result = validateEnv(VALID);
+
+    assert.equal(result.config?.appUrl, null);
+    assert.equal(result.config?.shopify.oauthRedirectUri, null);
+    assert.equal(result.config?.shopify.webhookCallbackUrl, null);
+    assert.ok(result.warnings.some((warning) => warning.includes('APP_URL')));
+  });
+
+  it('derives the redirect and webhook URLs from APP_URL', () => {
+    const result = validateEnv({ ...VALID, APP_URL: 'https://app.example.com' });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(
+      result.config?.shopify.oauthRedirectUri,
+      'https://app.example.com/api/auth/callback',
+    );
+    assert.equal(
+      result.config?.shopify.webhookCallbackUrl,
+      'https://app.example.com/api/webhooks/shopify',
+    );
+  });
+
+  it('strips trailing slashes so the redirect URI never doubles up', () => {
+    // Shopify compares the redirect_uri exactly; "//api/auth/callback" would not match.
+    const result = validateEnv({ ...VALID, APP_URL: 'https://app.example.com///' });
+
+    assert.equal(
+      result.config?.shopify.oauthRedirectUri,
+      'https://app.example.com/api/auth/callback',
+    );
+  });
+
+  it('rejects an APP_URL with no scheme', () => {
+    const result = validateEnv({ ...VALID, APP_URL: 'app.example.com' });
+
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((error) => error.includes('APP_URL')));
+  });
+
+  it('warns that a localhost APP_URL is unreachable by Shopify', () => {
+    const result = validateEnv({ ...VALID, APP_URL: 'http://localhost:4000' });
+
+    assert.deepEqual(result.errors, []);
+    assert.ok(result.warnings.some((warning) => warning.includes('cannot reach')));
+  });
+
+  it('requires https for APP_URL in production', () => {
+    const result = validateEnv({
+      ...VALID,
+      NODE_ENV: 'production',
+      APP_URL: 'http://app.example.com',
+    });
+
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((error) => error.includes('https')));
+  });
+});
+
+describe('validateEnv - SHOPIFY_SCOPES', () => {
+  it('defaults to the scopes the dashboard actually reads', () => {
+    const result = validateEnv(VALID);
+
+    assert.deepEqual(result.config?.shopify.scopes, [
+      'read_products',
+      'read_orders',
+      'read_customers',
+      'read_inventory',
+    ]);
+  });
+
+  it('parses a comma-separated list and lowercases it', () => {
+    const result = validateEnv({
+      ...VALID,
+      SHOPIFY_SCOPES: 'read_products, READ_ORDERS',
+    });
+
+    assert.deepEqual(result.config?.shopify.scopes, ['read_products', 'read_orders']);
+  });
+
+  it('de-duplicates repeated scopes', () => {
+    // Shopify rejects an authorize URL with a repeated scope.
+    const result = validateEnv({
+      ...VALID,
+      SHOPIFY_SCOPES: 'read_products,read_products,read_orders',
+    });
+
+    assert.deepEqual(result.config?.shopify.scopes, ['read_products', 'read_orders']);
+  });
+
+  it('rejects a scope name with invalid characters', () => {
+    const result = validateEnv({ ...VALID, SHOPIFY_SCOPES: 'read products!' });
+
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((error) => error.includes('SHOPIFY_SCOPES')));
+  });
+});
+
+describe('validateEnv - SHOPIFY_AUTH_MODE and TOKEN_ENCRYPTION_KEY', () => {
+  const KEY_B64 = Buffer.alloc(32, 7).toString('base64');
+
+  it('defaults to auto mode, preserving the existing strategy', () => {
+    const result = validateEnv(VALID);
+
+    assert.equal(result.config?.shopify.authMode, 'auto');
+    assert.equal(result.config?.shopify.authStrategy, 'CLIENT_CREDENTIALS');
+  });
+
+  it('rejects an unknown auth mode', () => {
+    const result = validateEnv({ ...VALID, SHOPIFY_AUTH_MODE: 'sometimes' });
+
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((error) => error.includes('SHOPIFY_AUTH_MODE')));
+  });
+
+  it('switches the strategy to OAUTH_OFFLINE in oauth mode', () => {
+    const result = validateEnv({
+      ...VALID,
+      SHOPIFY_AUTH_MODE: 'oauth',
+      APP_URL: 'https://app.example.com',
+      TOKEN_ENCRYPTION_KEY: KEY_B64,
+    });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.shopify.authStrategy, 'OAUTH_OFFLINE');
+  });
+
+  it('requires an encryption key in oauth mode', () => {
+    const result = validateEnv({
+      ...VALID,
+      SHOPIFY_AUTH_MODE: 'oauth',
+      APP_URL: 'https://app.example.com',
+    });
+
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((error) => error.includes('TOKEN_ENCRYPTION_KEY')));
+  });
+
+  it('requires APP_URL in oauth mode', () => {
+    const result = validateEnv({
+      ...VALID,
+      SHOPIFY_AUTH_MODE: 'oauth',
+      TOKEN_ENCRYPTION_KEY: KEY_B64,
+    });
+
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((error) => error.includes('APP_URL')));
+  });
+
+  it('accepts a 32-byte key in hex as well as base64', () => {
+    const result = validateEnv({
+      ...VALID,
+      TOKEN_ENCRYPTION_KEY: Buffer.alloc(32, 9).toString('hex'),
+    });
+
+    assert.deepEqual(result.errors, []);
+  });
+
+  it('rejects a key that does not decode to 32 bytes', () => {
+    const result = validateEnv({
+      ...VALID,
+      TOKEN_ENCRYPTION_KEY: Buffer.alloc(16, 1).toString('base64'),
+    });
+
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((error) => error.includes('32 bytes')));
+  });
+
+  it('leaves the static token override in charge even in oauth mode', () => {
+    // An explicit SHOPIFY_ACCESS_TOKEN is a deliberate debugging override and
+    // must keep winning, exactly as it does in auto mode.
+    const result = validateEnv({
+      ...VALID,
+      SHOPIFY_AUTH_MODE: 'oauth',
+      APP_URL: 'https://app.example.com',
+      TOKEN_ENCRYPTION_KEY: KEY_B64,
+      SHOPIFY_ACCESS_TOKEN: 'shpat_example',
+    });
+
+    assert.equal(result.config?.shopify.authStrategy, 'STATIC_TOKEN');
+  });
+});
