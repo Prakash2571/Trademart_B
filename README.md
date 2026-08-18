@@ -47,13 +47,22 @@ All secrets live here and **never** leave the server. Never commit `.env`.
 | `NODE_ENV` | no | `development` | `development` \| `test` \| `production` |
 | `PORT` | no | `4000` | |
 | `FRONTEND_URL` | no | `http://localhost:3000` | The **only** allowed CORS origin. Next.js dev runs on 3000. |
+| `APP_URL` | no | — | This backend's own **public** origin, as Shopify sees it. Enables the OAuth redirect flow and webhook registration. Must be `https` in production. |
 | `MONGODB_URI` | no in dev | — | Blank = run without persistence. Required when `NODE_ENV=production`. |
 | `SHOPIFY_STORE_DOMAIN` | **yes** | — | Must be the `.myshopify.com` domain. |
 | `SHOPIFY_API_VERSION` | no | `2026-07` | Format `YYYY-MM`. |
 | `SHOPIFY_CLIENT_ID` | no in dev, **yes in prod** | — | From the Dev Dashboard. Half a pair is a startup error. |
-| `SHOPIFY_CLIENT_SECRET` | no in dev, **yes in prod** | — | Paired with the client id. |
+| `SHOPIFY_CLIENT_SECRET` | no in dev, **yes in prod** | — | Paired with the client id. Also signs/verifies the OAuth HMAC. |
 | `SHOPIFY_ACCESS_TOKEN` | no | — | **Optional override.** Disables automatic refresh — see below. |
 | `SHOPIFY_WEBHOOK_SECRET` | no | — | Required before webhook deliveries are accepted. |
+| `SHOPIFY_SCOPES` | no | `read_products,read_orders,read_customers,read_inventory` | Scopes requested by the OAuth flow. Ignored under managed installation. |
+| `SHOPIFY_AUTH_MODE` | no | `auto` | `auto` = client credentials grant. `oauth` = use the stored per-merchant offline token. |
+| `TOKEN_ENCRYPTION_KEY` | only for `oauth` | — | 32 bytes (hex or base64) encrypting offline tokens at rest. `openssl rand -base64 32`. |
+
+`APP_URL` is **not** `FRONTEND_URL`: the first is this API as Shopify reaches it,
+the second is the browser app allowed through CORS. Shopify cannot reach
+`localhost`, so a tunnel URL is required for local OAuth/webhook testing — the
+server logs a warning if `APP_URL` points at localhost.
 
 Config is validated at boot. Structural mistakes (bad port, an
 `admin.shopify.com` URL, a malformed API version) **abort startup** with a
@@ -296,12 +305,13 @@ logged). Leave it blank unless you specifically need it — for an admin-created
 custom app that issued a long-lived `shpat_` token, or to debug against a known
 token. If both it and the client credentials are set, the static token wins.
 
-### Adding merchant OAuth later
+### Merchant OAuth (redirect flow)
 
-Multi-merchant OAuth is deliberately **not** implemented, but the seam for it
-exists. Everything obtains tokens through `ShopifyTokenProvider`
-(`src/shopify/token/token.types.ts`), and every method is already keyed by
-**shop domain**:
+Implemented and **opt-in**. Full guide: [docs/OAUTH_AND_WEBHOOKS.md](docs/OAUTH_AND_WEBHOOKS.md).
+
+Everything obtains tokens through `ShopifyTokenProvider`
+(`src/shopify/token/token.types.ts`), keyed by **shop domain**, which is what let
+OAuth slot in without touching the client, services or controllers:
 
 ```ts
 interface ShopifyTokenProvider {
@@ -313,10 +323,42 @@ interface ShopifyTokenProvider {
 }
 ```
 
-To add per-merchant OAuth: implement an `OAUTH_OFFLINE` provider that resolves
-tokens per shop from the database (encrypted at rest) and return it from
-`src/shopify/token/index.ts`. The client, services and controllers need no
-changes — they already pass a shop domain and never see a credential.
+The redirect URL to add under **App access → Allowed redirection URL(s)** is:
+
+```
+https://<APP_URL>/api/auth/callback
+```
+
+`GET /api/auth/status` prints the exact string to paste, because Shopify compares
+it character for character.
+
+Two things are worth knowing before enabling it:
+
+- **Completing an install does not change how requests authenticate.** That
+  requires `SHOPIFY_AUTH_MODE=oauth`. The default (`auto`) keeps using the client
+  credentials grant, so adding OAuth cannot silently change a working deployment.
+- **Offline tokens are encrypted at rest** with AES-256-GCM
+  (`TOKEN_ENCRYPTION_KEY`), and a completed install therefore needs MongoDB.
+  Changing the key invalidates every stored token.
+
+### Webhooks
+
+Receipt was already implemented; registration now exists too.
+
+```bash
+curl -X POST "http://localhost:4000/api/webhooks/register?dryRun=1"  # preview
+curl -X POST  http://localhost:4000/api/webhooks/register            # apply
+curl http://localhost:4000/api/webhooks/subscriptions                # live state
+```
+
+Needs `APP_URL` (Shopify cannot reach localhost — use a tunnel),
+`SHOPIFY_WEBHOOK_SECRET`, and the `write_webhooks` scope. Registration is
+idempotent: it reconciles against Shopify rather than blindly creating, so running
+it twice will not double your deliveries. Deliveries are de-duplicated by
+`X-Shopify-Webhook-Id`.
+
+See [docs/OAUTH_AND_WEBHOOKS.md](docs/OAUTH_AND_WEBHOOKS.md) for the reconciliation
+rules, the two different HMAC schemes, and a troubleshooting table.
 
 ### Scopes and what breaks without them
 
@@ -325,16 +367,25 @@ changes — they already pass a shop domain and never see a credential.
 | `read_products` | `/shopify/products` | Products fail with `SHOPIFY_SCOPE_MISSING` |
 | `read_orders` | `/shopify/orders`, analytics, revenue | Orders and all revenue figures unavailable |
 | `read_inventory` | `/shopify/inventory`, `totalInventory`, `inventoryQuantity`, cost per item | Products still load; inventory/cost fields return `null` and `meta.degraded` lists them |
-| `read_customers` | `/shopify/customers`, order customer | Customer PII withheld; aggregates still work |
+| `read_customers` | `/shopify/customers`, order customer, **the dashboard customer count** | `customersCount` fails with `SHOPIFY_SCOPE_MISSING`; the Customers stat shows as unavailable and the dashboard reports the issue under `shopify.counts.customers` |
 | `read_reports` | ShopifyQL analytics | Traffic endpoint reports `available: false` |
+| `write_webhooks` | `POST /api/webhooks/register` | Subscriptions cannot be registered; listing still works with `read_webhooks` |
 
-Reads that hit a missing scope automatically retry a **reduced query** and report
-what was dropped in `meta.degraded`, rather than failing the whole page. Missing
-fields come back as `null` — never as `0`.
+List reads that hit a missing scope automatically retry a **reduced query** and
+report what was dropped in `meta.degraded`, rather than failing the whole page.
+Missing fields come back as `null` — never as `0`.
+
+**Counts are different.** `getCounts()` has no reduced form to fall back on — a
+count either works or it doesn't — so each count is fetched in its own request
+and a failure is reported as a per-section issue (`shopify.counts.customers`)
+while the rest of the dashboard still renders. This is why a missing
+`read_customers` shows up as a warning banner rather than a blank page.
 
 Customer PII is additionally gated by Shopify's
 [protected customer data](https://shopify.dev/docs/apps/launch/protected-customer-data)
-approval, which is separate from the scope.
+approval, which is separate from the scope. A custom app installed on a store
+inside your own organisation has that access by default, and it is auto-granted on
+development stores — so on a test store the scope alone is normally enough.
 
 ---
 
@@ -406,8 +457,14 @@ Envelopes are consistent:
 | GET | `/api/suppliers/providers` | Registered providers + real capabilities |
 | POST | `/api/pricing/calculate` | Profit/margin from a selling price + costs |
 | POST | `/api/pricing/suggest-price` | Selling price for a desired margin |
-| POST | `/api/webhooks/shopify` | HMAC-verified receiver (no subscriptions registered yet) |
-| GET | `/api/webhooks/status` | What is configured / planned |
+| POST | `/api/webhooks/shopify` | HMAC-verified receiver. De-duplicates retries by `X-Shopify-Webhook-Id`. |
+| GET | `/api/webhooks/status` | Local configuration. Always answers, even if Shopify is down. |
+| GET | `/api/webhooks/subscriptions` | What Shopify actually has registered |
+| POST | `/api/webhooks/register` | Reconcile subscriptions. `?dryRun=1` to preview. |
+| POST | `/api/webhooks/unregister` | Delete one subscription: `{ "id": "gid://shopify/WebhookSubscription/…" }` |
+| GET | `/api/auth/install` | `?shop=<store>.myshopify.com` — starts the OAuth handshake (302) |
+| GET | `/api/auth/callback` | The allow-listed redirect URL Shopify calls back |
+| GET | `/api/auth/status` | OAuth diagnostics, including the exact `redirectUri` to allow-list |
 
 ### Error codes
 
@@ -416,7 +473,9 @@ Envelopes are consistent:
 `SHOPIFY_THROTTLED`, `SHOPIFY_GRAPHQL_ERROR`, `SHOPIFY_USER_ERROR`,
 `SHOPIFY_HTTP_ERROR`, `SHOPIFY_NETWORK_ERROR`, `SHOPIFY_NOT_FOUND`,
 `VALIDATION_ERROR`, `NOT_FOUND`, `DATABASE_UNAVAILABLE`, `RATE_LIMITED`,
-`INTERNAL_ERROR`, `WEBHOOK_NOT_CONFIGURED`, `WEBHOOK_INVALID_SIGNATURE`.
+`INTERNAL_ERROR`, `WEBHOOK_NOT_CONFIGURED`, `WEBHOOK_INVALID_SIGNATURE`,
+`WEBHOOK_REGISTRATION_FAILED`, `OAUTH_NOT_CONFIGURED`, `OAUTH_INVALID_REQUEST`,
+`OAUTH_INVALID_HMAC`, `OAUTH_STATE_INVALID`, `ENCRYPTION_NOT_CONFIGURED`.
 
 ### Rate limits
 
@@ -479,11 +538,15 @@ real imported product and extend the markers in
 
 ## Webhooks
 
-Not required for the first milestone; the receiver exists and is ready.
+Receiving and registering are both implemented. Full guide:
+[docs/OAUTH_AND_WEBHOOKS.md](docs/OAUTH_AND_WEBHOOKS.md).
 
 Order of operations, never reordered: **verify HMAC over the raw body → verify
 the shop domain → then parse**. The route is mounted before the JSON body parser
 because the signature is computed over the exact bytes Shopify sent.
+
+Retries are de-duplicated by `X-Shopify-Webhook-Id`, so a slow response followed
+by a Shopify retry cannot count the same order twice.
 
 `localhost` is not reachable by Shopify. For local testing, use a Shopify CLI
 tunnel — **no purchased domain is needed**:
@@ -493,12 +556,22 @@ npm install -g @shopify/cli@latest
 shopify app dev            # prints a public https URL
 ```
 
-Point the subscription at `<public-url>/api/webhooks/shopify` and set
-`SHOPIFY_WEBHOOK_SECRET`. Without that secret every delivery is rejected with
-`WEBHOOK_NOT_CONFIGURED`.
+Set `APP_URL` to that https URL and set `SHOPIFY_WEBHOOK_SECRET` — without the
+secret every delivery is rejected with `WEBHOOK_NOT_CONFIGURED`. Then register:
 
-Planned topics: order create/update/cancel, fulfillment create/update, product
-create/update/delete, customer create/update.
+```bash
+curl -X POST "http://localhost:4000/api/webhooks/register?dryRun=1"  # preview
+curl -X POST  http://localhost:4000/api/webhooks/register            # apply
+```
+
+Registration reconciles against Shopify instead of blindly creating, so it is safe
+to re-run; a topic already pointing at the right URL is left alone. Requires the
+`write_webhooks` scope.
+
+Registered topics: app uninstalled, order create/update/cancel, fulfillment
+create/update, product create/update/delete, customer create/update.
+`app/uninstalled` is the only one with a handler today — it clears the stored
+offline token. Other topics are verified and stored with `processed: false`.
 
 ---
 
@@ -511,7 +584,7 @@ npm test
 Compiles with `tsc` and runs Node's built-in runner — **no Shopify access and no
 network required**. Shopify payloads are mocked.
 
-**99 tests currently pass.** Coverage:
+**204 tests currently pass.** Coverage:
 
 | Area | File |
 | --- | --- |
@@ -521,6 +594,10 @@ network required**. Shopify payloads are mocked.
 | Environment / config validation | `src/config/env.validation.test.ts` |
 | Token caching, refresh, single-flight | `src/shopify/token/token.test.ts` |
 | Webhook HMAC verification | `src/webhooks/webhook.verify.test.ts` |
+| Webhook registration / idempotency | `src/webhooks/webhook.registration.test.ts` |
+| OAuth callback HMAC | `src/auth/oauth.hmac.test.ts` |
+| OAuth state nonce (CSRF, expiry, forgery) | `src/auth/oauth.state.test.ts` |
+| Token encryption at rest | `src/common/crypto.test.ts` |
 | Supplier classification | `src/suppliers/supplier.registry.test.ts` |
 | Shopify → DTO mapping | `src/shopify/shopify.mappers.test.ts` |
 | Analytics aggregation | `src/analytics/analytics.test.ts` |
@@ -536,15 +613,17 @@ src/
 ├── server.ts              entry point
 ├── app.ts                 middleware + route wiring
 ├── config/                env validation (pure) + loader
-├── common/                errors, logger (redacting), http, validation
+├── common/                errors, logger (redacting), http, validation, crypto
+├── auth/                  OAuth redirect flow (HMAC, state, code exchange)
 ├── shopify/               client, service, mappers, error mapping, throttling
-│   └── graphql/           query documents (FULL + BASIC scope variants)
+│   ├── graphql/           query documents (FULL + BASIC scope variants)
+│   └── token/             token providers: client credentials, static, OAuth offline
 ├── products/  orders/  customers/  inventory/    controllers
 ├── analytics/             real-data aggregates + honest unavailability
 ├── pricing/               standalone margin engine
 ├── suppliers/             SupplierProvider + registry
 │   └── tradelle/
-├── webhooks/              HMAC verification + receiver
+├── webhooks/              HMAC verification, receiver, registration
 ├── database/              Mongo connection + models
 ├── integrations/          shopify (done), meta + google (placeholders only)
 ├── health/
@@ -560,6 +639,12 @@ src/
 - `/api/shopify/status` reports credential **presence as booleans** — never values.
 - CORS is restricted to `FRONTEND_URL`; `helmet` sets security headers; `/api` is rate limited.
 - All query/body input is validated; Shopify ids are treated as opaque strings.
+- The OAuth `shop` parameter is validated against the `.myshopify.com` pattern before
+  being interpolated into any URL — an unchecked value would be an open redirect.
+- OAuth callbacks are verified by HMAC **then** by a signed, shop-bound `state`
+  nonce, before any parameter is trusted or any token is stored.
+- Offline access tokens are encrypted with AES-256-GCM before being persisted;
+  nothing in the schema ever holds a readable credential.
 - No card data, no payment gateway secrets, no customer passwords — Shopify owns checkout.
 - No Shopify Admin scraping, no browser automation, no private endpoints.
 
@@ -568,6 +653,11 @@ src/
 ## Not implemented (intentionally)
 
 Direct Tradelle API · Meta/Google Ads · automated campaigns · automatic price
-changes · automatic supplier ordering · payment processing · merchant OAuth ·
+changes · automatic supplier ordering · payment processing ·
 multi-tenant architecture · subscription billing · microservices · Kafka · Redis
 · Kubernetes · queues · AI recommendations · production deployment.
+
+Merchant OAuth **is** implemented but is opt-in (`SHOPIFY_AUTH_MODE=oauth`); the
+default remains the single-store client credentials grant. Multi-tenancy is still
+out of scope — the token seam is keyed by shop domain, but the rest of the app
+assumes one configured store.

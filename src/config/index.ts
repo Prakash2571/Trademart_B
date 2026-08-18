@@ -50,4 +50,27 @@ export const isShopifyConfigured = (): boolean => config.shopify.authStrategy !=
 /** True when a Mongo connection string was supplied. */
 export const isDatabaseConfigured = (): boolean => config.mongoUri !== null;
 
+/**
+ * True when the OAuth redirect flow can run.
+ *
+ * All three are genuinely required: the client id/secret sign the handshake and
+ * exchange the code, and APP_URL forms the redirect_uri that Shopify compares
+ * character-for-character against its allow-list.
+ */
+export const isOAuthConfigured = (): boolean =>
+  config.appUrl !== null &&
+  config.shopify.clientId !== null &&
+  config.shopify.clientSecret !== null;
+
+/**
+ * True when offline tokens can be encrypted before being persisted. Without it
+ * the OAuth callback refuses to store a token rather than writing plaintext.
+ */
+export const isTokenEncryptionConfigured = (): boolean =>
+  config.tokenEncryptionKey !== null;
+
+/** True when webhook subscriptions can be registered with a reachable URL. */
+export const isWebhookRegistrationConfigured = (): boolean =>
+  config.shopify.webhookCallbackUrl !== null;
+
 export type { AppConfig } from './env.validation';

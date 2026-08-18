@@ -7,15 +7,20 @@
  *   3. neither                   -> null, and Shopify routes report
  *                                   SHOPIFY_NOT_CONFIGURED
  *
- * When multi-merchant OAuth is added, this is the only place that needs to
- * learn about it: return an OAuth-offline provider that resolves tokens per
- * shop from the database. Nothing downstream changes, because everything
- * already asks for a token by shop domain.
+ * Multi-merchant OAuth slots in here and nowhere else: OAUTH_OFFLINE resolves
+ * tokens per shop from the database. Nothing downstream changes, because
+ * everything already asks for a token by shop domain.
+ *
+ * OAuth is opt-in via SHOPIFY_AUTH_MODE=oauth rather than being picked
+ * automatically. Adding a redirect flow must not silently change how an
+ * already-working single-store deployment authenticates, and both paths use the
+ * same client id/secret - so presence of credentials cannot disambiguate them.
  */
 
 import { config } from '../../config';
 import { logger } from '../../common/logger';
 import { ClientCredentialsTokenProvider } from './clientCredentials.provider';
+import { OAuthOfflineTokenProvider } from './oauthOffline.provider';
 import { StaticTokenProvider } from './static.provider';
 import type { ShopifyTokenProvider } from './token.types';
 
@@ -27,6 +32,16 @@ function build(): ShopifyTokenProvider | null {
       'Using SHOPIFY_ACCESS_TOKEN override. Unset it to use the client credentials grant, which refreshes automatically.',
     );
     return new StaticTokenProvider(config.shopify.accessToken);
+  }
+
+  // Checked before client credentials: in oauth mode the stored per-merchant
+  // token is the authority, even though the same client id/secret are also set
+  // (they are needed to perform the handshake itself).
+  if (config.shopify.authMode === 'oauth') {
+    logger.info(
+      'SHOPIFY_AUTH_MODE=oauth - Admin API calls will use the stored per-merchant offline token.',
+    );
+    return new OAuthOfflineTokenProvider();
   }
 
   if (config.shopify.clientId !== null && config.shopify.clientSecret !== null) {
@@ -53,4 +68,5 @@ export function resetTokenProvider(): void {
 export type { ShopifyTokenProvider, TokenDiagnostics, AuthStrategy } from './token.types';
 export type { CachedToken } from './token.cache';
 export { ClientCredentialsTokenProvider } from './clientCredentials.provider';
+export { OAuthOfflineTokenProvider } from './oauthOffline.provider';
 export { StaticTokenProvider } from './static.provider';
