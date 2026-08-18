@@ -77,6 +77,14 @@ export interface AppConfig {
   mongoUri: string | null;
   /** AES-256-GCM key for encrypting offline tokens at rest. */
   tokenEncryptionKey: string | null;
+  /**
+   * Master kill switch for storefront writes (prices and visibility).
+   *
+   * Defaults to FALSE. Preview endpoints always work; nothing can mutate the
+   * shop until this is deliberately turned on, so deploying automation cannot
+   * change a live storefront by accident.
+   */
+  automationEnabled: boolean;
   shopify: ShopifyConfig;
 }
 
@@ -395,6 +403,37 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     );
   }
 
+  // ---- AUTOMATION_ENABLED ------------------------------------------------
+  //
+  // Off unless explicitly "true". Any other value is rejected rather than
+  // treated as falsy: a typo like AUTOMATION_ENABLED=yes silently disabling
+  // writes is confusing, and silently ENABLING them would be dangerous.
+  const rawAutomation = read(env, 'AUTOMATION_ENABLED');
+  let automationEnabled = false;
+  if (rawAutomation !== null) {
+    const normalised = rawAutomation.toLowerCase();
+    if (normalised === 'true') automationEnabled = true;
+    else if (normalised === 'false') automationEnabled = false;
+    else {
+      errors.push(
+        `AUTOMATION_ENABLED must be "true" or "false" (received "${rawAutomation}").`,
+      );
+    }
+  }
+  if (automationEnabled) {
+    // Writing prices/status needs write_products. Warn rather than error: the
+    // scopes may come from shopify.app.toml under managed installation, which
+    // this validator cannot see.
+    if (!scopes.includes('write_products')) {
+      warnings.push(
+        'AUTOMATION_ENABLED=true but SHOPIFY_SCOPES does not include write_products - price and visibility writes will fail with SHOPIFY_SCOPE_MISSING.',
+      );
+    }
+    warnings.push(
+      'AUTOMATION_ENABLED=true - Trademart may change product prices and visibility in the live store. Use POST /api/automation/preview first.',
+    );
+  }
+
   if (errors.length > 0) {
     return { config: null, errors, warnings };
   }
@@ -408,6 +447,7 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
       appUrl,
       mongoUri,
       tokenEncryptionKey,
+      automationEnabled,
       shopify: {
         storeDomain,
         apiVersion,

@@ -73,4 +73,12 @@ export const isTokenEncryptionConfigured = (): boolean =>
 export const isWebhookRegistrationConfigured = (): boolean =>
   config.shopify.webhookCallbackUrl !== null;
 
+/**
+ * True when automation is permitted to WRITE to the store.
+ *
+ * Preview/plan endpoints ignore this; only the apply path consults it, so a
+ * misconfigured deployment can always still be inspected safely.
+ */
+export const isAutomationEnabled = (): boolean => config.automationEnabled;
+
 export type { AppConfig } from './env.validation';

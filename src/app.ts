@@ -21,6 +21,7 @@ import helmet from 'helmet';
 
 import { errorHandler, notFoundHandler } from './common/errorHandler';
 import { analyticsRouter } from './analytics/analytics.controller';
+import { automationRouter } from './automation/automation.controller';
 import { oauthRouter } from './auth/oauth.controller';
 import { config } from './config';
 import { customersRouter } from './customers/customers.controller';
@@ -92,6 +93,7 @@ export function createApp(): Express {
   app.use('/api', pricingRouter);
   app.use('/api', analyticsRouter);
   app.use('/api', suppliersRouter);
+  app.use('/api', automationRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

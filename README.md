@@ -58,6 +58,7 @@ All secrets live here and **never** leave the server. Never commit `.env`.
 | `SHOPIFY_SCOPES` | no | `read_products,read_orders,read_customers,read_inventory` | Scopes requested by the OAuth flow. Ignored under managed installation. |
 | `SHOPIFY_AUTH_MODE` | no | `auto` | `auto` = client credentials grant. `oauth` = use the stored per-merchant offline token. |
 | `TOKEN_ENCRYPTION_KEY` | only for `oauth` | — | 32 bytes (hex or base64) encrypting offline tokens at rest. `openssl rand -base64 32`. |
+| `AUTOMATION_ENABLED` | no | `false` | **Kill switch for storefront writes.** `true` lets Trademart change live prices and product visibility. Must be exactly `true`/`false`. |
 
 `APP_URL` is **not** `FRONTEND_URL`: the first is this API as Shopify reaches it,
 the second is the browser app allowed through CORS. Shopify cannot reach
@@ -370,6 +371,7 @@ rules, the two different HMAC schemes, and a troubleshooting table.
 | `read_customers` | `/shopify/customers`, order customer, **the dashboard customer count** | `customersCount` fails with `SHOPIFY_SCOPE_MISSING`; the Customers stat shows as unavailable and the dashboard reports the issue under `shopify.counts.customers` |
 | `read_reports` | ShopifyQL analytics | Traffic endpoint reports `available: false` |
 | `write_webhooks` | `POST /api/webhooks/register` | Subscriptions cannot be registered; listing still works with `read_webhooks` |
+| `write_products` | `POST /api/automation/apply` | Price and visibility changes fail with `SHOPIFY_SCOPE_MISSING`; preview still works |
 
 List reads that hit a missing scope automatically retry a **reduced query** and
 report what was dropped in `meta.degraded`, rather than failing the whole page.
@@ -465,6 +467,10 @@ Envelopes are consistent:
 | GET | `/api/auth/install` | `?shop=<store>.myshopify.com` — starts the OAuth handshake (302) |
 | GET | `/api/auth/callback` | The allow-listed redirect URL Shopify calls back |
 | GET | `/api/auth/status` | OAuth diagnostics, including the exact `redirectUri` to allow-list |
+| GET | `/api/automation/status` | Kill switch, default rules, cost source, readiness |
+| POST | `/api/automation/preview` | What automation **would** change. Never writes. |
+| POST | `/api/automation/apply` | Applies price/visibility changes. Needs `AUTOMATION_ENABLED=true`. |
+| GET | `/api/automation/runs` | Audit history of automation runs |
 
 ### Error codes
 
@@ -475,7 +481,9 @@ Envelopes are consistent:
 `VALIDATION_ERROR`, `NOT_FOUND`, `DATABASE_UNAVAILABLE`, `RATE_LIMITED`,
 `INTERNAL_ERROR`, `WEBHOOK_NOT_CONFIGURED`, `WEBHOOK_INVALID_SIGNATURE`,
 `WEBHOOK_REGISTRATION_FAILED`, `OAUTH_NOT_CONFIGURED`, `OAUTH_INVALID_REQUEST`,
-`OAUTH_INVALID_HMAC`, `OAUTH_STATE_INVALID`, `ENCRYPTION_NOT_CONFIGURED`.
+`OAUTH_INVALID_HMAC`, `OAUTH_STATE_INVALID`, `ENCRYPTION_NOT_CONFIGURED`,
+`AUTOMATION_DISABLED`, `AUTOMATION_RULES_INVALID`,
+`AUTOMATION_PRECONDITION_FAILED`.
 
 ### Rate limits
 
@@ -483,6 +491,49 @@ Every Shopify call goes through one client that handles HTTP failures, GraphQL
 `errors`, `userErrors`, throttling and network faults. Retries use exponential
 backoff with jitter and honour `Retry-After`, capped at 3 attempts.
 **Permission errors are never retried.**
+
+---
+
+## Storefront automation (price sync + visibility)
+
+The one part of Trademart that **writes** to your store. Full guide:
+[docs/AUTOMATION.md](docs/AUTOMATION.md).
+
+Supplier costs come from Shopify's own **"Cost per item"**
+(`inventoryItem.unitCost`). That is what makes it supplier-agnostic: Tradelle,
+DSers, Zendrop, CJ and AutoDS all write into that one field, so Trademart reads
+one place and works with any of them — no supplier API required, which matters
+because Tradelle does not publish one.
+
+```bash
+curl http://localhost:4000/api/automation/status            # what's configured
+curl -X POST http://localhost:4000/api/automation/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"rules":{"price":{"enabled":true,"targetMarginPercentage":35}}}'
+```
+
+`preview` **never writes** and works even with the kill switch off. `apply` runs
+the identical decision code and requires `AUTOMATION_ENABLED=true`.
+
+Guardrails, because this changes what real customers see and pay:
+
+- **Off by default.** `AUTOMATION_ENABLED=false`, and price rules are disabled
+  even then. Deploying it cannot change a price.
+- **Never prices from a guess.** No cost per item → the variant is skipped. A
+  `0` cost counts as *unknown*, not free.
+- **Hard margin floor**, upheld after rounding *and* after clamping. If a clamp
+  would breach it, the change is skipped rather than sold at a loss.
+- **Bounded movement** (±20% per run by default) and `maxItemsPerRun` (50), so a
+  bad cost feed cannot rewrite a catalogue.
+- **Escape hatch.** Tag a product `trademart:manual` and it is never touched.
+- **Never un-hides what a human hid** — automation only restores products it
+  tagged `trademart:auto-hidden` itself. `ARCHIVED` is never touched.
+- **Reversible + audited.** Every applied action stores its previous value in
+  `automation_runs` with the reasons that caused it.
+
+Needs `read_inventory` (for cost) and `write_products` (to apply). If Shopify
+withholds `unitCost`, automation **refuses to run** rather than reporting
+"nothing to do" for a reason unrelated to your catalogue.
 
 ---
 
@@ -584,7 +635,7 @@ npm test
 Compiles with `tsc` and runs Node's built-in runner — **no Shopify access and no
 network required**. Shopify payloads are mocked.
 
-**204 tests currently pass.** Coverage:
+**249 tests currently pass.** Coverage:
 
 | Area | File |
 | --- | --- |
@@ -598,6 +649,7 @@ network required**. Shopify payloads are mocked.
 | OAuth callback HMAC | `src/auth/oauth.hmac.test.ts` |
 | OAuth state nonce (CSRF, expiry, forgery) | `src/auth/oauth.state.test.ts` |
 | Token encryption at rest | `src/common/crypto.test.ts` |
+| Automation rules (price guardrails, visibility) | `src/automation/automation.rules.test.ts` |
 | Supplier classification | `src/suppliers/supplier.registry.test.ts` |
 | Shopify → DTO mapping | `src/shopify/shopify.mappers.test.ts` |
 | Analytics aggregation | `src/analytics/analytics.test.ts` |
@@ -615,6 +667,7 @@ src/
 ├── config/                env validation (pure) + loader
 ├── common/                errors, logger (redacting), http, validation, crypto
 ├── auth/                  OAuth redirect flow (HMAC, state, code exchange)
+├── automation/            price + visibility rules (pure) and execution
 ├── shopify/               client, service, mappers, error mapping, throttling
 │   ├── graphql/           query documents (FULL + BASIC scope variants)
 │   └── token/             token providers: client credentials, static, OAuth offline
@@ -645,6 +698,9 @@ src/
   nonce, before any parameter is trusted or any token is stored.
 - Offline access tokens are encrypted with AES-256-GCM before being persisted;
   nothing in the schema ever holds a readable credential.
+- Storefront writes are off behind `AUTOMATION_ENABLED` (default `false`), bounded
+  per run, reversible from the `automation_runs` audit trail, and always
+  previewable without writing.
 - No card data, no payment gateway secrets, no customer passwords — Shopify owns checkout.
 - No Shopify Admin scraping, no browser automation, no private endpoints.
 
@@ -652,12 +708,19 @@ src/
 
 ## Not implemented (intentionally)
 
-Direct Tradelle API · Meta/Google Ads · automated campaigns · automatic price
-changes · automatic supplier ordering · payment processing ·
-multi-tenant architecture · subscription billing · microservices · Kafka · Redis
-· Kubernetes · queues · AI recommendations · production deployment.
+Direct Tradelle API · Meta/Google Ads · automated campaigns ·
+automatic supplier ordering · payment processing · multi-tenant architecture ·
+subscription billing · microservices · Kafka · Redis · Kubernetes · queues ·
+AI recommendations · production deployment.
 
-Merchant OAuth **is** implemented but is opt-in (`SHOPIFY_AUTH_MODE=oauth`); the
-default remains the single-store client credentials grant. Multi-tenancy is still
-out of scope — the token seam is keyed by shop domain, but the rest of the app
-assumes one configured store.
+Two things that used to be on this list now exist, both **opt-in**:
+
+- **Merchant OAuth** — enabled with `SHOPIFY_AUTH_MODE=oauth`; the default
+  remains the single-store client credentials grant.
+- **Automatic price and visibility changes** — enabled with
+  `AUTOMATION_ENABLED=true`; `POST /api/automation/preview` always works and
+  never writes. See [docs/AUTOMATION.md](docs/AUTOMATION.md).
+
+Multi-tenancy is still out of scope — the token seam is keyed by shop domain, but
+the rest of the app assumes one configured store. Supplier *ordering* remains
+unimplemented: automation reads costs and writes prices, it does not place orders.
