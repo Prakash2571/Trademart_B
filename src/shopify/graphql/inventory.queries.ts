@@ -72,3 +72,25 @@ export const COUNTS_QUERY = /* GraphQL */ `
     }
   }
 `;
+
+
+/**
+ * Resolves an inventory item to its owning product.
+ *
+ * Needed because the `inventory_levels/update` webhook identifies an inventory
+ * ITEM, not a product, so automation cannot act on a stock change without this
+ * hop. Kept minimal: only the ids required to scope a run.
+ */
+export const INVENTORY_ITEM_PRODUCT_QUERY = /* GraphQL */ `
+  query TrademartInventoryItemProduct($id: ID!) {
+    inventoryItem(id: $id) {
+      id
+      variant {
+        id
+        product {
+          id
+        }
+      }
+    }
+  }
+`;

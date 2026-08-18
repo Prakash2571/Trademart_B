@@ -15,11 +15,14 @@ import { Router } from 'express';
 
 import { AppError } from '../common/errors';
 import { asyncHandler, sendSuccess } from '../common/http';
-import { parseIntParam, parseStringParam } from '../common/validate';
-import { config, isAutomationEnabled } from '../config';
+import { parseIntParam, parseStringParam, toShopifyGid } from '../common/validate';
+import { config, isAutomationEnabled, isAutomationOnWebhookEnabled } from '../config';
 import {
+  approveProduct,
+  getStoredRules,
   listAutomationRuns,
-  resolveRules,
+  resolveEffectiveRules,
+  saveRules,
   runAutomation,
 } from './automation.service';
 import { validateAutomationRules, type AutomationRules } from './rules.types';
@@ -64,6 +67,12 @@ function readRuleOverrides(body: Record<string, unknown>): Partial<AutomationRul
     }
     overrides.exemptTags = source['exemptTags'] as string[];
   }
+  if (source['selection'] !== undefined) {
+    if (typeof source['selection'] !== 'object' || source['selection'] === null) {
+      throw new AppError('VALIDATION_ERROR', 'rules.selection must be an object.');
+    }
+    overrides.selection = source['selection'] as AutomationRules['selection'];
+  }
   if (source['maxItemsPerRun'] !== undefined) {
     if (typeof source['maxItemsPerRun'] !== 'number') {
       throw new AppError('VALIDATION_ERROR', 'rules.maxItemsPerRun must be a number.');
@@ -77,12 +86,13 @@ function readRuleOverrides(body: Record<string, unknown>): Partial<AutomationRul
 automationRouter.get(
   '/automation/status',
   asyncHandler(async (_req, res) => {
-    const rules = resolveRules();
+    // Effective, not default: the whole point is to show what a run would use.
+    const rules = await resolveEffectiveRules();
     sendSuccess(res, {
       /** False means preview works but nothing can be written. */
       writesEnabled: isAutomationEnabled(),
       storeDomain: config.shopify.storeDomain,
-      defaultRules: rules,
+      effectiveRules: rules,
       ruleProblems: validateAutomationRules(rules),
       costSource: {
         field: 'inventoryItem.unitCost',
@@ -91,9 +101,14 @@ automationRouter.get(
         requiresScope: 'read_inventory',
       },
       writeScopeRequired: 'write_products',
+      /** True when Shopify webhooks trigger runs without anyone asking. */
+      webhookTriggersEnabled: isAutomationOnWebhookEnabled(),
       endpoints: {
         preview: 'POST /api/automation/preview',
         apply: 'POST /api/automation/apply',
+        approve: 'POST /api/automation/approve',
+        getRules: 'GET /api/automation/rules',
+        saveRules: 'PUT /api/automation/rules',
         history: 'GET /api/automation/runs',
       },
       note: isAutomationEnabled()
@@ -148,6 +163,57 @@ automationRouter.post(
             }),
     });
     sendSuccess(res, report, { dryRun: false });
+  }),
+);
+
+automationRouter.get(
+  '/automation/rules',
+  asyncHandler(async (_req, res) => {
+    const stored = await getStoredRules();
+    const effective = await resolveEffectiveRules();
+    sendSuccess(res, {
+      /** Only what has been explicitly saved. Null when nothing is saved. */
+      stored,
+      /** Defaults with the saved values applied - what a run will actually use. */
+      effective,
+      problems: validateAutomationRules(effective),
+      source: stored === null ? 'defaults' : 'stored',
+    });
+  }),
+);
+
+automationRouter.put(
+  '/automation/rules',
+  asyncHandler(async (req, res) => {
+    // Saving matters because webhook-triggered runs have no request body: these
+    // are the rules an automatic run will use.
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const overrides = readRuleOverrides(body);
+    if (overrides === undefined) {
+      throw new AppError(
+        'VALIDATION_ERROR',
+        'A rules object is required, e.g. { "rules": { "price": { "enabled": true } } }.',
+      );
+    }
+    const effective = await saveRules(overrides);
+    sendSuccess(res, { stored: overrides, effective });
+  }),
+);
+
+automationRouter.post(
+  '/automation/approve',
+  asyncHandler(async (req, res) => {
+    // The deliberate human step: clears the review gate and publishes. Separate
+    // from apply because approving is a decision, not a rule evaluation.
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const raw = parseStringParam(body['productId'], 'productId', { maxLength: 255 });
+    if (raw === undefined) {
+      throw new AppError('VALIDATION_ERROR', 'productId is required.');
+    }
+    const productId = toShopifyGid(raw, 'Product');
+
+    await approveProduct(productId);
+    sendSuccess(res, { shopifyProductId: productId, status: 'ACTIVE', approved: true });
   }),
 );
 

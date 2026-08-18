@@ -80,6 +80,9 @@ export function isExpectedShopDomain(
  */
 export const PLANNED_WEBHOOK_TOPICS = [
   'APP_UNINSTALLED',
+  // Drives automation: a stock change can hide or restore a product, and a
+  // product change can move its cost per item.
+  'INVENTORY_LEVELS_UPDATE',
   'ORDERS_CREATE',
   'ORDERS_UPDATED',
   'ORDERS_CANCELLED',

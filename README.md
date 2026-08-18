@@ -59,6 +59,7 @@ All secrets live here and **never** leave the server. Never commit `.env`.
 | `SHOPIFY_AUTH_MODE` | no | `auto` | `auto` = client credentials grant. `oauth` = use the stored per-merchant offline token. |
 | `TOKEN_ENCRYPTION_KEY` | only for `oauth` | — | 32 bytes (hex or base64) encrypting offline tokens at rest. `openssl rand -base64 32`. |
 | `AUTOMATION_ENABLED` | no | `false` | **Kill switch for storefront writes.** `true` lets Trademart change live prices and product visibility. Must be exactly `true`/`false`. |
+| `AUTOMATION_ON_WEBHOOK` | no | `false` | Let Shopify webhooks trigger automation runs, so cost/stock changes sync with no manual step. Needs `AUTOMATION_ENABLED=true` too. |
 
 `APP_URL` is **not** `FRONTEND_URL`: the first is this API as Shopify reaches it,
 the second is the browser app allowed through CORS. Shopify cannot reach
@@ -470,6 +471,9 @@ Envelopes are consistent:
 | GET | `/api/automation/status` | Kill switch, default rules, cost source, readiness |
 | POST | `/api/automation/preview` | What automation **would** change. Never writes. |
 | POST | `/api/automation/apply` | Applies price/visibility changes. Needs `AUTOMATION_ENABLED=true`. |
+| GET | `/api/automation/rules` | Saved rules + the effective set a run would use |
+| PUT | `/api/automation/rules` | Save rules. Required for webhook-triggered runs. |
+| POST | `/api/automation/approve` | Publish a held product: `{ "productId": "…" }` |
 | GET | `/api/automation/runs` | Audit history of automation runs |
 
 ### Error codes
@@ -505,15 +509,42 @@ DSers, Zendrop, CJ and AutoDS all write into that one field, so Trademart reads
 one place and works with any of them — no supplier API required, which matters
 because Tradelle does not publish one.
 
+Tradelle's own app still does the importing (it has no API to pull from).
+Trademart owns everything after that: which products show, your markup, and
+keeping prices in sync when costs move.
+
 ```bash
-curl http://localhost:4000/api/automation/status            # what's configured
-curl -X POST http://localhost:4000/api/automation/preview \
+# Save your rules once - webhook-triggered runs use these.
+curl -X PUT http://localhost:4000/api/automation/rules \
   -H 'Content-Type: application/json' \
-  -d '{"rules":{"price":{"enabled":true,"targetMarginPercentage":35}}}'
+  -d '{"rules":{
+        "price":{"enabled":true,"pricingMode":"multiplier","multiplier":2.5},
+        "selection":{"mode":"vendor","includeVendors":["Tradelle"]}
+      }}'
+
+curl -X POST http://localhost:4000/api/automation/preview   # never writes
 ```
 
 `preview` **never writes** and works even with the kill switch off. `apply` runs
 the identical decision code and requires `AUTOMATION_ENABLED=true`.
+
+**Three ways to set price:** a target margin, `cost × multiplier` (the 2.5x
+rule), or `cost + fixed uplift`. All three pass through the same guardrails — a
+markup is not a margin once fees are counted, so the floor still applies.
+
+**Only your desired products.** `selection` limits automation to chosen vendors
+or tags; anything outside is left completely untouched, so your own-brand
+products stay under your control while dropshipped ones are automated.
+
+**New imports are held for review** by default (`DRAFT` + a review tag), priced
+but not published, until you `POST /api/automation/approve`. A bulk import can't
+dump hundreds of unreviewed products into your shop.
+
+**Hands-off syncing.** With `AUTOMATION_ON_WEBHOOK=true`, a cost or stock change
+in Shopify triggers a run for that product automatically — no manual step. It
+cannot loop: automation only writes when the price actually differs from target,
+so its own echo is a no-op (asserted in tests), backed by a 60s per-product
+cooldown.
 
 Guardrails, because this changes what real customers see and pay:
 
@@ -619,10 +650,14 @@ Registration reconciles against Shopify instead of blindly creating, so it is sa
 to re-run; a topic already pointing at the right URL is left alone. Requires the
 `write_webhooks` scope.
 
-Registered topics: app uninstalled, order create/update/cancel, fulfillment
-create/update, product create/update/delete, customer create/update.
-`app/uninstalled` is the only one with a handler today — it clears the stored
-offline token. Other topics are verified and stored with `processed: false`.
+Registered topics: app uninstalled, inventory levels update, order
+create/update/cancel, fulfillment create/update, product create/update/delete,
+customer create/update.
+
+Handlers today: `app/uninstalled` clears the stored offline token, and
+`products/create`, `products/update` and `inventory_levels/update` trigger
+storefront automation when `AUTOMATION_ON_WEBHOOK=true`. Remaining topics are
+verified and stored with `processed: false`.
 
 ---
 
@@ -635,7 +670,7 @@ npm test
 Compiles with `tsc` and runs Node's built-in runner — **no Shopify access and no
 network required**. Shopify payloads are mocked.
 
-**249 tests currently pass.** Coverage:
+**286 tests currently pass.** Coverage:
 
 | Area | File |
 | --- | --- |
@@ -649,7 +684,8 @@ network required**. Shopify payloads are mocked.
 | OAuth callback HMAC | `src/auth/oauth.hmac.test.ts` |
 | OAuth state nonce (CSRF, expiry, forgery) | `src/auth/oauth.state.test.ts` |
 | Token encryption at rest | `src/common/crypto.test.ts` |
-| Automation rules (price guardrails, visibility) | `src/automation/automation.rules.test.ts` |
+| Automation rules (price guardrails, visibility, selection) | `src/automation/automation.rules.test.ts` |
+| Webhook triggers + write-loop safety | `src/automation/automation.triggers.test.ts` |
 | Supplier classification | `src/suppliers/supplier.registry.test.ts` |
 | Shopify → DTO mapping | `src/shopify/shopify.mappers.test.ts` |
 | Analytics aggregation | `src/analytics/analytics.test.ts` |

@@ -13,11 +13,17 @@
  *
  * Guardrails, in the order they are applied:
  *   1. Unknown cost            -> skip. Never invent a price.
- *   2. Compute target price at targetMarginPercentage.
+ *   2. Compute the target per `pricingMode`: solve for a margin, or apply a
+ *      markup (cost x N / cost + N).
  *   3. Rounding                -> charm/integer/none.
- *   4. Minimum-margin floor    -> raise the price if rounding breached it.
+ *   4. Minimum-margin floor    -> raise the price if rounding or a thin markup
+ *                                 breached it.
  *   5. Max change clamp        -> bound movement per run.
  *   6. Minimum change filter   -> ignore trivial drift.
+ *
+ * Note that the floor applies to the markup modes too. A "2.5x" rule sounds like
+ * a 60% margin but is not one once payment fees and ad costs are counted, so the
+ * floor still has real work to do — it is not redundant with the target.
  */
 
 import { AppError } from '../common/errors';
@@ -170,33 +176,46 @@ export function decideVariantPrice(
   const reasons: string[] = [];
 
   let target: number;
-  try {
-    const suggestion = calculateSuggestedPrice({
-      desiredMarginPercentage: rules.targetMarginPercentage,
-      supplierProductCost: cost,
-      advertisingCost: rules.advertisingCost,
-      otherCosts: rules.otherCosts,
-      paymentFeePercentage: rules.paymentFeePercentage,
-      shopifyFeePercentage: rules.shopifyFeePercentage,
-    });
-    target = suggestion.suggestedPrice;
-  } catch (error) {
-    // The engine refuses impossible inputs (margin + fees >= 100, zero costs).
-    // Surface its message instead of substituting a number of our own.
-    return {
-      kind: 'skip',
-      variantId,
-      reasons: [
-        error instanceof AppError
-          ? `Pricing engine rejected these inputs: ${error.message}`
-          : 'Pricing engine could not compute a price.',
-      ],
-    };
-  }
+  if (rules.pricingMode === 'multiplier') {
+    // The classic dropshipping markup: cost x N.
+    target = round2(cost * rules.multiplier);
+    reasons.push(
+      `Cost ${cost.toFixed(2)} ${currencyCode} x ${rules.multiplier} -> ${target.toFixed(2)}.`,
+    );
+  } else if (rules.pricingMode === 'fixed_uplift') {
+    target = round2(cost + rules.fixedUplift);
+    reasons.push(
+      `Cost ${cost.toFixed(2)} ${currencyCode} + ${rules.fixedUplift.toFixed(2)} -> ${target.toFixed(2)}.`,
+    );
+  } else {
+    try {
+      const suggestion = calculateSuggestedPrice({
+        desiredMarginPercentage: rules.targetMarginPercentage,
+        supplierProductCost: cost,
+        advertisingCost: rules.advertisingCost,
+        otherCosts: rules.otherCosts,
+        paymentFeePercentage: rules.paymentFeePercentage,
+        shopifyFeePercentage: rules.shopifyFeePercentage,
+      });
+      target = suggestion.suggestedPrice;
+    } catch (error) {
+      // The engine refuses impossible inputs (margin + fees >= 100, zero costs).
+      // Surface its message instead of substituting a number of our own.
+      return {
+        kind: 'skip',
+        variantId,
+        reasons: [
+          error instanceof AppError
+            ? `Pricing engine rejected these inputs: ${error.message}`
+            : 'Pricing engine could not compute a price.',
+        ],
+      };
+    }
 
-  reasons.push(
-    `Target ${rules.targetMarginPercentage}% margin on cost ${cost.toFixed(2)} ${currencyCode} -> ${target.toFixed(2)}.`,
-  );
+    reasons.push(
+      `Target ${rules.targetMarginPercentage}% margin on cost ${cost.toFixed(2)} ${currencyCode} -> ${target.toFixed(2)}.`,
+    );
+  }
 
   let candidate = applyRounding(target, rules.rounding);
   if (candidate !== round2(target)) {

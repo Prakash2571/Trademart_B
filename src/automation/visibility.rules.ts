@@ -21,7 +21,9 @@
 import type { ProductDto, ProductVariantDto } from '../shopify/shopify.types';
 import {
   AUTOMATION_HIDDEN_TAG,
+  AUTOMATION_REVIEW_TAG,
   type AutomationRules,
+  type SelectionRules,
   type VisibilityRules,
 } from './rules.types';
 
@@ -49,11 +51,50 @@ export function isExempt(product: ProductDto, exemptTags: readonly string[]): bo
   return exemptTags.some((tag) => normalised.has(tag.trim().toLowerCase()));
 }
 
+/** Case-insensitive tag membership test. */
+function hasTag(product: ProductDto, tag: string): boolean {
+  const target = tag.trim().toLowerCase();
+  return product.tags.some((entry) => entry.trim().toLowerCase() === target);
+}
+
 /** True when automation is the reason this product is currently hidden. */
 export function wasHiddenByAutomation(product: ProductDto): boolean {
-  return product.tags.some(
-    (tag) => tag.trim().toLowerCase() === AUTOMATION_HIDDEN_TAG.toLowerCase(),
-  );
+  return hasTag(product, AUTOMATION_HIDDEN_TAG);
+}
+
+/** True when the product is held back awaiting a human decision. */
+export function isAwaitingReview(product: ProductDto): boolean {
+  return hasTag(product, AUTOMATION_REVIEW_TAG);
+}
+
+/**
+ * True when this product is inside the configured selection.
+ *
+ * A product outside the selection is left ENTIRELY alone — not hidden, not
+ * repriced. Narrowing the selection is therefore always a safe operation: it
+ * removes products from automation's reach rather than acting on them.
+ */
+export function isSelected(product: ProductDto, selection: SelectionRules): boolean {
+  switch (selection.mode) {
+    case 'tagged': {
+      const wanted = new Set(
+        selection.includeTags.map((tag) => tag.trim().toLowerCase()).filter(Boolean),
+      );
+      if (wanted.size === 0) return false;
+      return product.tags.some((tag) => wanted.has(tag.trim().toLowerCase()));
+    }
+    case 'vendor': {
+      const wanted = new Set(
+        selection.includeVendors.map((v) => v.trim().toLowerCase()).filter(Boolean),
+      );
+      if (wanted.size === 0) return false;
+      const vendor = (product.vendor ?? '').trim().toLowerCase();
+      return vendor.length > 0 && wanted.has(vendor);
+    }
+    case 'all':
+    default:
+      return true;
+  }
 }
 
 /**
@@ -133,6 +174,19 @@ export function decideVisibility(
   }
 
   const current = product.status.toUpperCase();
+
+  // Held for review: a human must approve it. Automation will not publish it,
+  // but it also must not fight the merchant if they activated it themselves -
+  // an ACTIVE product still tagged for review is treated as approved-in-practice
+  // and the tag is simply stale.
+  if (isAwaitingReview(product) && current === 'DRAFT') {
+    return {
+      kind: 'skip',
+      reasons: [
+        `Awaiting review (tagged ${AUTOMATION_REVIEW_TAG}). Approve it with POST /api/automation/approve to allow it into the storefront.`,
+      ],
+    };
+  }
   const stock = resolveStock(product);
   const hideReasons: string[] = [];
 

@@ -81,4 +81,13 @@ export const isWebhookRegistrationConfigured = (): boolean =>
  */
 export const isAutomationEnabled = (): boolean => config.automationEnabled;
 
+/**
+ * True when webhook deliveries should trigger automation runs.
+ *
+ * Requires BOTH flags: triggering a run that would then refuse to write is just
+ * wasted Shopify calls.
+ */
+export const isAutomationOnWebhookEnabled = (): boolean =>
+  config.automationOnWebhook && config.automationEnabled;
+
 export type { AppConfig } from './env.validation';

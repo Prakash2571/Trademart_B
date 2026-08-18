@@ -28,6 +28,45 @@
  */
 export type PriceRounding = 'none' | 'charm99' | 'integer';
 
+/**
+ * How a target price is derived from the supplier cost.
+ *
+ *   margin       - solve for a price achieving `targetMarginPercentage`, fees
+ *                  included. Most accurate, least intuitive.
+ *   multiplier   - cost x `multiplier` (the classic dropshipping "2.5x rule").
+ *   fixed_uplift - cost + `fixedUplift` (a flat amount on every item).
+ *
+ * All three are then subject to the SAME guardrails: rounding, the
+ * minimum-margin floor and the per-run change clamps. A multiplier that fees
+ * would eat into gets raised to clear the floor rather than quietly shipping a
+ * thinner margin than the merchant thinks they set.
+ */
+export type PricingMode = 'margin' | 'multiplier' | 'fixed_uplift';
+
+/**
+ * Which products automation is allowed to act on — "my desired products".
+ *
+ *   all    - the whole catalogue.
+ *   tagged - only products carrying one of `includeTags`.
+ *   vendor - only products from one of `includeVendors` (e.g. "Tradelle").
+ *
+ * Products OUTSIDE the selection are left completely untouched — never hidden,
+ * never repriced. Narrowing the selection can therefore never damage the rest of
+ * the catalogue, which is what makes it safe to experiment with.
+ */
+export type SelectionMode = 'all' | 'tagged' | 'vendor';
+
+/**
+ * What to do with a product Trademart has never seen before (a fresh import
+ * from a dropshipping app).
+ *
+ *   leave    - do nothing; whatever status the importing app set stands.
+ *   draft    - force it to DRAFT and tag it for review, so nothing reaches the
+ *              storefront until a human approves it.
+ *   activate - publish it immediately once it has a price and stock.
+ */
+export type NewProductPolicy = 'leave' | 'draft' | 'activate';
+
 /** Where a variant's cost came from. Mirrors SupplierProduct.costSource. */
 export type CostSource = 'SHOPIFY_UNIT_COST' | 'MANUAL' | 'SUPPLIER_API' | 'UNKNOWN';
 
@@ -53,6 +92,12 @@ export interface VisibilityRules {
 
 export interface PriceRules {
   enabled: boolean;
+  /** How the target price is derived from cost. */
+  pricingMode: PricingMode;
+  /** Used when pricingMode is 'multiplier'. Price = cost x this. */
+  multiplier: number;
+  /** Used when pricingMode is 'fixed_uplift'. Price = cost + this. */
+  fixedUplift: number;
   /** Margin automation aims for, as a percentage of the selling price. */
   targetMarginPercentage: number;
   /** Hard floor. A computed price that breaches this is clamped or skipped. */
@@ -81,9 +126,26 @@ export interface PriceRules {
   requireKnownCost: boolean;
 }
 
+export interface SelectionRules {
+  mode: SelectionMode;
+  /** Used when mode is 'tagged'. Matched case-insensitively. */
+  includeTags: string[];
+  /** Used when mode is 'vendor'. Matched case-insensitively. */
+  includeVendors: string[];
+  /**
+   * How to treat a newly imported product.
+   *
+   * Defaults to 'draft': a dropshipping app can import hundreds of products at
+   * once, and having them appear in the shop unreviewed and unpriced is exactly
+   * the surprise this feature exists to prevent.
+   */
+  newProductPolicy: NewProductPolicy;
+}
+
 export interface AutomationRules {
   visibility: VisibilityRules;
   price: PriceRules;
+  selection: SelectionRules;
   /**
    * Products carrying any of these tags are never touched. The merchant's
    * manual override, and the first thing to reach for if a run goes wrong.
@@ -112,6 +174,9 @@ export const DEFAULT_AUTOMATION_RULES: AutomationRules = {
   },
   price: {
     enabled: false,
+    pricingMode: 'margin',
+    multiplier: 2.5,
+    fixedUplift: 10,
     targetMarginPercentage: 30,
     minMarginPercentage: 10,
     paymentFeePercentage: 2.9,
@@ -124,12 +189,28 @@ export const DEFAULT_AUTOMATION_RULES: AutomationRules = {
     minChangeAmount: 0.05,
     requireKnownCost: true,
   },
+  selection: {
+    mode: 'all',
+    includeTags: [],
+    includeVendors: [],
+    newProductPolicy: 'draft',
+  },
   exemptTags: ['trademart:manual', 'trademart:no-automation'],
   maxItemsPerRun: 50,
 };
 
 /** Tag automation applies when it hides a product, so it knows what it owns. */
 export const AUTOMATION_HIDDEN_TAG = 'trademart:auto-hidden';
+
+/**
+ * Tag applied to a newly imported product that is being held back for review.
+ * Distinct from AUTOMATION_HIDDEN_TAG so "never shown yet" is not confused with
+ * "was live, then went out of stock".
+ */
+export const AUTOMATION_REVIEW_TAG = 'trademart:needs-review';
+
+const PRICING_MODES: readonly PricingMode[] = ['margin', 'multiplier', 'fixed_uplift'];
+const SELECTION_MODES: readonly SelectionMode[] = ['all', 'tagged', 'vendor'];
 
 /**
  * Validates a rule set, returning human-readable problems.
@@ -139,7 +220,7 @@ export const AUTOMATION_HIDDEN_TAG = 'trademart:auto-hidden';
  */
 export function validateAutomationRules(rules: AutomationRules): string[] {
   const problems: string[] = [];
-  const { price } = rules;
+  const { price, selection } = rules;
 
   const percentages: { value: number; label: string }[] = [
     { value: price.targetMarginPercentage, label: 'targetMarginPercentage' },
@@ -158,26 +239,49 @@ export function validateAutomationRules(rules: AutomationRules): string[] {
     }
   }
 
+  if (!PRICING_MODES.includes(price.pricingMode)) {
+    problems.push(`pricingMode must be one of ${PRICING_MODES.join(', ')}.`);
+  }
+  if (price.pricingMode === 'multiplier') {
+    if (!Number.isFinite(price.multiplier) || price.multiplier <= 0) {
+      problems.push('multiplier must be greater than 0.');
+    } else if (price.multiplier < 1) {
+      // Below 1x is selling under cost. The margin floor would reject it later,
+      // but saying so here is far clearer than a run that skips everything.
+      problems.push(
+        'multiplier below 1 would price every product under its cost. Use a value of at least 1.',
+      );
+    }
+  }
+  if (price.pricingMode === 'fixed_uplift') {
+    if (!Number.isFinite(price.fixedUplift) || price.fixedUplift <= 0) {
+      problems.push('fixedUplift must be greater than 0.');
+    }
+  }
   if (price.targetMarginPercentage >= 100) {
     problems.push('targetMarginPercentage must be below 100.');
   }
   if (price.minMarginPercentage >= 100) {
     problems.push('minMarginPercentage must be below 100.');
   }
-  if (price.minMarginPercentage > price.targetMarginPercentage) {
-    problems.push(
-      'minMarginPercentage must not exceed targetMarginPercentage - the floor would always beat the target.',
-    );
-  }
-  // The pricing engine cannot solve for a price when margin + percentage fees
-  // reach 100%; catching it here gives a clearer message than the engine's throw.
-  if (
-    price.targetMarginPercentage + price.paymentFeePercentage + price.shopifyFeePercentage >=
-    100
-  ) {
-    problems.push(
-      'targetMarginPercentage plus paymentFeePercentage and shopifyFeePercentage must be below 100 - no price can satisfy these inputs.',
-    );
+  // Only meaningful in margin mode; in markup modes the target is derived from
+  // cost and the floor is a separate, independent guardrail.
+  if (price.pricingMode === 'margin') {
+    if (price.minMarginPercentage > price.targetMarginPercentage) {
+      problems.push(
+        'minMarginPercentage must not exceed targetMarginPercentage - the floor would always beat the target.',
+      );
+    }
+    // The pricing engine cannot solve for a price when margin + percentage fees
+    // reach 100%; catching it here is clearer than the engine's throw.
+    if (
+      price.targetMarginPercentage + price.paymentFeePercentage + price.shopifyFeePercentage >=
+      100
+    ) {
+      problems.push(
+        'targetMarginPercentage plus paymentFeePercentage and shopifyFeePercentage must be below 100 - no price can satisfy these inputs.',
+      );
+    }
   }
   if (price.maxDecreasePercentage > 100) {
     problems.push('maxDecreasePercentage must not exceed 100.');
@@ -187,6 +291,23 @@ export function validateAutomationRules(rules: AutomationRules): string[] {
   }
   if (!Number.isInteger(rules.maxItemsPerRun) || rules.maxItemsPerRun < 1) {
     problems.push('maxItemsPerRun must be a positive integer.');
+  }
+
+  // ---- selection --------------------------------------------------------
+  if (!SELECTION_MODES.includes(selection.mode)) {
+    problems.push(`selection.mode must be one of ${SELECTION_MODES.join(', ')}.`);
+  }
+  // An empty include list in a filtering mode would select NOTHING, so every run
+  // would silently do nothing. Reject it rather than look broken.
+  if (selection.mode === 'tagged' && selection.includeTags.length === 0) {
+    problems.push(
+      'selection.mode is "tagged" but selection.includeTags is empty, so no product would ever be selected.',
+    );
+  }
+  if (selection.mode === 'vendor' && selection.includeVendors.length === 0) {
+    problems.push(
+      'selection.mode is "vendor" but selection.includeVendors is empty, so no product would ever be selected.',
+    );
   }
 
   return problems;

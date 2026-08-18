@@ -466,3 +466,224 @@ describe('buildAutomationPlan', () => {
     assert.equal(buildAutomationPlan([p], rules).summary.clamped, 1);
   });
 });
+
+
+describe('pricing modes', () => {
+  it('multiplier mode prices at cost x multiplier', () => {
+    const decision = decideVariantPrice(
+      variant({ unitCost: money(10), price: money(12) }),
+      rulesWithPricing({
+        pricingMode: 'multiplier',
+        multiplier: 2.5,
+        maxIncreasePercentage: 500,
+        minMarginPercentage: 0,
+      }).price,
+    );
+    assert.equal(decision.kind, 'change');
+    assert.equal(decision.kind === 'change' ? decision.to : null, 25);
+  });
+
+  it('fixed_uplift mode prices at cost + uplift', () => {
+    const decision = decideVariantPrice(
+      variant({ unitCost: money(10), price: money(12) }),
+      rulesWithPricing({
+        pricingMode: 'fixed_uplift',
+        fixedUplift: 7.5,
+        maxIncreasePercentage: 500,
+        minMarginPercentage: 0,
+      }).price,
+    );
+    assert.equal(decision.kind, 'change');
+    assert.equal(decision.kind === 'change' ? decision.to : null, 17.5);
+  });
+
+  it('explains a markup in its reasons', () => {
+    const decision = decideVariantPrice(
+      variant({ unitCost: money(10), price: money(12) }),
+      rulesWithPricing({
+        pricingMode: 'multiplier',
+        multiplier: 2,
+        maxIncreasePercentage: 500,
+        minMarginPercentage: 0,
+      }).price,
+    );
+    assert.match(decision.reasons.join(' '), /x 2/);
+  });
+
+  it('still enforces the margin floor in multiplier mode', () => {
+    // 1.05x looks like a markup but leaves ~5% margin, under a 25% floor. Fees
+    // and ad costs are why a markup is not the same thing as a margin.
+    const decision = decideVariantPrice(
+      variant({ unitCost: money(10), price: money(10.5) }),
+      rulesWithPricing({
+        pricingMode: 'multiplier',
+        multiplier: 1.05,
+        minMarginPercentage: 25,
+        maxIncreasePercentage: 500,
+      }).price,
+    );
+    if (decision.kind === 'change') {
+      const margin = marginAtPrice(decision.to, 10, rulesWithPricing().price);
+      assert.ok(margin !== null && margin >= 25 - 0.01, `margin was ${margin}`);
+    }
+  });
+
+  it('still refuses an unknown cost in markup modes', () => {
+    const decision = decideVariantPrice(
+      variant({ unitCost: null }),
+      rulesWithPricing({ pricingMode: 'multiplier', multiplier: 3 }).price,
+    );
+    assert.equal(decision.kind, 'skip');
+  });
+
+  it('rejects a multiplier below 1 at validation time', () => {
+    const problems = validateAutomationRules(
+      rulesWithPricing({ pricingMode: 'multiplier', multiplier: 0.8 }),
+    );
+    assert.ok(problems.some((p) => p.includes('multiplier')));
+  });
+
+  it('rejects a non-positive fixed uplift', () => {
+    const problems = validateAutomationRules(
+      rulesWithPricing({ pricingMode: 'fixed_uplift', fixedUplift: 0 }),
+    );
+    assert.ok(problems.some((p) => p.includes('fixedUplift')));
+  });
+
+  it('does not apply the margin-vs-target check in markup modes', () => {
+    // A high floor with a low target is contradictory only in margin mode.
+    const problems = validateAutomationRules(
+      rulesWithPricing({
+        pricingMode: 'multiplier',
+        multiplier: 3,
+        targetMarginPercentage: 5,
+        minMarginPercentage: 40,
+      }),
+    );
+    assert.deepEqual(problems, []);
+  });
+});
+
+describe('selection rules', () => {
+  function withSelection(selection: Partial<AutomationRules['selection']>): AutomationRules {
+    return {
+      ...rulesWithPricing({ maxIncreasePercentage: 500, minMarginPercentage: 0 }),
+      selection: { ...DEFAULT_AUTOMATION_RULES.selection, ...selection },
+    };
+  }
+
+  it('selects everything in "all" mode', () => {
+    const plan = buildAutomationPlan(
+      [product({ variants: [variant({ unitCost: money(10), price: money(12) })] })],
+      withSelection({ mode: 'all' }),
+    );
+    assert.equal(plan.summary.priceChanges, 1);
+  });
+
+  it('acts only on matching vendors in "vendor" mode', () => {
+    const tradelle = product({
+      shopifyProductId: 'gid://shopify/Product/t',
+      vendor: 'Tradelle',
+      variants: [variant({ unitCost: money(10), price: money(12) })],
+    });
+    const other = product({
+      shopifyProductId: 'gid://shopify/Product/o',
+      vendor: 'My Own Brand',
+      variants: [variant({ shopifyVariantId: 'v2', unitCost: money(10), price: money(12) })],
+    });
+    const plan = buildAutomationPlan(
+      [tradelle, other],
+      withSelection({ mode: 'vendor', includeVendors: ['Tradelle'] }),
+    );
+    assert.equal(plan.summary.priceChanges, 1);
+    assert.ok(plan.skipped.some((s) => s.shopifyProductId === 'gid://shopify/Product/o'));
+  });
+
+  it('matches vendors case-insensitively', () => {
+    const plan = buildAutomationPlan(
+      [product({ vendor: 'TRADELLE', variants: [variant({ unitCost: money(10), price: money(12) })] })],
+      withSelection({ mode: 'vendor', includeVendors: ['tradelle'] }),
+    );
+    assert.equal(plan.summary.priceChanges, 1);
+  });
+
+  it('acts only on tagged products in "tagged" mode', () => {
+    const plan = buildAutomationPlan(
+      [
+        product({
+          tags: ['winter-range'],
+          variants: [variant({ unitCost: money(10), price: money(12) })],
+        }),
+      ],
+      withSelection({ mode: 'tagged', includeTags: ['winter-range'] }),
+    );
+    assert.equal(plan.summary.priceChanges, 1);
+  });
+
+  it('leaves an unselected product COMPLETELY untouched, never hidden', () => {
+    // Narrowing the selection must never damage the rest of the catalogue, so an
+    // out-of-stock product outside the selection must not be drafted either.
+    const outOfStock = product({
+      vendor: 'Someone Else',
+      totalInventory: 0,
+      variants: [variant({ inventoryQuantity: 0 })],
+    });
+    const plan = buildAutomationPlan(
+      [outOfStock],
+      withSelection({ mode: 'vendor', includeVendors: ['Tradelle'] }),
+    );
+    assert.equal(plan.actions.length, 0);
+    assert.equal(plan.summary.visibilityChanges, 0);
+  });
+
+  it('rejects a filtering mode with an empty include list', () => {
+    // Otherwise every run would silently select nothing and look broken.
+    const problems = validateAutomationRules(
+      withSelection({ mode: 'vendor', includeVendors: [] }),
+    );
+    assert.ok(problems.some((p) => p.includes('includeVendors')));
+
+    const tagProblems = validateAutomationRules(
+      withSelection({ mode: 'tagged', includeTags: [] }),
+    );
+    assert.ok(tagProblems.some((p) => p.includes('includeTags')));
+  });
+});
+
+describe('new-import review gate', () => {
+  it('defaults to holding new products as drafts', () => {
+    // A bulk import must not put unreviewed products in the shop.
+    assert.equal(DEFAULT_AUTOMATION_RULES.selection.newProductPolicy, 'draft');
+  });
+
+  it('does not publish a product awaiting review', () => {
+    const held = product({
+      status: 'DRAFT',
+      tags: ['trademart:needs-review', 'trademart:auto-hidden'],
+    });
+    const decision = decideVisibility(held, DEFAULT_AUTOMATION_RULES);
+    assert.equal(decision.kind, 'skip');
+    assert.match(decision.reasons.join(' '), /review/i);
+  });
+
+  it('treats a stale review tag on an ACTIVE product as approved', () => {
+    // The merchant activated it themselves; automation must not fight that.
+    const live = product({ status: 'ACTIVE', tags: ['trademart:needs-review'] });
+    assert.notEqual(decideVisibility(live, DEFAULT_AUTOMATION_RULES).kind, 'skip');
+  });
+
+  it('still prices a product that is awaiting review', () => {
+    // It should arrive at the review queue already correctly priced.
+    const held = product({
+      status: 'DRAFT',
+      tags: ['trademart:needs-review'],
+      variants: [variant({ unitCost: money(10), price: money(12) })],
+    });
+    const plan = buildAutomationPlan(
+      [held],
+      rulesWithPricing({ maxIncreasePercentage: 500, minMarginPercentage: 0 }),
+    );
+    assert.equal(plan.summary.priceChanges, 1);
+    assert.equal(plan.summary.visibilityChanges, 0);
+  });
+});
