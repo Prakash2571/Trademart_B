@@ -37,7 +37,11 @@ export type ErrorCode =
   | 'OAUTH_INVALID_HMAC'
   | 'OAUTH_STATE_INVALID'
   // Encryption of offline tokens at rest
-  | 'ENCRYPTION_NOT_CONFIGURED';
+  | 'ENCRYPTION_NOT_CONFIGURED'
+  // Storefront automation (price / visibility writes)
+  | 'AUTOMATION_DISABLED'
+  | 'AUTOMATION_RULES_INVALID'
+  | 'AUTOMATION_PRECONDITION_FAILED';
 
 export interface ErrorBody {
   success: false;
@@ -86,7 +90,15 @@ export function defaultStatusForCode(code: ErrorCode): number {
   switch (code) {
     case 'VALIDATION_ERROR':
     case 'OAUTH_INVALID_REQUEST':
+    case 'AUTOMATION_RULES_INVALID':
       return 400;
+    // 409: the request is valid but the store/config is not in a state where
+    // writing would be safe (e.g. read_inventory missing, so costs are unknown).
+    case 'AUTOMATION_PRECONDITION_FAILED':
+      return 409;
+    // 403: writes are switched off deliberately. Not a 503 - nothing is broken.
+    case 'AUTOMATION_DISABLED':
+      return 403;
     case 'SHOPIFY_UNAUTHORIZED':
     case 'SHOPIFY_AUTH_FAILED':
       return 401;
@@ -145,6 +157,11 @@ export function defaultRetryableForCode(code: ErrorCode): boolean {
     case 'OAUTH_STATE_INVALID':
     case 'ENCRYPTION_NOT_CONFIGURED':
     case 'WEBHOOK_REGISTRATION_FAILED':
+    // Retrying a write that was refused on purpose would be a way to defeat
+    // the guardrail, so these are never retryable.
+    case 'AUTOMATION_DISABLED':
+    case 'AUTOMATION_RULES_INVALID':
+    case 'AUTOMATION_PRECONDITION_FAILED':
       return false;
     default:
       return false;
