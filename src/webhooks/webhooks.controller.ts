@@ -25,6 +25,7 @@ import { asyncHandler, sendSuccess } from '../common/http';
 import { logger } from '../common/logger';
 import { parseStringParam } from '../common/validate';
 import { clearOfflineToken } from '../auth/oauth.service';
+import { scheduleAutomationForWebhook } from '../automation/automation.webhook';
 import { config, isWebhookRegistrationConfigured } from '../config';
 import { getDatabaseStatus } from '../database/mongo';
 import { WebhookEventModel } from '../database/models/WebhookEvent';
@@ -169,6 +170,11 @@ webhooksRouter.post(
 
     // Acknowledge fast; Shopify expects a 2xx within a few seconds.
     res.status(200).json({ success: true });
+
+    // Automation runs AFTER the acknowledgement, never before: a Shopify lookup
+    // plus a write can easily exceed the delivery timeout, and a timeout would
+    // make Shopify retry a webhook we had already processed.
+    scheduleAutomationForWebhook(topic, payload);
   }),
 );
 

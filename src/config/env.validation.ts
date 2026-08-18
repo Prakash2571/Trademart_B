@@ -85,6 +85,14 @@ export interface AppConfig {
    * change a live storefront by accident.
    */
   automationEnabled: boolean;
+  /**
+   * Whether webhook deliveries trigger automation runs automatically.
+   *
+   * Separate from `automationEnabled` on purpose: "Trademart may write" and
+   * "Trademart writes without me asking" are different levels of trust, and a
+   * merchant may reasonably want the first without the second.
+   */
+  automationOnWebhook: boolean;
   shopify: ShopifyConfig;
 }
 
@@ -420,6 +428,32 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
       );
     }
   }
+  // ---- AUTOMATION_ON_WEBHOOK ---------------------------------------------
+  const rawOnWebhook = read(env, 'AUTOMATION_ON_WEBHOOK');
+  let automationOnWebhook = false;
+  if (rawOnWebhook !== null) {
+    const normalised = rawOnWebhook.toLowerCase();
+    if (normalised === 'true') automationOnWebhook = true;
+    else if (normalised === 'false') automationOnWebhook = false;
+    else {
+      errors.push(
+        `AUTOMATION_ON_WEBHOOK must be "true" or "false" (received "${rawOnWebhook}").`,
+      );
+    }
+  }
+  if (automationOnWebhook && !automationEnabled) {
+    // Not an error - the triggers simply stay dormant - but silently doing
+    // nothing would look like a bug.
+    warnings.push(
+      'AUTOMATION_ON_WEBHOOK=true but AUTOMATION_ENABLED is false, so webhook-triggered runs will be skipped. Enable both for hands-off syncing.',
+    );
+  }
+  if (automationOnWebhook && webhookSecret === null) {
+    warnings.push(
+      'AUTOMATION_ON_WEBHOOK=true but SHOPIFY_WEBHOOK_SECRET is not set, so every delivery is rejected and nothing will ever trigger.',
+    );
+  }
+
   if (automationEnabled) {
     // Writing prices/status needs write_products. Warn rather than error: the
     // scopes may come from shopify.app.toml under managed installation, which
@@ -448,6 +482,7 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
       mongoUri,
       tokenEncryptionKey,
       automationEnabled,
+      automationOnWebhook,
       shopify: {
         storeDomain,
         apiVersion,

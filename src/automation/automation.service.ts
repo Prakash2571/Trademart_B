@@ -19,6 +19,7 @@ import { AppError, toAppError } from '../common/errors';
 import { logger } from '../common/logger';
 import { config, isAutomationEnabled } from '../config';
 import { AutomationRunModel } from '../database/models/AutomationRun';
+import { AutomationSettingsModel } from '../database/models/AutomationSettings';
 import { getDatabaseStatus } from '../database/mongo';
 import {
   PRODUCT_STATUS_UPDATE_MUTATION,
@@ -28,11 +29,13 @@ import {
 } from '../shopify/graphql/product.mutations';
 import { shopifyGraphql } from '../shopify/shopify.client';
 import { mapUserErrors } from '../shopify/shopify.errors';
-import { listProducts } from '../shopify/shopify.service';
+import { INVENTORY_ITEM_PRODUCT_QUERY } from '../shopify/graphql/inventory.queries';
+import { getProduct, listProducts } from '../shopify/shopify.service';
 import type { ProductDto } from '../shopify/shopify.types';
 import { buildAutomationPlan, type AutomationPlan, type PriceAction } from './plan';
 import {
   AUTOMATION_HIDDEN_TAG,
+  AUTOMATION_REVIEW_TAG,
   DEFAULT_AUTOMATION_RULES,
   validateAutomationRules,
   type AutomationRules,
@@ -50,6 +53,11 @@ export interface RunOptions {
   trigger?: 'manual' | 'webhook' | 'scheduled';
   /** Shopify product search syntax, to scope a run to part of the catalogue. */
   query?: string | undefined;
+  /**
+   * Exact products to act on. Used by webhook-triggered runs so a single changed
+   * product costs one lookup instead of a catalogue scan.
+   */
+  productIds?: readonly string[] | undefined;
   /** Overrides merged over DEFAULT_AUTOMATION_RULES. */
   rules?: Partial<AutomationRules> | undefined;
   maxProducts?: number | undefined;
@@ -82,21 +90,119 @@ export interface AutomationReport {
 }
 
 /**
- * Merges caller overrides over the defaults.
+ * Merges caller overrides over a base rule set.
  *
  * Nested objects are merged one level deep so a caller can send just
  * `{ price: { targetMarginPercentage: 40 } }` without having to restate every
  * other price rule (and accidentally reset a guardrail to undefined).
  */
-export function resolveRules(overrides?: Partial<AutomationRules>): AutomationRules {
-  const base = DEFAULT_AUTOMATION_RULES;
+export function resolveRules(
+  overrides?: Partial<AutomationRules>,
+  base: AutomationRules = DEFAULT_AUTOMATION_RULES,
+): AutomationRules {
   if (overrides === undefined) return base;
   return {
     ...base,
     ...overrides,
     visibility: { ...base.visibility, ...(overrides.visibility ?? {}) },
     price: { ...base.price, ...(overrides.price ?? {}) },
+    selection: { ...base.selection, ...(overrides.selection ?? {}) },
   };
+}
+
+/**
+ * The saved rule set for this shop, or null when none is stored.
+ * Never throws: automation must still work with no database.
+ */
+export async function getStoredRules(): Promise<Partial<AutomationRules> | null> {
+  if (getDatabaseStatus().status !== 'connected') return null;
+  try {
+    const doc = await AutomationSettingsModel.findOne({
+      shopDomain: config.shopify.storeDomain,
+    })
+      .select('rules')
+      .lean();
+    return (doc?.rules as Partial<AutomationRules> | undefined) ?? null;
+  } catch (error) {
+    logger.warn('Could not read stored automation rules; falling back to defaults.', {
+      reason: error instanceof Error ? error.message : 'unknown',
+    });
+    return null;
+  }
+}
+
+/**
+ * Effective rules: defaults <- stored <- per-request overrides.
+ *
+ * This precedence is what lets a webhook-triggered run (which has no request
+ * body) behave the way the merchant configured, while still allowing a one-off
+ * manual run to try different numbers without saving them.
+ */
+export async function resolveEffectiveRules(
+  overrides?: Partial<AutomationRules>,
+): Promise<AutomationRules> {
+  const stored = await getStoredRules();
+  const base = stored === null ? DEFAULT_AUTOMATION_RULES : resolveRules(stored);
+  return resolveRules(overrides, base);
+}
+
+/** Saves a partial rule set after validating the result it would produce. */
+export async function saveRules(
+  overrides: Partial<AutomationRules>,
+): Promise<AutomationRules> {
+  const effective = resolveRules(overrides);
+  const problems = validateAutomationRules(effective);
+  if (problems.length > 0) {
+    throw new AppError('AUTOMATION_RULES_INVALID', 'Automation rules are invalid.', {
+      details: { problems },
+    });
+  }
+  if (getDatabaseStatus().status !== 'connected') {
+    throw new AppError(
+      'DATABASE_UNAVAILABLE',
+      'Saving automation rules requires MongoDB. Set MONGODB_URI, or pass rules per request instead.',
+    );
+  }
+
+  await AutomationSettingsModel.updateOne(
+    { shopDomain: config.shopify.storeDomain },
+    { $set: { shopDomain: config.shopify.storeDomain, rules: overrides } },
+    { upsert: true },
+  );
+
+  logger.info('Saved automation rules.', {
+    priceEnabled: effective.price.enabled,
+    pricingMode: effective.price.pricingMode,
+    selectionMode: effective.selection.mode,
+  });
+  return effective;
+}
+
+/** Reads specific products by id, skipping any that no longer exist. */
+async function fetchProductsByIds(
+  productIds: readonly string[],
+): Promise<{ products: ProductDto[]; degraded: string[] }> {
+  const products: ProductDto[] = [];
+  for (const id of productIds) {
+    try {
+      products.push(await getProduct(id));
+    } catch (error) {
+      // A deleted product is normal in a webhook-triggered run: the delivery can
+      // arrive after the product is gone. Not an error worth failing the run for.
+      logger.info('Skipping product that could not be read.', {
+        shopifyProductId: id,
+        code: error instanceof AppError ? error.code : 'INTERNAL_ERROR',
+      });
+    }
+  }
+  // getProduct applies the same scope fallback as listProducts but does not
+  // report degraded fields, so cost availability is inferred from the data.
+  const degraded =
+    products.length > 0 &&
+    products.every((product) => product.variants.every((v) => v.unitCost === null))
+      ? [UNIT_COST_FIELD]
+      : [];
+  return { products, degraded };
 }
 
 /** Reads up to `maxProducts` products, collecting any degraded fields. */
@@ -212,7 +318,7 @@ async function applyPrices(productId: string, actions: PriceAction[]): Promise<v
  * Preview (`dryRun: true`) works regardless of the kill switch; applying does not.
  */
 export async function runAutomation(options: RunOptions): Promise<AutomationReport> {
-  const rules = resolveRules(options.rules);
+  const rules = await resolveEffectiveRules(options.rules);
   const problems = validateAutomationRules(rules);
   if (problems.length > 0) {
     throw new AppError('AUTOMATION_RULES_INVALID', 'Automation rules are invalid.', {
@@ -229,7 +335,10 @@ export async function runAutomation(options: RunOptions): Promise<AutomationRepo
 
   const notes: string[] = [];
   const maxProducts = Math.min(options.maxProducts ?? MAX_PRODUCTS, MAX_PRODUCTS);
-  const { products, degraded } = await fetchProducts(options.query, maxProducts);
+  const { products, degraded } =
+    options.productIds !== undefined && options.productIds.length > 0
+      ? await fetchProductsByIds(options.productIds.slice(0, maxProducts))
+      : await fetchProducts(options.query, maxProducts);
 
   // Critical honesty check. Without read_inventory every variant reports a null
   // unitCost, so the plan would be "nothing to do" for a reason that has nothing
@@ -437,6 +546,93 @@ async function persistRun(input: {
     });
     return null;
   }
+}
+
+/**
+ * Resolves an inventory item GID to its product GID.
+ *
+ * The `inventory_levels/update` webhook only names an inventory item, so a stock
+ * change cannot be acted on without this hop. Returns null rather than throwing:
+ * a webhook for a deleted variant is normal, not an error.
+ */
+export async function resolveProductFromInventoryItem(
+  inventoryItemGid: string,
+): Promise<string | null> {
+  try {
+    const result = await shopifyGraphql<{
+      inventoryItem: { variant: { product: { id: string } | null } | null } | null;
+    }>(
+      INVENTORY_ITEM_PRODUCT_QUERY,
+      { id: inventoryItemGid },
+      { operation: 'automationResolveInventoryItem' },
+    );
+    return result.data.inventoryItem?.variant?.product?.id ?? null;
+  } catch (error) {
+    logger.info('Could not resolve inventory item to a product.', {
+      inventoryItemId: inventoryItemGid,
+      code: error instanceof AppError ? error.code : 'INTERNAL_ERROR',
+    });
+    return null;
+  }
+}
+
+/**
+ * Holds a newly imported product back from the storefront pending review.
+ *
+ * This is the "show only my desired products" gate: a dropshipping app can
+ * import hundreds of products at once, and without this they would appear in the
+ * shop immediately, unreviewed and at whatever price the importer set.
+ *
+ * Sets DRAFT and tags for review. Requires the kill switch, because it writes.
+ */
+export async function holdProductForReview(shopifyProductId: string): Promise<void> {
+  if (!isAutomationEnabled()) {
+    throw new AppError(
+      'AUTOMATION_DISABLED',
+      'Storefront writes are disabled, so new products cannot be held for review. Set AUTOMATION_ENABLED=true.',
+    );
+  }
+
+  await applyVisibility(shopifyProductId, 'DRAFT');
+
+  const result = await shopifyGraphql<{
+    tagsAdd: { userErrors: { field?: string[] | null; message?: string }[] } | null;
+  }>(
+    TAGS_ADD_MUTATION,
+    { id: shopifyProductId, tags: [AUTOMATION_REVIEW_TAG] },
+    { operation: 'automationHoldForReview' },
+  );
+  const userError = mapUserErrors(result.data.tagsAdd?.userErrors);
+  if (userError !== null) throw userError;
+
+  logger.info('Held new product for review.', { shopifyProductId });
+}
+
+/**
+ * Approves a held product: clears the review and auto-hidden tags and publishes
+ * it. This is the deliberate human step that lets a product into the shop.
+ */
+export async function approveProduct(shopifyProductId: string): Promise<void> {
+  if (!isAutomationEnabled()) {
+    throw new AppError(
+      'AUTOMATION_DISABLED',
+      'Storefront writes are disabled, so a product cannot be published. Set AUTOMATION_ENABLED=true.',
+    );
+  }
+
+  const removal = await shopifyGraphql<{
+    tagsRemove: { userErrors: { field?: string[] | null; message?: string }[] } | null;
+  }>(
+    TAGS_REMOVE_MUTATION,
+    { id: shopifyProductId, tags: [AUTOMATION_REVIEW_TAG, AUTOMATION_HIDDEN_TAG] },
+    { operation: 'automationApproveTagsRemove' },
+  );
+  const removalError = mapUserErrors(removal.data.tagsRemove?.userErrors);
+  if (removalError !== null) throw removalError;
+
+  // applyVisibility also strips the auto-hidden tag; harmless and idempotent.
+  await applyVisibility(shopifyProductId, 'ACTIVE');
+  logger.info('Approved product for the storefront.', { shopifyProductId });
 }
 
 /** Most recent runs, newest first — the "what did automation just do?" view. */

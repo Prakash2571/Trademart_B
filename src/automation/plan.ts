@@ -12,7 +12,7 @@
 
 import type { ProductDto } from '../shopify/shopify.types';
 import { decideVariantPrice, lowestCurrentMargin } from './price.rules';
-import { decideVisibility, isExempt } from './visibility.rules';
+import { decideVisibility, isExempt, isSelected } from './visibility.rules';
 import type { AutomationRules } from './rules.types';
 
 export interface VisibilityAction {
@@ -85,6 +85,22 @@ export function buildAutomationPlan(
   let truncated = false;
 
   for (const product of products) {
+    // Selection is checked FIRST: a product outside it is not automation's
+    // business at all, so it should not even be reported as exempt or evaluated.
+    if (!isSelected(product, rules.selection)) {
+      skipped.push({
+        shopifyProductId: product.shopifyProductId,
+        shopifyVariantId: null,
+        title: product.title,
+        reasons: [
+          rules.selection.mode === 'vendor'
+            ? `Vendor "${product.vendor ?? 'none'}" is not in the selected vendors (${rules.selection.includeVendors.join(', ')}).`
+            : `Product does not carry a selected tag (${rules.selection.includeTags.join(', ')}).`,
+        ],
+      });
+      continue;
+    }
+
     // Checked once here so an exempt product produces a single clear skip rather
     // than one per variant.
     if (isExempt(product, rules.exemptTags)) {
