@@ -394,3 +394,41 @@ describe('validateEnv - SHOPIFY_AUTH_MODE and TOKEN_ENCRYPTION_KEY', () => {
     assert.equal(result.config?.shopify.authStrategy, 'STATIC_TOKEN');
   });
 });
+
+
+describe('validateEnv - webhook secret falls back to the client secret', () => {
+  it('uses SHOPIFY_CLIENT_SECRET when SHOPIFY_WEBHOOK_SECRET is unset', () => {
+    // Shopify signs app webhook deliveries with the client secret, so this is
+    // the CORRECT default - not a convenience.
+    const result = validateEnv(VALID);
+
+    assert.equal(result.config?.shopify.webhookSecret, 'client-secret-example');
+  });
+
+  it('warns that the fallback is in use, so it is never silent', () => {
+    const result = validateEnv(VALID);
+
+    assert.ok(
+      result.warnings.some((w) => w.includes('SHOPIFY_CLIENT_SECRET')),
+      'expected a warning naming the fallback',
+    );
+  });
+
+  it('prefers an explicit SHOPIFY_WEBHOOK_SECRET when given', () => {
+    // Webhooks created by hand in the Shopify admin get their own secret.
+    const result = validateEnv({
+      ...VALID,
+      SHOPIFY_WEBHOOK_SECRET: 'admin-ui-webhook-secret',
+    });
+
+    assert.equal(result.config?.shopify.webhookSecret, 'admin-ui-webhook-secret');
+  });
+
+  it('is null only when neither secret is available', () => {
+    const { SHOPIFY_CLIENT_ID: _id, SHOPIFY_CLIENT_SECRET: _secret, ...rest } = VALID;
+    const result = validateEnv(rest);
+
+    assert.equal(result.config?.shopify.webhookSecret, null);
+    assert.ok(result.warnings.some((w) => w.includes('reject all deliveries')));
+  });
+});

@@ -5,8 +5,8 @@ Two related but independent features:
 | Feature | What it needs | What breaks without it |
 | --- | --- | --- |
 | **OAuth redirect flow** | `APP_URL` + client id/secret | Nothing, if you use Shopify-managed installation |
-| **Webhook receipt** | `SHOPIFY_WEBHOOK_SECRET` | Deliveries are rejected with `WEBHOOK_INVALID_SIGNATURE` |
-| **Webhook registration** | `APP_URL` + `SHOPIFY_WEBHOOK_SECRET` | Shopify never sends anything, because nothing is subscribed |
+| **Webhook receipt** | `SHOPIFY_CLIENT_SECRET` (used automatically) | Deliveries are rejected with `WEBHOOK_INVALID_SIGNATURE` |
+| **Webhook registration** | `APP_URL` | Shopify never sends anything, because nothing is subscribed |
 
 > **Do you actually need OAuth?**
 > Probably not. A single-store deployment using Shopify-managed installation plus
@@ -121,7 +121,7 @@ Mixing these up is the most common source of "my HMAC won't validate":
 | Signed material | raw request **body** bytes | sorted **query string** |
 | Digest encoding | base64 | hex |
 | Carried in | `X-Shopify-Hmac-Sha256` header | `?hmac=` parameter |
-| Secret | `SHOPIFY_WEBHOOK_SECRET` | `SHOPIFY_CLIENT_SECRET` |
+| Secret | `SHOPIFY_WEBHOOK_SECRET`, defaulting to `SHOPIFY_CLIENT_SECRET` | `SHOPIFY_CLIENT_SECRET` |
 
 They live in `src/webhooks/webhook.verify.ts` and `src/auth/oauth.hmac.ts`
 respectively, and neither imports the other.
@@ -316,7 +316,7 @@ form (`orders/create`) in the `X-Shopify-Topic` delivery header.
 | "Stored token could not be decrypted" | The key changed | Reinstall the app on the store |
 | `DATABASE_UNAVAILABLE` on install | No MongoDB | Set `MONGODB_URI` |
 | `SHOPIFY_NOT_CONFIGURED` in `oauth` mode | No install completed | Visit `/api/auth/install?shop=...` |
-| Registration: `WEBHOOK_NOT_CONFIGURED` | No webhook secret | Set `SHOPIFY_WEBHOOK_SECRET` first |
+| Registration: `WEBHOOK_NOT_CONFIGURED` | Neither `SHOPIFY_CLIENT_SECRET` nor `SHOPIFY_WEBHOOK_SECRET` is set | Set `SHOPIFY_CLIENT_SECRET` — the webhook secret defaults to it |
 | Registration: `SHOPIFY_SCOPE_MISSING` on one topic | Missing the read scope for that topic's data | Add e.g. `read_customers` for `CUSTOMERS_*`, release a version, update the install |
 | No deliveries arrive | Nothing subscribed, or an unreachable URL | `GET /api/webhooks/subscriptions`; confirm `APP_URL` is public |
 | Deliveries rejected as `WEBHOOK_INVALID_SIGNATURE` | Wrong secret, or body was re-parsed | Confirm the secret; the receiver must stay mounted before `express.json()` |

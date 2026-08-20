@@ -331,10 +331,29 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     }
   }
 
-  const webhookSecret = read(env, 'SHOPIFY_WEBHOOK_SECRET');
-  if (webhookSecret === null) {
+  // ---- SHOPIFY_WEBHOOK_SECRET -------------------------------------------
+  //
+  // Shopify signs APP webhook deliveries with the app's CLIENT SECRET - there is
+  // no separate "webhook secret" to find for subscriptions created through the
+  // Admin API or app config:
+  // https://shopify.dev/docs/apps/build/webhooks/ignore-duplicates
+  //
+  // So an unset SHOPIFY_WEBHOOK_SECRET falls back to the client secret instead of
+  // rejecting every delivery. Without this the default configuration silently
+  // fails HMAC verification and sends people hunting for a value that does not
+  // exist for their setup.
+  //
+  // The explicit variable is still honoured, because webhooks created by hand in
+  // the Shopify admin (Settings -> Notifications) DO get their own secret.
+  const explicitWebhookSecret = read(env, 'SHOPIFY_WEBHOOK_SECRET');
+  const webhookSecret = explicitWebhookSecret ?? clientSecret;
+  if (explicitWebhookSecret === null && clientSecret === null) {
     warnings.push(
-      'SHOPIFY_WEBHOOK_SECRET not set - webhook routes will reject all deliveries.',
+      'Neither SHOPIFY_WEBHOOK_SECRET nor SHOPIFY_CLIENT_SECRET is set - webhook routes will reject all deliveries.',
+    );
+  } else if (explicitWebhookSecret === null) {
+    warnings.push(
+      'SHOPIFY_WEBHOOK_SECRET not set - verifying webhooks with SHOPIFY_CLIENT_SECRET, which is what Shopify signs app webhook deliveries with. Set it explicitly only for webhooks created by hand in the Shopify admin.',
     );
   }
 
