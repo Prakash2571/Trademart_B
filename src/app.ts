@@ -46,6 +46,7 @@ import { inventoryRouter } from './inventory/inventory.controller';
 import { ordersRouter } from './orders/orders.controller';
 import { pricingRouter } from './pricing/pricing.controller';
 import { productsRouter } from './products/products.controller';
+import { productsWriteRouter } from './products/products.write.controller';
 import { shopifyRouter } from './shopify/shopify.controller';
 import { manualCostRouter } from './suppliers/manualCost.controller';
 import { suppliersRouter } from './suppliers/suppliers.controller';
@@ -135,6 +136,9 @@ export function createApp(): Express {
   // ---- Read surface --------------------------------------------------------
   app.use('/api/shopify', requireOperatorForReads, shopifyRouter);
   app.use('/api/shopify', requireOperatorForReads, productsRouter);
+  // Product EDIT (PATCH). Separate router behind the write guard so mutations
+  // always require an operator, while the read router above can stay open.
+  app.use('/api/shopify', requireOperatorForWrites, productsWriteRouter);
   app.use('/api/shopify', requireOperatorForReads, ordersRouter);
   app.use('/api/shopify', requireOperatorForReads, customersRouter);
   app.use('/api/shopify', requireOperatorForReads, inventoryRouter);

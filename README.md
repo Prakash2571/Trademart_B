@@ -473,6 +473,7 @@ receiver.
 | GET | `/api/shopify/shop` | Connection test / shop info |
 | GET | `/api/shopify/products` | `?limit=1..100&cursor=&query=` (Shopify search syntax) |
 | GET | `/api/shopify/products/:id` | Numeric id or full GID |
+| PATCH | `/api/shopify/products/:id` | Edit title/description/vendor/type/status, add/remove tags, set variant price + compare-at. Operator-only. |
 | GET | `/api/shopify/orders` | `?limit=&cursor=&query=` |
 | GET | `/api/shopify/orders/:id` | |
 | GET | `/api/shopify/customers` | Only scope-permitted fields |
