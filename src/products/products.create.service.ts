@@ -16,8 +16,13 @@ import { AppError } from '../common/errors';
 import { logger } from '../common/logger';
 import {
   PRODUCT_CREATE_MUTATION,
+  PRODUCT_STATUS_UPDATE_MUTATION,
   PRODUCT_VARIANTS_BULK_CREATE_MUTATION,
 } from '../shopify/graphql/product.mutations';
+import {
+  getProductPublications,
+  publishProduct,
+} from '../shopify/publications/publications.service';
 import { shopifyGraphql } from '../shopify/shopify.client';
 import { mapUserErrors } from '../shopify/shopify.errors';
 import {
@@ -43,9 +48,16 @@ export interface CreatedVariant {
 export interface ProductCreateResult {
   shopifyProductId: string;
   title: string;
+  /** Final status: DRAFT unless publish was requested AND verified. */
   status: string;
   variantsCreated: number;
   mediaAttached: number;
+  /** True only when publication to a sales channel was requested and verified. */
+  published: boolean;
+  /** Set when publish was requested but failed; the product was left DRAFT. */
+  publishError: string | null;
+  /** Channels the product is on, when a publish was attempted. */
+  publications: { publicationId: string; name: string; isPublished: boolean }[];
   /**
    * The variants that now exist on the product, with their SKU and selected
    * option values. When explicit variants were supplied these are the created
@@ -138,9 +150,62 @@ export async function createProduct(
     }
   }
 
+  // Step 3 (optional): publish + activate. The product was created DRAFT; only
+  // now, if requested, do we make it live - and only via the safe order
+  // publish -> verify -> set ACTIVE. If any step fails the product is LEFT
+  // DRAFT (never ACTIVE-but-invisible), and the failure is reported.
+  let status = product.status;
+  let published = false;
+  let publishError: string | null = null;
+  let publications: ProductCreateResult['publications'] = [];
+
+  if (request.publish) {
+    try {
+      const result = await publishProduct(product.id);
+      publications = result.state.map((entry) => ({
+        publicationId: entry.publicationId,
+        name: entry.name,
+        isPublished: entry.isPublished,
+      }));
+      const verified = publications.some((entry) => entry.isPublished);
+      if (verified) {
+        const activated = await shopifyGraphql<{
+          productUpdate: {
+            product: { id: string; status: string } | null;
+            userErrors: UserErrors;
+          } | null;
+        }>(
+          PRODUCT_STATUS_UPDATE_MUTATION,
+          { product: { id: product.id, status: 'ACTIVE' } },
+          { operation: 'productCreateActivate' },
+        );
+        const activateError = mapUserErrors(activated.data.productUpdate?.userErrors);
+        if (activateError !== null) throw activateError;
+        status = activated.data.productUpdate?.product?.status ?? 'ACTIVE';
+        published = true;
+      } else {
+        publishError =
+          'Publish returned but no sales channel reports the product as published; it was left as DRAFT.';
+      }
+    } catch (error) {
+      publishError =
+        error instanceof AppError ? `${error.code}: ${error.message}` : 'Publication failed.';
+      if (publications.length === 0) {
+        try {
+          publications = await getProductPublications(product.id);
+        } catch {
+          publications = [];
+        }
+      }
+      // status stays DRAFT.
+    }
+  }
+
   logger.info('Created Shopify product.', {
     shopifyProductId: product.id,
-    status: product.status,
+    status,
+    published,
+    publishError,
     variantsCreated,
     mediaAttached: media.length,
   });
@@ -148,9 +213,12 @@ export async function createProduct(
   return {
     shopifyProductId: product.id,
     title: product.title,
-    status: product.status,
+    status,
     variantsCreated,
     mediaAttached: media.length,
+    published,
+    publishError,
+    publications,
     variants: createdVariants,
   };
 }

@@ -43,7 +43,19 @@ export interface ProductCreateRequest {
   descriptionHtml?: string;
   vendor?: string;
   productType?: string;
+  /**
+   * Status the product is CREATED with. Always DRAFT: a product is never
+   * created ACTIVE, because ACTIVE without a sales-channel publication is
+   * invisible-but-looks-live. Activation happens only after a verified publish.
+   */
   status: ProductStatus;
+  /**
+   * Whether to publish + activate after creation. Set by `publish: true`, or by
+   * the legacy `status: 'ACTIVE'`. When true the service publishes to the Online
+   * Store, verifies it, and only then sets ACTIVE; on failure the product is
+   * left DRAFT.
+   */
+  publish: boolean;
   tags: string[];
   options: ProductOptionInput[];
   variants: NewVariantInput[];
@@ -229,14 +241,18 @@ function validateMediaUrls(raw: unknown): string[] {
 export function validateProductCreate(body: Record<string, unknown>): ProductCreateRequest {
   const title = requiredString(body['title'], 'title', MAX_TITLE);
 
-  let status: ProductStatus = 'DRAFT';
+  // The product is ALWAYS created DRAFT. `publish: true` (or the legacy
+  // status: 'ACTIVE') requests the create+publish+activate flow, which the
+  // service performs only after verifying publication.
+  let publish = body['publish'] === true;
   if (body['status'] !== undefined && body['status'] !== null) {
     const raw = String(body['status']).toUpperCase();
     if (!(STATUSES as readonly string[]).includes(raw)) {
       throw new AppError('VALIDATION_ERROR', `status must be one of ${STATUSES.join(', ')}.`);
     }
-    status = raw as ProductStatus;
+    if (raw === 'ACTIVE') publish = true;
   }
+  const status: ProductStatus = 'DRAFT';
 
   const options = validateOptions(body['options']);
   const variants = validateNewVariants(body['variants'], options);
@@ -258,6 +274,7 @@ export function validateProductCreate(body: Record<string, unknown>): ProductCre
   const request: ProductCreateRequest = {
     title,
     status,
+    publish,
     tags,
     options,
     variants,

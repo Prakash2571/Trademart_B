@@ -29,8 +29,18 @@ describe('validateProductCreate', () => {
     assert.equal(validateProductCreate(minimal).status, 'DRAFT');
   });
 
-  it('allows an explicit ACTIVE', () => {
-    assert.equal(validateProductCreate({ ...minimal, status: 'active' }).status, 'ACTIVE');
+  it('never creates ACTIVE directly; status:ACTIVE requests publish instead', () => {
+    // A product is always CREATED as DRAFT. Legacy status:'active' is mapped to
+    // publish:true, so the service publishes + verifies before activating.
+    const req = validateProductCreate({ ...minimal, status: 'active' });
+    assert.equal(req.status, 'DRAFT');
+    assert.equal(req.publish, true);
+  });
+
+  it('defaults publish to false and honours an explicit publish flag', () => {
+    assert.equal(validateProductCreate(minimal).publish, false);
+    assert.equal(validateProductCreate({ ...minimal, publish: true }).publish, true);
+    assert.equal(validateProductCreate({ ...minimal, publish: true }).status, 'DRAFT');
   });
 
   it('requires a title', () => {
