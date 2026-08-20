@@ -244,7 +244,11 @@ describe('ClientCredentialsTokenProvider', () => {
   });
 
   it('coalesces concurrent requests into a single token fetch', async () => {
-    let resolveFetch: ((value: { status: number; body: RawTokenResponse }) => void) | null = null;
+    // Initialised to a typed noop rather than null: assigning the Promise
+    // executor's `resolve` through a `| null` field made TS narrow the later
+    // `resolveFetch?.(...)` call target to `never` (TS2349, "not callable")
+    // once real @types were present. A definite function type sidesteps that.
+    let resolveFetch: (value: { status: number; body: RawTokenResponse }) => void = () => {};
     let calls = 0;
     const provider = new ClientCredentialsTokenProvider({
       clientId: 'id',
