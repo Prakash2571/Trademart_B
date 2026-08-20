@@ -129,15 +129,18 @@ export async function getShop(options: { useCache?: boolean } = {}): Promise<Sho
     return shopCache.value;
   }
 
-  const { data } = await withScopeFallback<{ shop: RawShop }>(
+  const { data, degraded } = await withScopeFallback<{ shop: RawShop }>(
     'getShop',
     SHOP_QUERY_FULL,
     SHOP_QUERY_BASIC,
     {},
-    ['shop.email'],
+    // SHOP_QUERY_BASIC drops billingAddress as well as email/contactEmail, so
+    // `country` degrades too. Both must be reported, otherwise a withheld
+    // field is indistinguishable from an empty one.
+    ['shop.email', 'shop.country'],
   );
 
-  const shop = mapShop(data.shop, config.shopify.apiVersion);
+  const shop = mapShop(data.shop, config.shopify.apiVersion, degraded);
   shopCache = { value: shop, expiresAt: Date.now() + SHOP_CACHE_TTL_MS };
   return shop;
 }

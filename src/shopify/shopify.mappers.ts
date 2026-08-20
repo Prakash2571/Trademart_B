@@ -67,8 +67,12 @@ function parseCount(value: string | null | undefined): number | null {
 // Shop
 // ---------------------------------------------------------------------------
 
-export function mapShop(raw: RawShop, apiVersion: string): ShopDto {
-  return {
+export function mapShop(
+  raw: RawShop,
+  apiVersion: string,
+  degraded: string[] = [],
+): ShopDto {
+  const shop: ShopDto = {
     shopifyShopId: raw.id,
     name: raw.name,
     myshopifyDomain: raw.myshopifyDomain,
@@ -83,6 +87,9 @@ export function mapShop(raw: RawShop, apiVersion: string): ShopDto {
     country: raw.billingAddress?.country ?? null,
     apiVersion,
   };
+  // Omitted rather than an empty array, matching `PageMeta.degraded`.
+  if (degraded.length > 0) shop.degraded = degraded;
+  return shop;
 }
 
 // ---------------------------------------------------------------------------
