@@ -247,6 +247,7 @@ export function decideVariantPrice(
       return {
         kind: 'skip',
         variantId,
+        costSource,
         reasons: [
           error instanceof AppError
             ? `Pricing engine rejected these inputs: ${error.message}`
