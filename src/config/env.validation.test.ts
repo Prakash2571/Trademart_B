@@ -432,3 +432,130 @@ describe('validateEnv - webhook secret falls back to the client secret', () => {
     assert.ok(result.warnings.some((w) => w.includes('reject all deliveries')));
   });
 });
+
+
+describe('validateEnv - operator authentication', () => {
+  const HASH = 'scrypt$16384$8$1$c2FsdHNhbHQ=$aGFzaGhhc2hoYXNo';
+  const SECRET = 'x'.repeat(48);
+
+  it('defaults to no login configured, and warns rather than errors', () => {
+    // Auth being unconfigured must not stop the server booting - the middleware
+    // fails closed instead.
+    const result = validateEnv(VALID);
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.operator.passwordHash, null);
+    assert.equal(result.config?.operator.sessionSecret, null);
+    assert.ok(result.warnings.some((w) => w.includes('management endpoints')));
+  });
+
+  it('defaults the operator username to "operator"', () => {
+    assert.equal(validateEnv(VALID).config?.operator.username, 'operator');
+  });
+
+  it('accepts a password hash plus a session secret', () => {
+    const result = validateEnv({
+      ...VALID,
+      OPERATOR_PASSWORD_HASH: HASH,
+      SESSION_SECRET: SECRET,
+    });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.operator.passwordHash, HASH);
+    assert.equal(result.config?.operator.sessionSecret, SECRET);
+  });
+
+  it('rejects a password hash with no session secret', () => {
+    // Half a credential pair is always a mistake.
+    const result = validateEnv({ ...VALID, OPERATOR_PASSWORD_HASH: HASH });
+
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((e) => e.includes('SESSION_SECRET')));
+  });
+
+  it('rejects a hash that is not scrypt', () => {
+    const result = validateEnv({
+      ...VALID,
+      OPERATOR_PASSWORD_HASH: 'bcrypt$whatever',
+      SESSION_SECRET: SECRET,
+    });
+
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((e) => e.includes('scrypt')));
+  });
+
+  it('rejects a short session secret', () => {
+    const result = validateEnv({
+      ...VALID,
+      OPERATOR_PASSWORD_HASH: HASH,
+      SESSION_SECRET: 'too-short',
+    });
+
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((e) => e.includes('SESSION_SECRET')));
+  });
+
+  it('rejects a short API key', () => {
+    const result = validateEnv({ ...VALID, OPERATOR_API_KEY: 'short' });
+
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((e) => e.includes('OPERATOR_API_KEY')));
+  });
+
+  it('accepts an API key alone as a valid operator credential', () => {
+    const result = validateEnv({ ...VALID, OPERATOR_API_KEY: 'k'.repeat(32) });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.operator.apiKey, 'k'.repeat(32));
+    // No "management endpoints locked" warning when a key is present.
+    assert.ok(!result.warnings.some((w) => w.includes('management endpoints')));
+  });
+
+  it('refuses to protect reads when nobody can sign in', () => {
+    // Otherwise the whole console locks with no way in.
+    const result = validateEnv({ ...VALID, OPERATOR_PROTECT_READS: 'true' });
+
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((e) => e.includes('OPERATOR_PROTECT_READS')));
+  });
+
+  it('allows protected reads once a login exists', () => {
+    const result = validateEnv({
+      ...VALID,
+      OPERATOR_PASSWORD_HASH: HASH,
+      SESSION_SECRET: SECRET,
+      OPERATOR_PROTECT_READS: 'true',
+    });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.operator.protectReads, true);
+  });
+
+  it('rejects a username containing the payload separator', () => {
+    const result = validateEnv({ ...VALID, OPERATOR_USERNAME: 'bad:name' });
+
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((e) => e.includes('OPERATOR_USERNAME')));
+  });
+
+  it('validates SESSION_TTL_HOURS bounds', () => {
+    assert.ok(
+      validateEnv({ ...VALID, SESSION_TTL_HOURS: '0' }).errors.some((e) =>
+        e.includes('SESSION_TTL_HOURS'),
+      ),
+    );
+    assert.equal(
+      validateEnv({ ...VALID, SESSION_TTL_HOURS: '24' }).config?.operator.sessionTtlMs,
+      24 * 60 * 60 * 1000,
+    );
+  });
+
+  it('derives secureCookies from production', () => {
+    assert.equal(validateEnv(VALID).config?.operator.secureCookies, false);
+    assert.equal(
+      validateEnv({ ...VALID, NODE_ENV: 'production', MONGODB_URI: VALID.MONGODB_URI }).config
+        ?.operator.secureCookies,
+      true,
+    );
+  });
+});

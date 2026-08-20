@@ -92,6 +92,17 @@ services:
       # Check `make logs-backend` if the container will not start.
       AUTOMATION_ENABLED: ${AUTOMATION_ENABLED:-false}
       AUTOMATION_ON_WEBHOOK: ${AUTOMATION_ON_WEBHOOK:-false}
+
+      # ---- Operator authentication ----------------------------------------
+      # Protects every write endpoint. Fails closed: with none of these set,
+      # management endpoints refuse with UNAUTHORIZED rather than being open.
+      # Generate: npm run operator:hash / openssl rand -base64 48.
+      OPERATOR_USERNAME: ${OPERATOR_USERNAME:-operator}
+      OPERATOR_PASSWORD_HASH: ${OPERATOR_PASSWORD_HASH:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      OPERATOR_API_KEY: ${OPERATOR_API_KEY:-}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
+      OPERATOR_PROTECT_READS: ${OPERATOR_PROTECT_READS:-false}
     # No depends_on: the database is external by default. The local-db override
     # adds a depends_on for the bundled Mongo when you opt into it.
     expose:

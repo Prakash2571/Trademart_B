@@ -93,7 +93,36 @@ export interface AppConfig {
    * merchant may reasonably want the first without the second.
    */
   automationOnWebhook: boolean;
+  operator: OperatorConfig;
   shopify: ShopifyConfig;
+}
+
+export interface OperatorConfig {
+  username: string;
+  /** scrypt$N$r$p$salt$hash. Null when no password login is configured. */
+  passwordHash: string | null;
+  /** HMAC key for session cookies. Null disables cookie sessions entirely. */
+  sessionSecret: string | null;
+  /**
+   * Pre-shared key for non-browser clients (curl, cron). Null disables it.
+   * Exempt from CSRF because a browser never attaches it automatically.
+   */
+  apiKey: string | null;
+  sessionTtlMs: number;
+  /**
+   * When true, READ endpoints also require a signed-in operator.
+   *
+   * Defaults to false so enabling auth cannot black out an existing dashboard
+   * before its login screen is deployed. Mutations are ALWAYS protected
+   * regardless of this setting.
+   */
+  protectReads: boolean;
+  /**
+   * Whether to mark cookies Secure. Derived from NODE_ENV: a Secure cookie is
+   * dropped by the browser over plain http, which would make local development
+   * impossible to sign in to.
+   */
+  secureCookies: boolean;
 }
 
 export interface EnvValidationResult {
@@ -487,6 +516,96 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     );
   }
 
+  // ---- Operator authentication -------------------------------------------
+  //
+  // Protects every endpoint that can change the Shopify store. CORS is not
+  // authentication: it is a browser-enforced policy that does nothing about a
+  // direct request, so without this layer /api/automation/apply is callable by
+  // anyone who knows the URL.
+  const operatorUsername = read(env, 'OPERATOR_USERNAME') ?? 'operator';
+  if (operatorUsername.includes(':')) {
+    // ':' is the session payload separator.
+    errors.push('OPERATOR_USERNAME must not contain a colon.');
+  }
+
+  const operatorPasswordHash = read(env, 'OPERATOR_PASSWORD_HASH');
+  if (operatorPasswordHash !== null && !operatorPasswordHash.startsWith('scrypt$')) {
+    errors.push(
+      'OPERATOR_PASSWORD_HASH must be a scrypt hash of the form scrypt$N$r$p$salt$hash. Generate one with: npm run operator:hash',
+    );
+  }
+
+  const sessionSecret = read(env, 'SESSION_SECRET');
+  // 32 chars is the shortest value that is unreasonable to brute force; a short
+  // secret here forges sessions, so it is an error rather than a warning.
+  if (sessionSecret !== null && sessionSecret.length < 32) {
+    errors.push(
+      'SESSION_SECRET must be at least 32 characters. Generate one with: openssl rand -base64 48',
+    );
+  }
+
+  const operatorApiKey = read(env, 'OPERATOR_API_KEY');
+  if (operatorApiKey !== null && operatorApiKey.length < 24) {
+    errors.push(
+      'OPERATOR_API_KEY must be at least 24 characters. Generate one with: openssl rand -base64 32',
+    );
+  }
+
+  const rawTtlHours = read(env, 'SESSION_TTL_HOURS');
+  let sessionTtlHours = 12;
+  if (rawTtlHours !== null) {
+    if (!/^\d+$/.test(rawTtlHours)) {
+      errors.push(`SESSION_TTL_HOURS must be an integer (received "${rawTtlHours}").`);
+    } else {
+      const parsed = Number(rawTtlHours);
+      if (parsed < 1 || parsed > 720) {
+        errors.push('SESSION_TTL_HOURS must be between 1 and 720.');
+      } else {
+        sessionTtlHours = parsed;
+      }
+    }
+  }
+
+  const rawProtectReads = read(env, 'OPERATOR_PROTECT_READS');
+  let protectReads = false;
+  if (rawProtectReads !== null) {
+    const normalised = rawProtectReads.toLowerCase();
+    if (normalised === 'true') protectReads = true;
+    else if (normalised === 'false') protectReads = false;
+    else {
+      errors.push(
+        `OPERATOR_PROTECT_READS must be "true" or "false" (received "${rawProtectReads}").`,
+      );
+    }
+  }
+
+  // A usable login needs BOTH a password hash and a session secret. Half of the
+  // pair is always a mistake, never a deliberate state.
+  const hasPasswordLogin = operatorPasswordHash !== null && sessionSecret !== null;
+  if (operatorPasswordHash !== null && sessionSecret === null) {
+    errors.push('SESSION_SECRET is required when OPERATOR_PASSWORD_HASH is set.');
+  }
+  if (sessionSecret !== null && operatorPasswordHash === null && operatorApiKey === null) {
+    warnings.push(
+      'SESSION_SECRET is set but OPERATOR_PASSWORD_HASH is not, so nobody can sign in. Generate a hash with: npm run operator:hash',
+    );
+  }
+
+  if (!hasPasswordLogin && operatorApiKey === null) {
+    // Fail CLOSED: with no credentials the middleware denies every mutation.
+    // Loud, because the alternative reading - "auth is off, so writes are open" -
+    // would be a serious hole.
+    const message =
+      'No operator credentials configured (OPERATOR_PASSWORD_HASH + SESSION_SECRET, or OPERATOR_API_KEY). All management endpoints - automation apply/approve/rules and webhook registration - will refuse with UNAUTHORIZED.';
+    if (isProduction) warnings.push(`${message} Set them before using the console.`);
+    else warnings.push(message);
+  }
+  if (protectReads && !hasPasswordLogin && operatorApiKey === null) {
+    errors.push(
+      'OPERATOR_PROTECT_READS=true would lock every endpoint with no way to sign in. Configure OPERATOR_PASSWORD_HASH + SESSION_SECRET first.',
+    );
+  }
+
   if (errors.length > 0) {
     return { config: null, errors, warnings };
   }
@@ -502,6 +621,17 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
       tokenEncryptionKey,
       automationEnabled,
       automationOnWebhook,
+      operator: {
+        username: operatorUsername,
+        passwordHash: operatorPasswordHash,
+        sessionSecret,
+        apiKey: operatorApiKey,
+        sessionTtlMs: sessionTtlHours * 60 * 60 * 1000,
+        protectReads,
+        // Secure cookies are dropped over plain http, which would make local
+        // development unable to sign in at all.
+        secureCookies: isProduction,
+      },
       shopify: {
         storeDomain,
         apiVersion,

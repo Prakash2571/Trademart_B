@@ -41,7 +41,12 @@ export type ErrorCode =
   // Storefront automation (price / visibility writes)
   | 'AUTOMATION_DISABLED'
   | 'AUTOMATION_RULES_INVALID'
-  | 'AUTOMATION_PRECONDITION_FAILED';
+  | 'AUTOMATION_PRECONDITION_FAILED'
+  // Operator authentication (protects everything that can change the store)
+  | 'UNAUTHORIZED'
+  | 'CSRF_INVALID'
+  | 'LOGIN_FAILED'
+  | 'OPERATOR_NOT_CONFIGURED';
 
 export interface ErrorBody {
   success: false;
@@ -107,6 +112,14 @@ export function defaultStatusForCode(code: ErrorCode): number {
       return 403;
     case 'WEBHOOK_INVALID_SIGNATURE':
       return 401;
+    // Not signed in, or the session expired. 401 tells the frontend to show the
+    // login screen; 403 would imply "signed in but not allowed".
+    case 'UNAUTHORIZED':
+    case 'LOGIN_FAILED':
+      return 401;
+    // Authenticated but the request could not be proven to be intentional.
+    case 'CSRF_INVALID':
+      return 403;
     // A failed HMAC or state check is an authentication failure, not a 400:
     // the request was well-formed but could not be proven to come from Shopify.
     case 'OAUTH_INVALID_HMAC':
@@ -122,6 +135,9 @@ export function defaultStatusForCode(code: ErrorCode): number {
     case 'WEBHOOK_NOT_CONFIGURED':
     case 'OAUTH_NOT_CONFIGURED':
     case 'ENCRYPTION_NOT_CONFIGURED':
+    // No operator credentials configured at all. 503, not 401: nobody can sign
+    // in, so this is a server configuration fault rather than a bad attempt.
+    case 'OPERATOR_NOT_CONFIGURED':
       return 503;
     case 'DATABASE_UNAVAILABLE':
       return 503;
@@ -162,6 +178,12 @@ export function defaultRetryableForCode(code: ErrorCode): boolean {
     case 'AUTOMATION_DISABLED':
     case 'AUTOMATION_RULES_INVALID':
     case 'AUTOMATION_PRECONDITION_FAILED':
+    // Retrying an auth failure with the same credentials cannot succeed, and
+    // automatic retries on a login route are indistinguishable from an attack.
+    case 'UNAUTHORIZED':
+    case 'CSRF_INVALID':
+    case 'LOGIN_FAILED':
+    case 'OPERATOR_NOT_CONFIGURED':
       return false;
     default:
       return false;

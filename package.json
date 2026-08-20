@@ -13,7 +13,8 @@
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsc -p tsconfig.test.json && node --test \"dist-test/**/*.test.js\"",
-    "shopify:ping": "tsx src/scripts/shopifyPing.ts"
+    "shopify:ping": "tsx src/scripts/shopifyPing.ts",
+    "operator:hash": "tsx src/scripts/hashOperatorPassword.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

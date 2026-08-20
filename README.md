@@ -60,6 +60,12 @@ All secrets live here and **never** leave the server. Never commit `.env`.
 | `TOKEN_ENCRYPTION_KEY` | only for `oauth` | — | 32 bytes (hex or base64) encrypting offline tokens at rest. `openssl rand -base64 32`. |
 | `AUTOMATION_ENABLED` | no | `false` | **Kill switch for storefront writes.** `true` lets Trademart change live prices and product visibility. Must be exactly `true`/`false`. |
 | `AUTOMATION_ON_WEBHOOK` | no | `false` | Let Shopify webhooks trigger automation runs, so cost/stock changes sync with no manual step. Needs `AUTOMATION_ENABLED=true` too. |
+| `OPERATOR_USERNAME` | no | `operator` | Console login username. No colon. |
+| `OPERATOR_PASSWORD_HASH` | for the console | — | scrypt hash from `npm run operator:hash`. Never the plaintext. |
+| `SESSION_SECRET` | with password | — | HMAC key signing session cookies. ≥ 32 chars. Rotating it logs everyone out. |
+| `OPERATOR_API_KEY` | for scripts | — | Bearer key for non-browser clients. ≥ 24 chars. CSRF-exempt. |
+| `SESSION_TTL_HOURS` | no | `12` | Session lifetime (1–720). |
+| `OPERATOR_PROTECT_READS` | no | `false` | `true` requires login for reads too, not just writes. |
 
 `APP_URL` is **not** `FRONTEND_URL`: the first is this API as Shopify reaches it,
 the second is the browser app allowed through CORS. Shopify cannot reach
@@ -450,9 +456,19 @@ Envelopes are consistent:
 { "success": false, "code": "SHOPIFY_SCOPE_MISSING", "message": "…" }
 ```
 
+**Authentication:** everything that changes the store requires a signed-in
+operator (session cookie or `Authorization: Bearer <OPERATOR_API_KEY>`). See
+[docs/OPERATOR_AUTH.md](docs/OPERATOR_AUTH.md). Public exceptions: `/api/health`,
+`/api/operator/*`, the Shopify OAuth callback, and the HMAC-verified webhook
+receiver.
+
 | Method | Route | Notes |
 | --- | --- | --- |
-| GET | `/api/health` | Liveness + database/Shopify diagnostics |
+| GET | `/api/health` | Liveness + database/Shopify diagnostics. Public. |
+| POST | `/api/operator/login` | Start a session. Public, rate-limited. |
+| POST | `/api/operator/logout` | Clear the session. |
+| GET | `/api/operator/me` | Auth state. Always 200. |
+| GET | `/api/operator/csrf` | Issue a CSRF token. |
 | GET | `/api/shopify/status` | Config + connectivity. Always 200. Booleans only, no secrets. |
 | GET | `/api/shopify/shop` | Connection test / shop info |
 | GET | `/api/shopify/products` | `?limit=1..100&cursor=&query=` (Shopify search syntax) |
@@ -494,7 +510,8 @@ Envelopes are consistent:
 `WEBHOOK_REGISTRATION_FAILED`, `OAUTH_NOT_CONFIGURED`, `OAUTH_INVALID_REQUEST`,
 `OAUTH_INVALID_HMAC`, `OAUTH_STATE_INVALID`, `ENCRYPTION_NOT_CONFIGURED`,
 `AUTOMATION_DISABLED`, `AUTOMATION_RULES_INVALID`,
-`AUTOMATION_PRECONDITION_FAILED`.
+`AUTOMATION_PRECONDITION_FAILED`, `UNAUTHORIZED`, `CSRF_INVALID`,
+`LOGIN_FAILED`, `OPERATOR_NOT_CONFIGURED`.
 
 ### Rate limits
 
@@ -743,6 +760,9 @@ src/
   nonce, before any parameter is trusted or any token is stored.
 - Offline access tokens are encrypted with AES-256-GCM before being persisted;
   nothing in the schema ever holds a readable credential.
+- Every write endpoint requires an authenticated operator (session cookie or API
+  key); the middleware fails closed. CORS is defence-in-depth, not auth. See
+  [docs/OPERATOR_AUTH.md](docs/OPERATOR_AUTH.md).
 - Storefront writes are off behind `AUTOMATION_ENABLED` (default `false`), bounded
   per run, reversible from the `automation_runs` audit trail, and always
   previewable without writing.

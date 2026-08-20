@@ -90,4 +90,15 @@ export const isAutomationEnabled = (): boolean => config.automationEnabled;
 export const isAutomationOnWebhookEnabled = (): boolean =>
   config.automationOnWebhook && config.automationEnabled;
 
+/** True when an operator can sign in with a username and password. */
+export const isOperatorPasswordLoginConfigured = (): boolean =>
+  config.operator.passwordHash !== null && config.operator.sessionSecret !== null;
+
+/**
+ * True when SOME operator credential exists. When false the auth middleware
+ * denies every management endpoint - it fails closed, never open.
+ */
+export const isOperatorConfigured = (): boolean =>
+  isOperatorPasswordLoginConfigured() || config.operator.apiKey !== null;
+
 export type { AppConfig } from './env.validation';
