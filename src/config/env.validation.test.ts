@@ -272,15 +272,42 @@ describe('validateEnv - APP_URL and derived callback URLs', () => {
 });
 
 describe('validateEnv - SHOPIFY_SCOPES', () => {
-  it('defaults to the scopes the dashboard actually reads', () => {
+  it('defaults to every scope the implemented features need', () => {
     const result = validateEnv(VALID);
 
+    // Derived from shopify/capabilities.ts, so this list grows automatically
+    // when a feature is added. Asserted explicitly anyway: a silent change to
+    // the requested scope list changes what merchants are asked to approve.
     assert.deepEqual(result.config?.shopify.scopes, [
-      'read_products',
-      'read_orders',
       'read_customers',
       'read_inventory',
+      'read_locations',
+      'read_orders',
+      'read_products',
+      'read_themes',
+      'write_inventory',
+      'write_products',
     ]);
+  });
+
+  it('defaults to the write scopes the mutations need', () => {
+    // Regression guard for the original bug: the default list was read-only
+    // long after product and inventory writes shipped, so a fresh install
+    // could not perform half the product's features.
+    const scopes = validateEnv(VALID).config?.shopify.scopes ?? [];
+
+    assert.ok(scopes.includes('write_products'), 'write_products must be requested');
+    assert.ok(scopes.includes('write_inventory'), 'write_inventory must be requested');
+    assert.ok(scopes.includes('read_locations'), 'read_locations must be requested');
+  });
+
+  it('does not request write_themes, which is not implemented', () => {
+    // Requesting permission that cannot be exercised adds install friction and
+    // costs merchant trust for no capability.
+    const scopes = validateEnv(VALID).config?.shopify.scopes ?? [];
+
+    assert.ok(!scopes.includes('write_themes'));
+    assert.ok(!scopes.includes('write_theme_code'));
   });
 
   it('parses a comma-separated list and lowercases it', () => {

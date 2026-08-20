@@ -1,0 +1,377 @@
+/**
+ * Centralised Shopify scope + capability definitions.
+ *
+ * WHY THIS FILE EXISTS
+ * --------------------
+ * Scope knowledge used to be scattered across a dozen places: a hardcoded
+ * default list in env.validation.ts, prose in JSDoc headers, a `requiredScope`
+ * string literal in themes.controller.ts, another in automation.controller.ts.
+ * Nothing tied a scope to the operation that actually needs it, so the default
+ * scope list drifted behind the code (it still requested read-only access long
+ * after product/inventory writes shipped).
+ *
+ * Every scope Trademart needs is now derived from THIS catalogue:
+ *   - DEFAULT_SHOPIFY_SCOPES (config) is computed from the implemented features
+ *   - GET /api/shopify/capabilities reports the catalogue against what Shopify
+ *     actually granted
+ *
+ * THE DISTINCTION THAT MATTERS
+ * ----------------------------
+ * A feature can be unavailable for two completely different reasons, and
+ * conflating them sends the operator to the wrong place:
+ *
+ *   SCOPE_MISSING     the code exists; re-install/re-authorise the app with the
+ *                     scope. Operator action: Partner Dashboard / SHOPIFY_SCOPES.
+ *   NOT_IMPLEMENTED   Trademart has no code for this. Granting a scope changes
+ *                     nothing. Operator action: none, wait for the feature.
+ *
+ * `write_themes` is the motivating example: granting it would NOT enable theme
+ * editing here, because no theme-write code exists (and Shopify additionally
+ * gates themeFilesUpsert behind a per-app exemption). Reporting that as
+ * "scope missing" would be a lie that costs someone an afternoon.
+ */
+
+/**
+ * Granting write access to a resource also grants read access to it, so
+ * `write_products` alone is enough to read products.
+ *
+ * This is not a guess. The reference deployment's granted scope list contains
+ * `write_products` and `write_inventory` but neither `read_products` nor
+ * `read_inventory`, and product and inventory reads work against it.
+ *
+ * Treating write as implying read is also the safe direction of error: the
+ * alternative would report `products.read: false` on a deployment where reading
+ * demonstrably works, and send the operator off to add a scope they do not
+ * need. If Shopify ever changes this, the cost is one over-optimistic line in a
+ * diagnostics payload — the real request path still surfaces the truth as
+ * SHOPIFY_SCOPE_MISSING.
+ */
+export function impliedScopes(granted: readonly string[]): Set<string> {
+  const set = new Set(granted);
+  for (const scope of granted) {
+        if (scope.startsWith('write_')) set.add(`read_${scope.slice('write_'.length)}`);
+  }
+  return set;
+}
+
+export type CapabilityStatus =
+  /** Implemented and every required scope is granted. */
+  | 'AVAILABLE'
+  /** Implemented, but Shopify has not granted a required scope. */
+  | 'SCOPE_MISSING'
+  /** No implementation exists. Granting scopes will not help. */
+  | 'NOT_IMPLEMENTED'
+  /** Implemented, but the granted scope list is unknown (static token). */
+  | 'SCOPES_UNKNOWN';
+
+export interface FeatureDefinition {
+  /** Stable identifier, `group.action`. */
+  readonly key: string;
+  readonly group: string;
+  readonly action: string;
+  readonly title: string;
+  /** Scopes that must be granted. Empty means no scope gates this. */
+  readonly requiredScopes: readonly string[];
+  /** Whether Trademart has code for this at all. */
+  readonly implemented: boolean;
+  /** Admin API operations performed, so a scope can be traced to a call. */
+  readonly operations: readonly string[];
+  /** HTTP surface exposing it. */
+  readonly routes: readonly string[];
+  readonly note?: string;
+}
+
+/**
+ * Every Shopify-touching capability, implemented or not.
+ *
+ * Derived by auditing the GraphQL documents in ./graphql against the routes in
+ * app.ts. Add an entry here when you add an operation — do not sprinkle scope
+ * strings through controllers.
+ */
+export const SHOPIFY_FEATURES: readonly FeatureDefinition[] = Object.freeze([
+  {
+    key: 'shop.read',
+    group: 'shop',
+    action: 'read',
+    title: 'Read shop profile',
+    // The `shop` root field needs no scope; individual fields do. email and
+    // billingAddress are withheld without approved protected-data access, which
+    // is why getShop falls back to a reduced document and reports `degraded`.
+    requiredScopes: [],
+    implemented: true,
+    operations: ['query TrademartShopInfo', 'query TrademartShopInfoBasic'],
+    routes: ['GET /api/shopify/shop', 'GET /api/shopify/status'],
+    note: 'shop.email and shop.country require approved protected customer data access; when withheld the reduced query is used and ShopDto.degraded lists the fields.',
+  },
+  {
+    key: 'products.read',
+    group: 'products',
+    action: 'read',
+    title: 'Read products and variants',
+    requiredScopes: ['read_products'],
+    implemented: true,
+    operations: [
+      'query TrademartProducts',
+      'query TrademartProduct',
+      'query TrademartCounts',
+    ],
+    routes: ['GET /api/shopify/products', 'GET /api/shopify/products/:id'],
+  },
+  {
+    key: 'products.write',
+    group: 'products',
+    action: 'write',
+    title: 'Edit products (title, description, vendor, type, status, tags, prices)',
+    requiredScopes: ['write_products'],
+    implemented: true,
+    operations: [
+      'mutation TrademartProductUpdate',
+      'mutation TrademartProductStatusUpdate',
+      'mutation TrademartTagsAdd',
+      'mutation TrademartTagsRemove',
+      'mutation TrademartVariantPriceUpdate',
+    ],
+    routes: ['PATCH /api/shopify/products/:id'],
+  },
+  {
+    key: 'products.create',
+    group: 'products',
+    action: 'create',
+    title: 'Create products with options, variants and media',
+    requiredScopes: ['write_products'],
+    implemented: true,
+    operations: [
+      'mutation TrademartProductCreate',
+      'mutation TrademartVariantsBulkCreate',
+    ],
+    routes: ['POST /api/shopify/products'],
+    note: 'Creates as DRAFT unless the caller explicitly asks otherwise.',
+  },
+  {
+    key: 'inventory.read',
+    group: 'inventory',
+    action: 'read',
+    title: 'Read stock levels and unit cost',
+    requiredScopes: ['read_inventory'],
+    implemented: true,
+    operations: ['query TrademartInventory', 'query TrademartInventoryItemProduct'],
+    routes: ['GET /api/shopify/inventory'],
+    note: 'Also gates variant.inventoryItem.unitCost, the SHOPIFY_UNIT_COST tier of the cost hierarchy.',
+  },
+  {
+    key: 'inventory.write',
+    group: 'inventory',
+    action: 'write',
+    title: 'Set stock quantities',
+    // read_locations too: a quantity is meaningless without a location, and the
+    // caller picks one from GET /api/shopify/locations.
+    requiredScopes: ['write_inventory', 'read_locations'],
+    implemented: true,
+    operations: ['mutation TrademartInventorySet'],
+    routes: ['POST /api/shopify/inventory/set'],
+  },
+  {
+    key: 'locations.read',
+    group: 'locations',
+    action: 'read',
+    title: 'List inventory locations',
+    requiredScopes: ['read_locations'],
+    implemented: true,
+    operations: ['query TrademartLocations'],
+    routes: ['GET /api/shopify/locations'],
+  },
+  {
+    key: 'orders.read',
+    group: 'orders',
+    action: 'read',
+    title: 'Read orders and fulfillments',
+    requiredScopes: ['read_orders'],
+    implemented: true,
+    operations: ['query TrademartOrders', 'query TrademartOrder'],
+    routes: ['GET /api/shopify/orders', 'GET /api/shopify/orders/:id'],
+  },
+  {
+    key: 'customers.read',
+    group: 'customers',
+    action: 'read',
+    title: 'Read customers',
+    requiredScopes: ['read_customers'],
+    implemented: true,
+    operations: ['query TrademartCustomers', 'query TrademartCustomersCount'],
+    routes: ['GET /api/shopify/customers'],
+    note: 'read_customers alone is not always sufficient: customer PII additionally requires approved protected customer data access in the Partner Dashboard, which surfaces as "Access denied for customers field" even when the scope is granted.',
+  },
+  {
+    key: 'themes.read',
+    group: 'themes',
+    action: 'read',
+    title: 'List themes, identify the live theme, read theme files',
+    requiredScopes: ['read_themes'],
+    implemented: true,
+    operations: ['query TrademartThemes', 'query TrademartThemeFiles'],
+    routes: [
+      'GET /api/shopify/themes',
+      'GET /api/shopify/themes/:id/files',
+      'GET /api/storefront/status',
+    ],
+  },
+  {
+    key: 'themes.write',
+    group: 'themes',
+    action: 'write',
+    title: 'Edit or publish themes',
+    requiredScopes: ['write_themes'],
+    // The important false. Granting write_themes does NOT enable this.
+    implemented: false,
+    operations: [],
+    routes: [],
+    note: 'NOT IMPLEMENTED, and deliberately not requested. themeFilesUpsert and themeDuplicate require write_themes PLUS a Shopify-granted exemption, so requesting the scope would add install friction and still not work. Trademart never modifies the live theme.',
+  },
+  {
+    key: 'webhooks.manage',
+    group: 'webhooks',
+    action: 'manage',
+    title: 'Register and inspect webhook subscriptions',
+    // There is no read_webhooks/write_webhooks scope. An app may always manage
+    // its OWN subscriptions; what each topic needs is the read scope for the
+    // data it carries (PRODUCTS_* -> read_products, ORDERS_* -> read_orders).
+    requiredScopes: [],
+    implemented: true,
+    operations: [
+      'query TrademartWebhookSubscriptions',
+      'mutation TrademartWebhookSubscriptionCreate',
+      'mutation TrademartWebhookSubscriptionUpdate',
+      'mutation TrademartWebhookSubscriptionDelete',
+    ],
+    routes: ['POST /api/webhooks/register', 'GET /api/webhooks/subscriptions'],
+    note: 'write_webhooks does not exist as a Shopify scope. Each subscribed topic instead requires the read scope covering its payload.',
+  },
+]);
+
+/**
+ * Scopes Trademart should request: the union required by IMPLEMENTED features.
+ *
+ * Unimplemented features are excluded on purpose — asking for permission you
+ * cannot use costs install friction and merchant trust for nothing.
+ */
+export const REQUIRED_SCOPES: readonly string[] = Object.freeze(
+  [
+    ...new Set(
+      SHOPIFY_FEATURES.filter((feature) => feature.implemented).flatMap(
+        (feature) => feature.requiredScopes,
+      ),
+    ),
+  ].sort(),
+);
+
+export interface FeatureReport extends FeatureDefinition {
+  status: CapabilityStatus;
+  /** True only when implemented AND every required scope is granted. */
+  available: boolean;
+  /** Required scopes Shopify did not grant. Empty when nothing is missing. */
+  missingScopes: string[];
+}
+
+export interface CapabilityReport {
+  /**
+   * Compact view, `group -> action -> granted`.
+   *
+   * `null` means undeterminable rather than false: a static access token does
+   * not report its scopes, and claiming `false` there would invent a problem.
+   */
+  capabilities: Record<string, Record<string, boolean | null>>;
+  features: FeatureReport[];
+  scopes: {
+    /** What this build needs, derived from the feature catalogue. */
+    required: readonly string[];
+    /** What config asks for (SHOPIFY_SCOPES or the default list). */
+    requested: readonly string[];
+    /** What Shopify actually granted. Null when the strategy cannot report it. */
+    granted: readonly string[] | null;
+    /** Required but not granted. Empty when nothing is missing. */
+    missing: readonly string[];
+    /** Required but absent from the requested list — a config bug. */
+    notRequested: readonly string[];
+    /** Granted but unused by any implemented feature. */
+    unused: readonly string[];
+  };
+}
+
+/**
+ * Evaluates the catalogue against the granted scope list.
+ *
+ * @param granted Scopes Shopify granted, or null when unknown (static token).
+ * @param requested Scopes this build asks for, for drift detection.
+ */
+export function resolveCapabilities(
+  granted: readonly string[] | null,
+  requested: readonly string[],
+): CapabilityReport {
+  const grantedSet = granted === null ? null : impliedScopes(granted);
+  const requestedSet = impliedScopes(requested);
+
+  const features: FeatureReport[] = SHOPIFY_FEATURES.map((feature) => {
+    const missingScopes =
+      grantedSet === null
+        ? []
+        : feature.requiredScopes.filter((scope) => !grantedSet.has(scope));
+
+    let status: CapabilityStatus;
+    if (!feature.implemented) {
+      // Checked first: an unimplemented feature's scope state is irrelevant.
+      status = 'NOT_IMPLEMENTED';
+    } else if (grantedSet === null && feature.requiredScopes.length > 0) {
+      status = 'SCOPES_UNKNOWN';
+    } else if (missingScopes.length > 0) {
+      status = 'SCOPE_MISSING';
+    } else {
+      status = 'AVAILABLE';
+    }
+
+    return {
+      ...feature,
+      status,
+      available: status === 'AVAILABLE',
+      missingScopes,
+    };
+  });
+
+  const capabilities: Record<string, Record<string, boolean | null>> = {};
+  for (const feature of features) {
+    const group = (capabilities[feature.group] ??= {});
+    // An unimplemented feature is a hard false, not unknown: no scope grant
+    // will make it work, so `null` ("might work") would mislead.
+    group[feature.action] =
+      feature.status === 'SCOPES_UNKNOWN' ? null : feature.available;
+  }
+
+  const missing =
+    grantedSet === null
+      ? []
+      : REQUIRED_SCOPES.filter((scope) => !grantedSet.has(scope));
+
+  const notRequested = REQUIRED_SCOPES.filter((scope) => !requestedSet.has(scope));
+
+  const unused =
+    granted === null
+      ? []
+      : granted.filter((scope) => {
+          // Compare through implication: read_products is "used" when
+          // write_products is what the catalogue asked for.
+          const implied = impliedScopes([scope]);
+          return !REQUIRED_SCOPES.some((required) => implied.has(required));
+        });
+
+  return {
+    capabilities,
+    features,
+    scopes: {
+      required: REQUIRED_SCOPES,
+      requested: [...requested],
+      granted: granted === null ? null : [...granted],
+      missing,
+      notRequested,
+      unused,
+    },
+  };
+}

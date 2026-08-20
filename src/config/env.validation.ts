@@ -10,7 +10,15 @@
  *  - Missing-but-optional credentials (Mongo URI, Shopify token, webhook
  *    secret) are warnings in development so the server still boots and can
  *    report its own degraded state. In production they are errors.
+ *
+ * The single import below is the one exception to "import-free", and a
+ * deliberate one: shopify/capabilities.ts is itself pure data with no imports of
+ * its own, so pulling it in keeps this module side-effect free and unit
+ * testable. The alternative was a second, hand-maintained copy of the scope
+ * list here — which is exactly the drift that made the old default list wrong.
  */
+
+import { REQUIRED_SCOPES } from '../shopify/capabilities';
 
 export type NodeEnv = 'development' | 'test' | 'production';
 
@@ -139,16 +147,21 @@ export const DEFAULT_SHOPIFY_API_VERSION = '2026-07';
 /**
  * Scopes requested by the OAuth redirect flow when SHOPIFY_SCOPES is unset.
  *
- * Deliberately the minimum Trademart actually reads. `read_customers` is
- * included because the dashboard's customer count uses `customersCount`, which
- * fails outright without it.
+ * DERIVED, not hand-written: the union of what every implemented feature in
+ * shopify/capabilities.ts declares. That file is the single source of truth.
+ *
+ * This list used to be maintained by hand and had gone stale — it still asked
+ * for read-only access (read_products, read_orders, read_customers,
+ * read_inventory) long after product writes, inventory writes, location reads
+ * and theme reads shipped, so a fresh install silently lacked permission for
+ * half the product. Deriving it means adding a feature cannot leave the scope
+ * list behind.
+ *
+ * Scopes for UNIMPLEMENTED features are excluded on purpose (notably
+ * write_themes): requesting permission you cannot exercise adds install
+ * friction and costs merchant trust for no capability.
  */
-export const DEFAULT_SHOPIFY_SCOPES = [
-  'read_products',
-  'read_orders',
-  'read_customers',
-  'read_inventory',
-] as const;
+export const DEFAULT_SHOPIFY_SCOPES: readonly string[] = REQUIRED_SCOPES;
 
 /** Path of the OAuth callback. Kept as a constant so config and docs agree. */
 export const OAUTH_CALLBACK_PATH = '/api/auth/callback';
