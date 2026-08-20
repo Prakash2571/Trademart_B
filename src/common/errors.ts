@@ -46,7 +46,9 @@ export type ErrorCode =
   | 'UNAUTHORIZED'
   | 'CSRF_INVALID'
   | 'LOGIN_FAILED'
-  | 'OPERATOR_NOT_CONFIGURED';
+  | 'OPERATOR_NOT_CONFIGURED'
+  // Storefront / theme safety
+  | 'THEME_PROTECTED';
 
 export interface ErrorBody {
   success: false;
@@ -120,6 +122,10 @@ export function defaultStatusForCode(code: ErrorCode): number {
     // Authenticated but the request could not be proven to be intentional.
     case 'CSRF_INVALID':
       return 403;
+    // Refusing to modify the live theme is a deliberate safety refusal, not a
+    // permission error - 409 (conflict with a safe-workflow rule).
+    case 'THEME_PROTECTED':
+      return 409;
     // A failed HMAC or state check is an authentication failure, not a 400:
     // the request was well-formed but could not be proven to come from Shopify.
     case 'OAUTH_INVALID_HMAC':
@@ -184,6 +190,7 @@ export function defaultRetryableForCode(code: ErrorCode): boolean {
     case 'CSRF_INVALID':
     case 'LOGIN_FAILED':
     case 'OPERATOR_NOT_CONFIGURED':
+    case 'THEME_PROTECTED':
       return false;
     default:
       return false;

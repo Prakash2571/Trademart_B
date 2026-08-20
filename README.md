@@ -475,6 +475,9 @@ receiver.
 | GET | `/api/shopify/products/:id` | Numeric id or full GID |
 | PATCH | `/api/shopify/products/:id` | Edit title/description/vendor/type/status, add/remove tags, set variant price + compare-at. Operator-only. |
 | POST | `/api/shopify/products` | Create a product (options, variants, media). **DRAFT by default.** Operator-only. |
+| GET | `/api/shopify/themes` | List themes; marks the live (MAIN) one. Needs `read_themes`. |
+| GET | `/api/shopify/themes/:id/files` | Read specific theme files (`?filenames=a,b`). Read-only. |
+| GET | `/api/storefront/status` | Storefront capabilities + honest limitations |
 | GET | `/api/shopify/orders` | `?limit=&cursor=&query=` |
 | GET | `/api/shopify/orders/:id` | |
 | GET | `/api/shopify/customers` | Only scope-permitted fields |
@@ -516,7 +519,7 @@ receiver.
 `OAUTH_INVALID_HMAC`, `OAUTH_STATE_INVALID`, `ENCRYPTION_NOT_CONFIGURED`,
 `AUTOMATION_DISABLED`, `AUTOMATION_RULES_INVALID`,
 `AUTOMATION_PRECONDITION_FAILED`, `UNAUTHORIZED`, `CSRF_INVALID`,
-`LOGIN_FAILED`, `OPERATOR_NOT_CONFIGURED`.
+`LOGIN_FAILED`, `OPERATOR_NOT_CONFIGURED`, `THEME_PROTECTED`.
 
 ### Rate limits
 

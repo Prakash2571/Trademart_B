@@ -48,6 +48,7 @@ import { pricingRouter } from './pricing/pricing.controller';
 import { productsRouter } from './products/products.controller';
 import { productsWriteRouter } from './products/products.write.controller';
 import { shopifyRouter } from './shopify/shopify.controller';
+import { themesRouter } from './shopify/themes/themes.controller';
 import { manualCostRouter } from './suppliers/manualCost.controller';
 import { suppliersRouter } from './suppliers/suppliers.controller';
 import {
@@ -142,6 +143,9 @@ export function createApp(): Express {
   app.use('/api/shopify', requireOperatorForReads, ordersRouter);
   app.use('/api/shopify', requireOperatorForReads, customersRouter);
   app.use('/api/shopify', requireOperatorForReads, inventoryRouter);
+  // Storefront/theme reads. Read-only: no write path exists yet, and the live
+  // theme is never modified directly (see themes/theme.guard.ts).
+  app.use('/api', requireOperatorForReads, themesRouter);
   app.use('/api', requireOperatorForReads, pricingRouter);
   app.use('/api', requireOperatorForReads, analyticsRouter);
   app.use('/api', requireOperatorForReads, suppliersRouter);
