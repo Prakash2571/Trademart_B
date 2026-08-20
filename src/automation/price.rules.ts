@@ -33,6 +33,12 @@ import {
   round2,
 } from '../pricing/pricing.service';
 import type { ProductVariantDto } from '../shopify/shopify.types';
+import {
+  describeCostSource,
+  resolveCostSource,
+  type CostSource,
+  type ManualCost,
+} from '../suppliers/cost';
 import type { PriceRounding, PriceRules } from './rules.types';
 
 export type PriceDecision =
@@ -46,11 +52,19 @@ export type PriceDecision =
       projectedMarginPercentage: number | null;
       /** Margin at the price it had before. Null when it could not be computed. */
       currentMarginPercentage: number | null;
+      /** Where the cost that drove this decision came from. */
+      costSource: CostSource;
       clamped: boolean;
       reasons: string[];
     }
-  | { kind: 'noop'; variantId: string; currentMarginPercentage: number | null; reasons: string[] }
-  | { kind: 'skip'; variantId: string; reasons: string[] };
+  | {
+      kind: 'noop';
+      variantId: string;
+      currentMarginPercentage: number | null;
+      costSource: CostSource;
+      reasons: string[];
+    }
+  | { kind: 'skip'; variantId: string; costSource: CostSource; reasons: string[] };
 
 /**
  * Rounds to the nearest .99 at or below the target, then steps up a unit if
@@ -108,49 +122,78 @@ export function marginAtPrice(
 }
 
 /**
- * The variant's cost, or null when unknown.
+ * The variant's resolved cost, following the source hierarchy
+ * (supplier API > Shopify cost per item > manual > unknown).
  *
- * A zero or negative unitCost is treated as UNKNOWN, not as free: Shopify
- * returns 0 both for "genuinely free" and for "never filled in", and pricing a
- * product as if it cost nothing is exactly the invented-data failure the
+ * A zero or negative amount at any level is treated as UNKNOWN, not as free:
+ * Shopify returns 0 both for "genuinely free" and "never filled in", and pricing
+ * a product as if it cost nothing is exactly the invented-data failure the
  * codebase forbids.
  */
-export function resolveCost(variant: ProductVariantDto): number | null {
-  if (variant.unitCost === null) return null;
-  const amount = variant.unitCost.amount;
-  if (!Number.isFinite(amount) || amount <= 0) return null;
-  return amount;
+export function resolveVariantCost(
+  variant: ProductVariantDto,
+  manualCost?: ManualCost | null,
+) {
+  return resolveCostSource({
+    // No supplier provider returns a real cost today (Tradelle has no API), so
+    // supplierApiCost is intentionally not supplied here; the hierarchy still
+    // reserves the top slot for when one does.
+    shopifyUnitCost: variant.unitCost,
+    manualCost: manualCost ?? null,
+  });
+}
+
+/**
+ * Backward-compatible numeric accessor. Returns just the amount (or null), for
+ * callers that do not need the source. Prefer resolveVariantCost when the source
+ * matters (audit, UI).
+ */
+export function resolveCost(
+  variant: ProductVariantDto,
+  manualCost?: ManualCost | null,
+): number | null {
+  return resolveVariantCost(variant, manualCost).amount;
 }
 
 /** Decides the price for a single variant. */
 export function decideVariantPrice(
   variant: ProductVariantDto,
   rules: PriceRules,
+  manualCost?: ManualCost | null,
 ): PriceDecision {
   const variantId = variant.shopifyVariantId;
 
   if (!rules.enabled) {
-    return { kind: 'skip', variantId, reasons: ['Price automation is disabled.'] };
+    return {
+      kind: 'skip',
+      variantId,
+      costSource: 'UNKNOWN',
+      reasons: ['Price automation is disabled.'],
+    };
   }
 
-  const cost = resolveCost(variant);
+  const resolved = resolveVariantCost(variant, manualCost);
+  const cost = resolved.amount;
+  const costSource = resolved.source;
   if (cost === null && rules.requireKnownCost) {
     return {
       kind: 'skip',
       variantId,
+      costSource,
       reasons: [
-        'No cost per item on this variant. Set "Cost per item" in Shopify (dropshipping apps such as Tradelle usually populate it) - nothing is priced from a guess.',
+        'No cost available from any source (supplier API, Shopify cost per item, or a manual entry). Set "Cost per item" in Shopify, or add a manual cost in Trademart - nothing is priced from a guess.',
       ],
     };
   }
   if (cost === null) {
-    return { kind: 'skip', variantId, reasons: ['Cost unknown.'] };
+    return { kind: 'skip', variantId, costSource, reasons: ['Cost unknown.'] };
   }
 
   if (variant.price === null) {
     return {
       kind: 'skip',
       variantId,
+      costSource,
       reasons: ['Variant has no current price to compare against.'],
     };
   }
@@ -159,21 +202,21 @@ export function decideVariantPrice(
 
   // A cost denominated differently from the price would make the maths
   // meaningless, and no conversion rate is available. Refuse rather than guess.
-  if (
-    variant.unitCost !== null &&
-    variant.unitCost.currencyCode !== currencyCode
-  ) {
+  // Uses the RESOLVED cost's currency, so a manual cost is checked too, not just
+  // Shopify's unit cost.
+  if (resolved.currencyCode !== null && resolved.currencyCode !== currencyCode) {
     return {
       kind: 'skip',
       variantId,
+      costSource,
       reasons: [
-        `Cost is in ${variant.unitCost.currencyCode} but the price is in ${currencyCode}; no exchange rate is available.`,
+        `Cost is in ${resolved.currencyCode} but the price is in ${currencyCode}; no exchange rate is available.`,
       ],
     };
   }
 
   const currentMarginPercentage = marginAtPrice(currentPrice, cost, rules);
-  const reasons: string[] = [];
+  const reasons: string[] = [`Cost source: ${describeCostSource(costSource)}.`];
 
   let target: number;
   if (rules.pricingMode === 'multiplier') {
@@ -260,6 +303,7 @@ export function decideVariantPrice(
       return {
         kind: 'skip',
         variantId,
+        costSource,
         reasons: [
           ...reasons,
           `Clamped price yields ${margin.toFixed(2)}% margin, below the ${floorMargin}% floor. Skipped rather than sold at a loss - raise maxIncreasePercentage or lower the target.`,
@@ -273,6 +317,7 @@ export function decideVariantPrice(
       kind: 'noop',
       variantId,
       currentMarginPercentage,
+      costSource,
       reasons: [
         `Already within ${rules.minChangeAmount} of the target (${currentPrice.toFixed(2)} vs ${candidate.toFixed(2)}).`,
       ],
@@ -287,6 +332,7 @@ export function decideVariantPrice(
     currencyCode,
     projectedMarginPercentage: marginAtPrice(candidate, cost, rules),
     currentMarginPercentage,
+    costSource,
     clamped,
     reasons,
   };
@@ -302,10 +348,11 @@ export function decideVariantPrice(
 export function lowestCurrentMargin(
   variants: readonly ProductVariantDto[],
   rules: PriceRules,
+  manualCosts?: ReadonlyMap<string, ManualCost>,
 ): number | null {
   let lowest: number | null = null;
   for (const variant of variants) {
-    const cost = resolveCost(variant);
+    const cost = resolveCost(variant, manualCosts?.get(variant.shopifyVariantId) ?? null);
     if (cost === null || variant.price === null) continue;
     const margin = marginAtPrice(variant.price.amount, cost, rules);
     if (margin === null) continue;

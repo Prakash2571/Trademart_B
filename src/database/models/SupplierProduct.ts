@@ -30,6 +30,13 @@ const supplierProductSchema = new Schema(
       enum: ['SHOPIFY_UNIT_COST', 'MANUAL', 'SUPPLIER_API', 'UNKNOWN'],
       default: 'UNKNOWN',
     },
+    /**
+     * When costSource is MANUAL, whether this hand-entered value should override
+     * Shopify's cost per item rather than only being used as a fallback.
+     */
+    manualOverride: { type: Boolean, default: false },
+    /** Free-text note for a manual cost (why it was set, its source, etc.). */
+    note: { type: String, default: null },
     /** Why this product was attributed to the provider. */
     evidence: { type: [String], default: [] },
     lastVerifiedAt: { type: Date, default: null },

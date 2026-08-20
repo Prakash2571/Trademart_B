@@ -11,9 +11,16 @@
  */
 
 import type { ProductDto } from '../shopify/shopify.types';
+import type { CostSource, ManualCost } from '../suppliers/cost';
 import { decideVariantPrice, lowestCurrentMargin } from './price.rules';
 import { decideVisibility, isExempt, isSelected } from './visibility.rules';
 import type { AutomationRules } from './rules.types';
+
+/**
+ * Manual costs to apply, keyed by Shopify variant GID. Optional: when absent,
+ * pricing falls back to Shopify's cost per item exactly as before.
+ */
+export type ManualCostMap = ReadonlyMap<string, ManualCost>;
 
 export interface VisibilityAction {
   type: 'visibility';
@@ -35,6 +42,8 @@ export interface PriceAction {
   currencyCode: string;
   currentMarginPercentage: number | null;
   projectedMarginPercentage: number | null;
+  /** Where the cost driving this price came from - surfaced for the audit. */
+  costSource: CostSource;
   clamped: boolean;
   reasons: string[];
 }
@@ -79,10 +88,13 @@ export interface AutomationPlan {
 export function buildAutomationPlan(
   products: readonly ProductDto[],
   rules: AutomationRules,
+  manualCosts?: ManualCostMap,
 ): AutomationPlan {
   const actions: AutomationAction[] = [];
   const skipped: SkippedItem[] = [];
   let truncated = false;
+  const manualFor = (variantId: string): ManualCost | null =>
+    manualCosts?.get(variantId) ?? null;
 
   for (const product of products) {
     // Selection is checked FIRST: a product outside it is not automation's
@@ -120,7 +132,7 @@ export function buildAutomationPlan(
 
     // Computed once and shared: the visibility rule needs the current margin,
     // and recomputing it per engine risks the two disagreeing.
-    const currentMargin = lowestCurrentMargin(product.variants, rules.price);
+    const currentMargin = lowestCurrentMargin(product.variants, rules.price, manualCosts);
 
     const visibility = decideVisibility(product, rules, currentMargin);
     if (visibility.kind === 'change') {
@@ -161,7 +173,7 @@ export function buildAutomationPlan(
         break;
       }
 
-      const decision = decideVariantPrice(variant, rules.price);
+      const decision = decideVariantPrice(variant, rules.price, manualFor(variant.shopifyVariantId));
       if (decision.kind === 'change') {
         actions.push({
           type: 'price',
@@ -174,6 +186,7 @@ export function buildAutomationPlan(
           currencyCode: decision.currencyCode,
           currentMarginPercentage: decision.currentMarginPercentage,
           projectedMarginPercentage: decision.projectedMarginPercentage,
+          costSource: decision.costSource,
           clamped: decision.clamped,
           reasons: decision.reasons,
         });

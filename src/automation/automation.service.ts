@@ -32,6 +32,7 @@ import { mapUserErrors } from '../shopify/shopify.errors';
 import { INVENTORY_ITEM_PRODUCT_QUERY } from '../shopify/graphql/inventory.queries';
 import { getProduct, listProducts } from '../shopify/shopify.service';
 import type { ProductDto } from '../shopify/shopify.types';
+import { loadManualCostMap } from '../suppliers/manualCost.service';
 import { buildAutomationPlan, type AutomationPlan, type PriceAction } from './plan';
 import {
   AUTOMATION_HIDDEN_TAG,
@@ -340,18 +341,35 @@ export async function runAutomation(options: RunOptions): Promise<AutomationRepo
       ? await fetchProductsByIds(options.productIds.slice(0, maxProducts))
       : await fetchProducts(options.query, maxProducts);
 
+  // Manual costs let a product be priced when Shopify has no cost per item, so
+  // they are loaded before the honesty check below.
+  const manualCosts = await loadManualCostMap(
+    products.map((product) => ({
+      shopifyProductId: product.shopifyProductId,
+      variantIds: product.variants.map((v) => v.shopifyVariantId),
+    })),
+  );
+
   // Critical honesty check. Without read_inventory every variant reports a null
   // unitCost, so the plan would be "nothing to do" for a reason that has nothing
-  // to do with the catalogue. Refuse instead of misleading.
-  if (rules.price.enabled && degraded.includes(UNIT_COST_FIELD)) {
+  // to do with the catalogue. Refuse instead of misleading - UNLESS manual costs
+  // are available, in which case pricing can still proceed from those.
+  if (
+    rules.price.enabled &&
+    degraded.includes(UNIT_COST_FIELD) &&
+    manualCosts.size === 0
+  ) {
     throw new AppError(
       'AUTOMATION_PRECONDITION_FAILED',
-      'Shopify did not return cost per item (read_inventory is not granted), so every product would appear to have no cost and no price could be calculated. Add the read_inventory scope, or disable price rules for this run.',
+      'Shopify did not return cost per item (read_inventory is not granted) and no manual costs are stored, so no product has a usable cost and no price could be calculated. Add the read_inventory scope, enter manual costs, or disable price rules for this run.',
       { details: { degraded } },
     );
   }
   if (degraded.length > 0) {
     notes.push(`Shopify withheld: ${degraded.join(', ')}.`);
+  }
+  if (manualCosts.size > 0) {
+    notes.push(`Applied ${manualCosts.size} manual cost(s) where present.`);
   }
   if (products.length === maxProducts) {
     notes.push(
@@ -359,7 +377,7 @@ export async function runAutomation(options: RunOptions): Promise<AutomationRepo
     );
   }
 
-  const plan = buildAutomationPlan(products, rules);
+  const plan = buildAutomationPlan(products, rules, manualCosts);
 
   const actions: AppliedAction[] = [];
   let applied = 0;

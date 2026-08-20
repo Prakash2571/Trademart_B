@@ -70,7 +70,10 @@ export function parseNumberField(
  * Accepts either a raw Shopify numeric id or a full GID and returns a GID.
  * Shopify ids must be treated as opaque strings, never coerced to numbers.
  */
-export function toShopifyGid(raw: string, resource: 'Product' | 'Order' | 'Customer'): string {
+export function toShopifyGid(
+  raw: string,
+  resource: 'Product' | 'Order' | 'Customer' | 'ProductVariant',
+): string {
   const value = raw.trim();
   if (value.startsWith('gid://shopify/')) {
     const expectedPrefix = `gid://shopify/${resource}/`;

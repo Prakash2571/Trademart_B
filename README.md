@@ -498,6 +498,9 @@ receiver.
 | PUT | `/api/automation/rules` | Save rules. Required for webhook-triggered runs. |
 | POST | `/api/automation/approve` | Publish a held product: `{ "productId": "…" }` |
 | GET | `/api/automation/runs` | Audit history of automation runs |
+| GET | `/api/costs` | List stored manual supplier costs (`?productId=`) |
+| PUT | `/api/costs` | Set a manual cost for a product/variant |
+| DELETE | `/api/costs` | Remove a manual cost (`?productId=&variantId=`) |
 
 ### Error codes
 

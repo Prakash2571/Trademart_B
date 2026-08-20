@@ -28,6 +28,48 @@ No per-supplier integration, no supplier API keys, nothing to maintain per vendo
 
 Requires the **`read_inventory`** scope. Without it Shopify withholds `unitCost` entirely, and automation refuses to run rather than concluding "no product has a cost" — see [Preconditions](#preconditions).
 
+### Cost-source hierarchy
+
+Shopify's cost per item is not the *only* possible source, and which one was
+used is recorded on every priced action. Costs resolve in this order (most to
+least authoritative):
+
+| # | Source | Where it comes from |
+| --- | --- | --- |
+| 1 | `SUPPLIER_API` | a documented supplier API (none today — Tradelle has none) |
+| 2 | `SHOPIFY_UNIT_COST` | Shopify's "cost per item", written by the dropshipping app |
+| 3 | `MANUAL` | a cost you entered in Trademart |
+| 4 | `UNKNOWN` | nothing available — the product is **not** priced |
+
+A non-positive amount at any level is treated as **UNKNOWN, never as free**. The
+source appears in every price action's `costSource` and in its reasons, so a run
+is auditable down to "where did this number come from".
+
+### Manual costs
+
+When a product has no Shopify cost per item (and no supplier API), attach one
+yourself so it can still be priced:
+
+```bash
+# Set a manual cost for a whole product (all variants) or one variant
+curl -X PUT https://your-host/api/costs \
+  -H 'Content-Type: application/json' \
+  -d '{"shopifyProductId":"123","supplierProductCost":9.50,"supplierShippingCost":2,"currencyCode":"GBP","provider":"TRADELLE","note":"from supplier invoice"}'
+
+curl "https://your-host/api/costs?productId=123"        # list
+curl -X DELETE "https://your-host/api/costs?productId=123&variantId=456"
+```
+
+- A **variant-level** manual cost wins over a **product-level** one for that variant.
+- By default a manual cost is a *fallback* below Shopify's cost per item. Send
+  `"override": true` to make it win over a wrong Shopify value (it still never
+  beats a live supplier API).
+- Manual costs are stored in MongoDB, so this needs `MONGODB_URI`. With automation
+  in `read_inventory`-less mode, stored manual costs are what let a run proceed
+  instead of failing the precondition check.
+- `PUT`/`DELETE` require an authenticated operator; `GET` follows
+  `OPERATOR_PROTECT_READS`.
+
 ---
 
 ## The workflow this replaces

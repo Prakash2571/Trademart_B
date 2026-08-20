@@ -47,6 +47,7 @@ import { ordersRouter } from './orders/orders.controller';
 import { pricingRouter } from './pricing/pricing.controller';
 import { productsRouter } from './products/products.controller';
 import { shopifyRouter } from './shopify/shopify.controller';
+import { manualCostRouter } from './suppliers/manualCost.controller';
 import { suppliersRouter } from './suppliers/suppliers.controller';
 import {
   webhookAdminRouter,
@@ -140,6 +141,9 @@ export function createApp(): Express {
   app.use('/api', requireOperatorForReads, pricingRouter);
   app.use('/api', requireOperatorForReads, analyticsRouter);
   app.use('/api', requireOperatorForReads, suppliersRouter);
+  // Manual supplier costs: GET is a read, PUT/DELETE are operator-protected
+  // writes. Mounted with the write guard, which leaves GET open by default.
+  app.use('/api', requireOperatorForWrites, manualCostRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);
