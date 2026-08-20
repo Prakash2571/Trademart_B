@@ -94,3 +94,49 @@ export const INVENTORY_ITEM_PRODUCT_QUERY = /* GraphQL */ `
     }
   }
 `;
+
+
+/**
+ * Store locations, so the operator can choose where to set stock.
+ * Requires read_locations.
+ */
+export const LOCATIONS_QUERY = /* GraphQL */ `
+  query TrademartLocations($first: Int!) {
+    locations(first: $first, includeInactive: false) {
+      edges {
+        node {
+          id
+          name
+          isActive
+          shipsInventory
+          fulfillsOnlineOrders
+        }
+      }
+    }
+  }
+`;
+
+/**
+ * Sets an inventory item's quantity to an absolute value at a location.
+ * https://shopify.dev/docs/api/admin-graphql/latest/mutations/inventorySetQuantities
+ * Requires write_inventory.
+ */
+export const INVENTORY_SET_QUANTITIES_MUTATION = /* GraphQL */ `
+  mutation TrademartInventorySet($input: InventorySetQuantitiesInput!) {
+    inventorySetQuantities(input: $input) {
+      inventoryAdjustmentGroup {
+        createdAt
+        reason
+        changes {
+          name
+          delta
+          quantityAfterChange
+        }
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;

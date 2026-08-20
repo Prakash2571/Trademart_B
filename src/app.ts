@@ -43,6 +43,7 @@ import { config } from './config';
 import { customersRouter } from './customers/customers.controller';
 import { healthRouter } from './health/health.controller';
 import { inventoryRouter } from './inventory/inventory.controller';
+import { inventoryWriteRouter } from './inventory/inventory.write.controller';
 import { ordersRouter } from './orders/orders.controller';
 import { pricingRouter } from './pricing/pricing.controller';
 import { productsRouter } from './products/products.controller';
@@ -143,6 +144,9 @@ export function createApp(): Express {
   app.use('/api/shopify', requireOperatorForReads, ordersRouter);
   app.use('/api/shopify', requireOperatorForReads, customersRouter);
   app.use('/api/shopify', requireOperatorForReads, inventoryRouter);
+  // Inventory writes (set quantity) + locations. Behind the write guard so
+  // setting stock always requires an operator; the GET locations stays open.
+  app.use('/api/shopify', requireOperatorForWrites, inventoryWriteRouter);
   // Storefront/theme reads. Read-only: no write path exists yet, and the live
   // theme is never modified directly (see themes/theme.guard.ts).
   app.use('/api', requireOperatorForReads, themesRouter);

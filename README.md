@@ -482,6 +482,8 @@ receiver.
 | GET | `/api/shopify/orders/:id` | |
 | GET | `/api/shopify/customers` | Only scope-permitted fields |
 | GET | `/api/shopify/inventory` | Read-only |
+| GET | `/api/shopify/locations` | Active store locations. Needs `read_locations`. |
+| POST | `/api/shopify/inventory/set` | Set an absolute quantity at a location. Needs `write_inventory`. Operator-only. |
 | GET | `/api/analytics/overview` | Aggregates over real orders, window disclosed |
 | GET | `/api/analytics/traffic` | Reports `available: false` — sessions are not inferred |
 | GET | `/api/dashboard/summary` | One call for the dashboard; degrades per-section |
