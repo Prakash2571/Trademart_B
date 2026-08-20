@@ -59,12 +59,39 @@ services:
       # To run Mongo inside the stack instead, see docker-compose.local-db.yml.
       MONGODB_URI: ${MONGODB_URI:?set MONGODB_URI in deploy/.env}
 
+      # This backend's own PUBLIC origin, as Shopify reaches it. Distinct from
+      # FRONTEND_URL (the browser app). Required for the OAuth redirect flow and
+      # for registering webhooks - Shopify cannot reach an internal service name.
+      # Normally https://<your DOMAIN>; left blank disables both features.
+      APP_URL: ${APP_URL:-}
+
       SHOPIFY_STORE_DOMAIN: ${SHOPIFY_STORE_DOMAIN:?set SHOPIFY_STORE_DOMAIN in deploy/.env}
       SHOPIFY_API_VERSION: ${SHOPIFY_API_VERSION:-2026-07}
       SHOPIFY_CLIENT_ID: ${SHOPIFY_CLIENT_ID:-}
       SHOPIFY_CLIENT_SECRET: ${SHOPIFY_CLIENT_SECRET:-}
       SHOPIFY_ACCESS_TOKEN: ${SHOPIFY_ACCESS_TOKEN:-}
       SHOPIFY_WEBHOOK_SECRET: ${SHOPIFY_WEBHOOK_SECRET:-}
+
+      # Scopes requested by the OAuth redirect flow. Ignored under Shopify-managed
+      # installation, where shopify.app.toml is the source of truth.
+      SHOPIFY_SCOPES: ${SHOPIFY_SCOPES:-}
+
+      # auto (default) = client credentials grant, unchanged.
+      # oauth          = use the stored per-merchant offline token; requires
+      #                  APP_URL and TOKEN_ENCRYPTION_KEY.
+      SHOPIFY_AUTH_MODE: ${SHOPIFY_AUTH_MODE:-auto}
+
+      # AES-256-GCM key for offline tokens at rest. Only required when
+      # SHOPIFY_AUTH_MODE=oauth. Changing it invalidates every stored token.
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:-}
+
+      # ---- Storefront automation kill switches ----------------------------
+      # Both default to false, so deploying this cannot change a live store.
+      # Must be exactly "true" or "false" - the backend exits 1 on anything else
+      # rather than silently guessing, which in Docker looks like a crash loop.
+      # Check `make logs-backend` if the container will not start.
+      AUTOMATION_ENABLED: ${AUTOMATION_ENABLED:-false}
+      AUTOMATION_ON_WEBHOOK: ${AUTOMATION_ON_WEBHOOK:-false}
     # No depends_on: the database is external by default. The local-db override
     # adds a depends_on for the bundled Mongo when you opt into it.
     expose:
