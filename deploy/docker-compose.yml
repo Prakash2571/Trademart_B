@@ -1,0 +1,216 @@
+# Trademart - single-host production stack.
+#
+#   cd Trademart_B/deploy
+#   cp .env.example .env    # then fill it in
+#   ./start.sh              # builds, boots, and issues TLS certs
+#
+# The database is EXTERNAL by default - set MONGODB_URI to your Atlas (or other)
+# connection string and nothing here touches a Mongo image. To run Mongo inside
+# the stack instead, add this line to .env:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.local-db.yml
+#
+# Expects both repos cloned side by side:
+#
+#   <parent>/
+#     ├── Trademart_B/deploy/docker-compose.yml   <- you are here
+#     └── Trademart_F/
+#
+# Override FRONTEND_CONTEXT in .env if the frontend lives somewhere else.
+#
+# Only nginx publishes ports. backend and frontend are reachable solely on the
+# internal `trademart` network. The database is external by default (Atlas);
+# the local-db overlay adds an internal-only `mongo` service.
+
+name: trademart
+
+# Shared by every service:
+#  - restart: unless-stopped -> restarts on crash AND on host boot, but a
+#    deliberate `docker compose stop` stays stopped.
+#  - capped json-file logs -> an unbounded log is the most common way a
+#    "never stops" stack actually dies (full disk).
+x-defaults: &defaults
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  # ------------------------------------------------------------- backend ------
+  backend:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: runtime
+    image: trademart-backend:${IMAGE_TAG:-latest}
+    <<: *defaults
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+
+      # Sole CORS origin accepted by the API. Must match the public origin
+      # exactly, no trailing slash.
+      FRONTEND_URL: ${FRONTEND_URL:?set FRONTEND_URL in deploy/.env}
+
+      # Required when NODE_ENV=production - the process exits 1 without it.
+      # Point this at MongoDB Atlas (mongodb+srv://...) or any external server.
+      # To run Mongo inside the stack instead, see docker-compose.local-db.yml.
+      MONGODB_URI: ${MONGODB_URI:?set MONGODB_URI in deploy/.env}
+
+      # This backend's own PUBLIC origin, as Shopify reaches it. Distinct from
+      # FRONTEND_URL (the browser app). Required for the OAuth redirect flow and
+      # for registering webhooks - Shopify cannot reach an internal service name.
+      # Normally https://<your DOMAIN>; left blank disables both features.
+      APP_URL: ${APP_URL:-}
+
+      SHOPIFY_STORE_DOMAIN: ${SHOPIFY_STORE_DOMAIN:?set SHOPIFY_STORE_DOMAIN in deploy/.env}
+      SHOPIFY_API_VERSION: ${SHOPIFY_API_VERSION:-2026-07}
+      SHOPIFY_CLIENT_ID: ${SHOPIFY_CLIENT_ID:-}
+      SHOPIFY_CLIENT_SECRET: ${SHOPIFY_CLIENT_SECRET:-}
+      SHOPIFY_ACCESS_TOKEN: ${SHOPIFY_ACCESS_TOKEN:-}
+      SHOPIFY_WEBHOOK_SECRET: ${SHOPIFY_WEBHOOK_SECRET:-}
+
+      # Scopes requested by the OAuth redirect flow. Ignored under Shopify-managed
+      # installation, where shopify.app.toml is the source of truth.
+      SHOPIFY_SCOPES: ${SHOPIFY_SCOPES:-}
+
+      # auto (default) = client credentials grant, unchanged.
+      # oauth          = use the stored per-merchant offline token; requires
+      #                  APP_URL and TOKEN_ENCRYPTION_KEY.
+      SHOPIFY_AUTH_MODE: ${SHOPIFY_AUTH_MODE:-auto}
+
+      # AES-256-GCM key for offline tokens at rest. Only required when
+      # SHOPIFY_AUTH_MODE=oauth. Changing it invalidates every stored token.
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:-}
+
+      # ---- Storefront automation kill switches ----------------------------
+      # Both default to false, so deploying this cannot change a live store.
+      # Must be exactly "true" or "false" - the backend exits 1 on anything else
+      # rather than silently guessing, which in Docker looks like a crash loop.
+      # Check `make logs-backend` if the container will not start.
+      AUTOMATION_ENABLED: ${AUTOMATION_ENABLED:-false}
+      AUTOMATION_ON_WEBHOOK: ${AUTOMATION_ON_WEBHOOK:-false}
+    # No depends_on: the database is external by default. The local-db override
+    # adds a depends_on for the bundled Mongo when you opt into it.
+    expose:
+      - "4000"
+    networks: [trademart]
+
+  # ------------------------------------------------------------ frontend ------
+  frontend:
+    build:
+      context: ${FRONTEND_CONTEXT:-../../Trademart_F}
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        # Inlined into the browser bundle at build time. Rebuild the image
+        # (./start.sh or `docker compose build frontend`) after changing it.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-/api}
+    image: trademart-frontend:${IMAGE_TAG:-latest}
+    <<: *defaults
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+    expose:
+      - "3000"
+    networks: [trademart]
+
+  # --------------------------------------------------------------- nginx ------
+  nginx:
+    image: nginx:1.27-alpine
+    <<: *defaults
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in deploy/.env}
+      # Substitute ONLY ${DOMAIN} in the templates. Without this filter envsubst
+      # would also eat nginx runtime variables such as $host and $request_uri.
+      NGINX_ENVSUBST_FILTER: "^DOMAIN$$"
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/snippets:/etc/nginx/snippets:ro
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - letsencrypt:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+      - nginx_logs:/var/log/nginx
+    # service_started, not service_healthy: nginx must come up even when the
+    # backend is crash-looping, otherwise a bad env var takes the whole site
+    # offline instead of just the /api routes. Upstreams are re-resolved via
+    # Docker's DNS at request time (see nginx/nginx.conf).
+    depends_on:
+      backend:
+        condition: service_started
+      frontend:
+        condition: service_started
+    healthcheck:
+      # Internal-only listener on 8080, never published.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    # Reload every 6h so renewed certificates are picked up without downtime.
+    #
+    # Deliberately plain POSIX sh: this image's /bin/sh is busybox ash, where
+    # `wait ${!}` is a "Bad substitution" syntax error that kills the whole
+    # script before nginx ever starts. A bare `sleep` needs no job-control
+    # plumbing because nginx, not this shell, is the process handling signals.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        while :; do sleep 6h; nginx -s reload; done &
+        exec /docker-entrypoint.sh nginx -g 'daemon off;'
+    networks: [trademart]
+
+  # -------------------------------------------------------------- certbot -----
+  # Long-running renewal loop. Certificate ISSUANCE is done once by ./start.sh
+  # (which overrides the entrypoint); this service only renews.
+  certbot:
+    image: certbot/certbot:latest
+    <<: *defaults
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - letsencrypt_lib:/var/lib/letsencrypt
+      - certbot_www:/var/www/certbot
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        trap exit TERM
+        while :; do
+          certbot renew --webroot --webroot-path /var/www/certbot --quiet
+          sleep 12h & wait $${!}
+        done
+    networks: [trademart]
+
+  # -------------------------------------------------------------- autoheal ----
+  # Opt-in: `docker compose --profile autoheal up -d`.
+  # Docker restarts containers that EXIT, but not containers that are merely
+  # reported unhealthy. This watches healthchecks and restarts the unhealthy.
+  # It needs the Docker socket, so enable it only if you accept that trade-off.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    profiles: [autoheal]
+    <<: *defaults
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: all
+      AUTOHEAL_INTERVAL: "30"
+      AUTOHEAL_START_PERIOD: "60"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [trademart]
+
+volumes:
+  letsencrypt:
+  letsencrypt_lib:
+  certbot_www:
+  nginx_logs:
+
+networks:
+  trademart:
+    driver: bridge

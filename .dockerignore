@@ -1,0 +1,27 @@
+# Keep the build context small and make sure no local secret is ever baked
+# into an image layer.
+.git
+.gitignore
+.github
+
+node_modules
+dist
+dist-test
+coverage
+.nyc_output
+
+# Secrets: never copy these in. Compose injects env at runtime instead.
+.env
+.env.*
+
+# The deployment stack lives in the build context but is not part of the image.
+deploy
+
+*.log
+npm-debug.log*
+logs
+.DS_Store
+Thumbs.db
+.idea
+.vscode
+*.tsbuildinfo

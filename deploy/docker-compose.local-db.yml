@@ -1,0 +1,72 @@
+# OPTIONAL overlay: run MongoDB inside the stack instead of using an external
+# server such as Atlas.
+#
+# The base docker-compose.yml has no database service at all, so nothing pulls a
+# Mongo image unless you opt in here.
+#
+# Enable it by adding one line to deploy/.env:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.local-db.yml
+#
+# Docker Compose reads COMPOSE_FILE from .env, so every command
+# (docker compose up, ./start.sh, make logs) picks up both files automatically -
+# no extra -f flags anywhere.
+#
+# Then set these in .env as well:
+#
+#   MONGO_INITDB_ROOT_USERNAME=trademart
+#   MONGO_INITDB_ROOT_PASSWORD=<openssl rand -hex 24>
+#   MONGODB_URI=mongodb://trademart:<same password>@mongo:27017/trademart?authSource=admin
+#
+# Mongo is never published to the host - it is reachable only on the internal
+# `trademart` network. Data lives in the `trademart_mongo_data` volume, which
+# `make destroy` deletes and `make down` keeps.
+#
+# NOTE: anchors do not cross file boundaries in Compose, so the restart policy
+# and logging limits are spelled out here rather than reusing *defaults.
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    command:
+      - --wiredTigerCacheSizeGB
+      - "${MONGO_CACHE_SIZE_GB:-1}"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:?set MONGO_INITDB_ROOT_USERNAME in deploy/.env}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:?set MONGO_INITDB_ROOT_PASSWORD in deploy/.env}
+    volumes:
+      - mongo_data:/data/db
+      - mongo_config:/data/configdb
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mongosh --quiet
+          -u "$$MONGO_INITDB_ROOT_USERNAME"
+          -p "$$MONGO_INITDB_ROOT_PASSWORD"
+          --authenticationDatabase admin
+          --eval "db.adminCommand('ping').ok" | grep -q 1
+      interval: 20s
+      timeout: 5s
+      start_period: 40s
+      retries: 5
+    networks: [trademart]
+
+  # Merged into the backend service from the base file. mongoose does not retry
+  # after a failed FIRST connection, so with a local database the ordering
+  # actually matters - unlike the external case, where the URI is reachable
+  # before the stack even starts.
+  backend:
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+volumes:
+  mongo_data:
+  mongo_config:
