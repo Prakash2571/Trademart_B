@@ -473,6 +473,9 @@ receiver.
 | GET | `/api/shopify/shop` | Connection test / shop info |
 | GET | `/api/shopify/products` | `?limit=1..100&cursor=&query=` (Shopify search syntax) |
 | GET | `/api/shopify/products/:id` | Numeric id or full GID |
+| GET | `/api/shopify/themes` | List themes; marks the live (MAIN) one. Needs `read_themes`. |
+| GET | `/api/shopify/themes/:id/files` | Read specific theme files (`?filenames=a,b`). Read-only. |
+| GET | `/api/storefront/status` | Storefront capabilities + honest limitations |
 | GET | `/api/shopify/orders` | `?limit=&cursor=&query=` |
 | GET | `/api/shopify/orders/:id` | |
 | GET | `/api/shopify/customers` | Only scope-permitted fields |
@@ -511,7 +514,7 @@ receiver.
 `OAUTH_INVALID_HMAC`, `OAUTH_STATE_INVALID`, `ENCRYPTION_NOT_CONFIGURED`,
 `AUTOMATION_DISABLED`, `AUTOMATION_RULES_INVALID`,
 `AUTOMATION_PRECONDITION_FAILED`, `UNAUTHORIZED`, `CSRF_INVALID`,
-`LOGIN_FAILED`, `OPERATOR_NOT_CONFIGURED`.
+`LOGIN_FAILED`, `OPERATOR_NOT_CONFIGURED`, `THEME_PROTECTED`.
 
 ### Rate limits
 
