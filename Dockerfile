@@ -6,15 +6,26 @@
 # any devDependency: install (all deps) -> compile -> install (prod deps only)
 # -> runtime.
 #
-# NOTE: no package-lock.json is committed in this repo, so `npm install` is used
-# instead of `npm ci`. Commit a lockfile and switch to `npm ci` when you want
-# byte-reproducible builds.
+# DEPENDENCY INSTALL: `npm ci` when a lockfile is committed, `npm install`
+# otherwise. npm ci is strictly better - it installs exactly what the lockfile
+# pins and fails if package.json disagrees - but it REQUIRES the lockfile, so an
+# unconditional `npm ci` would make the image unbuildable until one is added.
+#
+# The wildcard in the COPY is what makes this work: `package-lock.json*` matches
+# zero files without erroring. Commit a lockfile and both install stages switch
+# to npm ci on the next build with no edit here.
+#   npm install --package-lock-only && git add package-lock.json
 
 # ---------------------------------------------------------------- deps --------
 FROM node:22-alpine AS deps
 WORKDIR /app
-COPY package.json ./
-RUN npm install --no-audit --no-fund
+COPY package.json package-lock.json* ./
+RUN if [ -f package-lock.json ]; then \
+      echo "Lockfile present - npm ci"; npm ci --no-audit --no-fund; \
+    else \
+      echo "WARNING: no package-lock.json - falling back to npm install; this build is not reproducible"; \
+      npm install --no-audit --no-fund; \
+    fi
 
 # --------------------------------------------------------------- build --------
 FROM node:22-alpine AS build
@@ -28,8 +39,14 @@ RUN npm run build
 # ---------------------------------------------------------- prod-deps ---------
 FROM node:22-alpine AS prod-deps
 WORKDIR /app
-COPY package.json ./
-RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
+COPY package.json package-lock.json* ./
+# --omit=dev keeps the TypeScript compiler and @types out of the runtime image.
+RUN if [ -f package-lock.json ]; then \
+      npm ci --omit=dev --no-audit --no-fund; \
+    else \
+      npm install --omit=dev --no-audit --no-fund; \
+    fi \
+    && npm cache clean --force
 
 # ------------------------------------------------------------- runtime --------
 FROM node:22-alpine AS runtime
