@@ -20,6 +20,40 @@ export function getProvider(name: string): SupplierProvider | undefined {
   );
 }
 
+export interface SupplierCostSupport {
+  providerName: string;
+  /** Whether an authoritative supplier cost feed exists. */
+  supplierCostApi: boolean;
+  /** Whether products arrive via the supplier's own Shopify app. */
+  shopifyIntegration: boolean;
+  /** Why supplierCostApi is false, when it is. */
+  limitation: string | null;
+}
+
+/**
+ * Per-provider cost-feed truth, for /api/automation/status.
+ *
+ * Reads the provider's DECLARED capabilities rather than probing for method
+ * existence, so a method that exists only to return null cannot be reported as
+ * a working integration.
+ */
+export function describeSupplierCostSupport(): SupplierCostSupport[] {
+  return providers.map((provider) => ({
+    providerName: provider.providerName,
+    supplierCostApi: provider.capabilities.getSupplierCost,
+    shopifyIntegration: provider.capabilities.shopifyIntegration,
+    limitation: provider.capabilities.getSupplierCost
+      ? null
+      : (provider.limitations?.getSupplierCost ??
+        'This provider does not expose a supplier cost API.'),
+  }));
+}
+
+/** True when ANY registered provider has a real supplier cost feed. */
+export function anySupplierCostApiAvailable(): boolean {
+  return providers.some((provider) => provider.capabilities.getSupplierCost);
+}
+
 /**
  * Classifies a product's supplier from Shopify data only.
  *

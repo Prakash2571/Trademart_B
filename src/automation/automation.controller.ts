@@ -17,6 +17,11 @@ import { AppError } from '../common/errors';
 import { asyncHandler, sendSuccess } from '../common/http';
 import { parseIntParam, parseStringParam, toShopifyGid } from '../common/validate';
 import { config, isAutomationEnabled, isAutomationOnWebhookEnabled } from '../config';
+import { COST_SOURCE_ORDER, UNKNOWN_COST_POLICY } from '../suppliers/cost';
+import {
+  anySupplierCostApiAvailable,
+  describeSupplierCostSupport,
+} from '../suppliers/supplier.registry';
 import {
   approveProduct,
   getStoredRules,
@@ -88,17 +93,64 @@ automationRouter.get(
   asyncHandler(async (_req, res) => {
     // Effective, not default: the whole point is to show what a run would use.
     const rules = await resolveEffectiveRules();
+    // False today: no registered provider has a documented cost API. Computed
+    // rather than hardcoded so registering one flips this automatically.
+    const supplierCostAvailable = anySupplierCostApiAvailable();
     sendSuccess(res, {
       /** False means preview works but nothing can be written. */
       writesEnabled: isAutomationEnabled(),
       storeDomain: config.shopify.storeDomain,
       effectiveRules: rules,
       ruleProblems: validateAutomationRules(rules),
-      costSource: {
-        field: 'inventoryItem.unitCost',
-        description:
-          'Shopify\'s "Cost per item". Dropshipping apps (Tradelle, DSers, Zendrop, CJ, AutoDS) write into this field, so Trademart reads one place and works with any of them - no supplier API needed.',
-        requiresScope: 'read_inventory',
+      /**
+       * The real cost hierarchy.
+       *
+       * This used to report a single `costSource` of inventoryItem.unitCost,
+       * which was accurate for the original MVP and wrong once the supplier
+       * registry and manual costs shipped. `order` is imported from
+       * suppliers/cost.ts rather than restated, so it cannot drift from the
+       * resolution logic.
+       */
+      costResolution: {
+        order: COST_SOURCE_ORDER,
+        manualCostSupported: true,
+        unknownCostPolicy: UNKNOWN_COST_POLICY,
+        tiers: [
+          {
+            source: 'SUPPLIER_API',
+            description:
+              "A supplier provider's getSupplierCost returned a positive value. Most current, and outranks a manual override.",
+            available: supplierCostAvailable,
+            requiresScope: null,
+          },
+          {
+            source: 'SHOPIFY_UNIT_COST',
+            description:
+              'Shopify\'s "Cost per item" (variant.inventoryItem.unitCost). Dropshipping apps commonly write it on import, so Trademart reads one field and works with any of them.',
+            available: true,
+            requiresScope: 'read_inventory',
+          },
+          {
+            source: 'MANUAL',
+            description:
+              'A cost entered in Trademart via PUT /api/costs. Ranks below Shopify by default; set override=true to make it win over a wrong Shopify value. Never beats a live SUPPLIER_API fetch.',
+            available: true,
+            requiresScope: null,
+          },
+          {
+            source: 'UNKNOWN',
+            description:
+              'No usable cost from any tier. The product is SKIPPED for automatic pricing - a missing cost is never treated as 0, because that would compute an absurd margin and a nonsense price.',
+            available: true,
+            requiresScope: null,
+          },
+        ],
+        /**
+         * Per-provider honesty. Derived from which optional methods each
+         * provider actually implements plus whether they can return a value,
+         * so this cannot claim an integration that does not exist.
+         */
+        suppliers: describeSupplierCostSupport(),
       },
       writeScopeRequired: 'write_products',
       /** True when Shopify webhooks trigger runs without anyone asking. */

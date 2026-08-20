@@ -27,6 +27,35 @@ import type { Money } from '../shopify/shopify.types';
 
 export type CostSource = 'SUPPLIER_API' | 'SHOPIFY_UNIT_COST' | 'MANUAL' | 'UNKNOWN';
 
+/**
+ * The hierarchy, most to least authoritative, as a value.
+ *
+ * Exported so API responses can report the order instead of restating it in
+ * prose. /api/automation/status used to describe Shopify's unitCost as if it
+ * were the only cost source, which was true of the original MVP and badly
+ * misleading afterwards. A single exported constant means the documented order
+ * and the implemented order cannot drift apart - and the test suite asserts
+ * resolveCostSource actually honours this sequence.
+ *
+ * UNKNOWN is last and is a real member: "no cost" is a decision the pricing
+ * path must handle, not an absence to paper over with 0.
+ */
+export const COST_SOURCE_ORDER: readonly CostSource[] = Object.freeze([
+  'SUPPLIER_API',
+  'SHOPIFY_UNIT_COST',
+  'MANUAL',
+  'UNKNOWN',
+] as const);
+
+/**
+ * What happens to a product whose cost is UNKNOWN.
+ *
+ * Stated as a constant because it is a safety guarantee the UI repeats to the
+ * operator: an unknown cost means the product is skipped, never priced from a
+ * zero cost (which would compute an enormous margin and a nonsense price).
+ */
+export const UNKNOWN_COST_POLICY = 'SKIP_AUTOMATIC_PRICING' as const;
+
 /** A cost that always states where it came from. */
 export interface ResolvedCost {
   /** Null only when source is UNKNOWN. Never 0-as-unknown. */

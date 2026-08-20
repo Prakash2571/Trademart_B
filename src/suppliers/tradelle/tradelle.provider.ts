@@ -20,7 +20,11 @@
  */
 
 import { logger } from '../../common/logger';
-import type { ProductIdentitySignals, SupplierProvider } from '../supplier.types';
+import {
+  NO_SUPPLIER_CAPABILITIES,
+  type ProductIdentitySignals,
+  type SupplierProvider,
+} from '../supplier.types';
 
 /** Lowercase markers considered reliable evidence of a Tradelle product. */
 const TRADELLE_VENDOR_MARKERS = ['tradelle'];
@@ -65,6 +69,29 @@ export function collectTradelleEvidence(signals: ProductIdentitySignals): string
 
 export const tradelleProvider: SupplierProvider = {
   providerName: 'TRADELLE',
+
+  /**
+   * Declared, not inferred. getSupplierCost/getShippingCost exist below but
+   * always return null, so reporting them as available (which is what
+   * `typeof provider.getSupplierCost === 'function'` did) promised the UI a
+   * supplier cost feed that does not exist.
+   */
+  capabilities: {
+    ...NO_SUPPLIER_CAPABILITIES,
+    identifyProduct: true,
+    shopifyIntegration: true,
+  },
+
+  limitations: {
+    getSupplierCost:
+      'Tradelle publishes no documented public API, so there is no cost endpoint to call. Use Shopify\'s cost per item (Tradelle writes it on import) or enter a manual cost.',
+    getShippingQuote:
+      'Shipping cost is a Tradelle-side value not exposed to Shopify or any public API.',
+    searchProducts:
+      'Product discovery happens inside Tradelle\'s own app, which pushes products into Shopify. Trademart reads them from Shopify afterwards.',
+    createOrder:
+      'Tradelle fulfils Shopify orders through its own Shopify integration; there is no public order API for Trademart to call.',
+  },
 
   identifyProduct(signals: ProductIdentitySignals): boolean {
     return collectTradelleEvidence(signals).length > 0;
