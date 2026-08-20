@@ -118,3 +118,71 @@ export const PRODUCT_VARIANTS_PRICE_UPDATE_MUTATION = /* GraphQL */ `
     }
   }
 `;
+
+
+/**
+ * Creates a product plus its initial default variant (step 1 of 2).
+ *
+ * `media` attaches images by URL (Shopify fetches them). To set real variant
+ * prices/SKUs, follow with PRODUCT_VARIANTS_BULK_CREATE_MUTATION using the
+ * REMOVE_STANDALONE_VARIANT strategy, which replaces the auto-created default.
+ * https://shopify.dev/docs/api/admin-graphql/latest/mutations/productCreate
+ */
+export const PRODUCT_CREATE_MUTATION = /* GraphQL */ `
+  mutation TrademartProductCreate(
+    $product: ProductCreateInput!
+    $media: [CreateMediaInput!]
+  ) {
+    productCreate(product: $product, media: $media) {
+      product {
+        id
+        title
+        status
+        handle
+        options {
+          id
+          name
+        }
+        variants(first: 1) {
+          edges {
+            node {
+              id
+            }
+          }
+        }
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+/**
+ * Creates the real variants (step 2 of 2). REMOVE_STANDALONE_VARIANT removes the
+ * default variant productCreate made, so the product ends up with exactly the
+ * variants supplied here.
+ */
+export const PRODUCT_VARIANTS_BULK_CREATE_MUTATION = /* GraphQL */ `
+  mutation TrademartVariantsBulkCreate(
+    $productId: ID!
+    $variants: [ProductVariantsBulkInput!]!
+  ) {
+    productVariantsBulkCreate(
+      productId: $productId
+      variants: $variants
+      strategy: REMOVE_STANDALONE_VARIANT
+    ) {
+      productVariants {
+        id
+        price
+        sku
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
