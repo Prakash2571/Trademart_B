@@ -30,6 +30,12 @@ import {
   saveRules,
   runAutomation,
 } from './automation.service';
+import {
+  computeRulesHash,
+  consumePreview,
+  findApplicablePreview,
+  recordPreview,
+} from './preview.store';
 import { validateAutomationRules, type AutomationRules } from './rules.types';
 
 export const automationRouter = Router();
@@ -174,23 +180,38 @@ automationRouter.post(
   '/automation/preview',
   asyncHandler(async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
+    const overrides = readRuleOverrides(body);
+    const query = parseStringParam(body['query'], 'query', { maxLength: 500 });
+    const maxProducts =
+      body['maxProducts'] === undefined
+        ? undefined
+        : parseIntParam(String(body['maxProducts']), 'maxProducts', {
+            min: 1,
+            max: 250,
+            fallback: 250,
+          });
+
     const report = await runAutomation({
       // Hardcoded, not read from input: this route must never be able to write,
       // whatever the caller sends.
       dryRun: true,
       trigger: 'manual',
-      query: parseStringParam(body['query'], 'query', { maxLength: 500 }),
-      rules: readRuleOverrides(body),
-      maxProducts:
-        body['maxProducts'] === undefined
-          ? undefined
-          : parseIntParam(String(body['maxProducts']), 'maxProducts', {
-              min: 1,
-              max: 250,
-              fallback: 250,
-            }),
+      query,
+      rules: overrides,
+      maxProducts,
     });
-    sendSuccess(res, report, { dryRun: true });
+
+    // Issue a single-use token bound to the effective rules and store, so a
+    // later apply can prove it corresponds to THIS preview (see preview.store).
+    const preview = recordPreview({
+      rulesHash: computeRulesHash(report.rules),
+      storeDomain: report.shopDomain,
+      query,
+      maxProducts,
+      overrides,
+    });
+
+    sendSuccess(res, report, { dryRun: true, preview });
   }),
 );
 
@@ -198,23 +219,29 @@ automationRouter.post(
   '/automation/apply',
   asyncHandler(async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
-    // runAutomation enforces the kill switch itself; checking here as well would
-    // duplicate the rule and let the two drift apart.
+
+    // Apply is only permitted for a valid, current, unused preview. This is the
+    // server-side half of the preview gate: it cannot be bypassed by calling
+    // the API directly. The rules/store are re-checked against NOW, so a rule
+    // change or store switch after previewing invalidates the token.
+    const previewId = parseStringParam(body['previewId'], 'previewId', { maxLength: 100 });
+    const record = findApplicablePreview(previewId, config.shopify.storeDomain);
+    // Recompute the effective rules the preview's overrides would produce NOW;
+    // if the saved rules changed since the preview, the hash differs and the
+    // token is rejected as stale.
+    const currentEffective = await resolveEffectiveRules(record.overrides);
+    consumePreview(record.previewId, computeRulesHash(currentEffective));
+
+    // runAutomation enforces the kill switch itself. Replays the exact scope
+    // (rules overrides, query, maxProducts) the preview was generated with.
     const report = await runAutomation({
       dryRun: false,
       trigger: 'manual',
-      query: parseStringParam(body['query'], 'query', { maxLength: 500 }),
-      rules: readRuleOverrides(body),
-      maxProducts:
-        body['maxProducts'] === undefined
-          ? undefined
-          : parseIntParam(String(body['maxProducts']), 'maxProducts', {
-              min: 1,
-              max: 250,
-              fallback: 250,
-            }),
+      query: record.query,
+      rules: record.overrides,
+      maxProducts: record.maxProducts,
     });
-    sendSuccess(res, report, { dryRun: false });
+    sendSuccess(res, report, { dryRun: false, previewId: record.previewId });
   }),
 );
 

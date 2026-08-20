@@ -42,6 +42,12 @@ export type ErrorCode =
   | 'AUTOMATION_DISABLED'
   | 'AUTOMATION_RULES_INVALID'
   | 'AUTOMATION_PRECONDITION_FAILED'
+  // Automation preview -> apply enforcement
+  | 'PREVIEW_REQUIRED'
+  | 'PREVIEW_NOT_FOUND'
+  | 'PREVIEW_EXPIRED'
+  | 'PREVIEW_ALREADY_APPLIED'
+  | 'PREVIEW_STALE'
   // Operator authentication (protects everything that can change the store)
   | 'UNAUTHORIZED'
   | 'CSRF_INVALID'
@@ -125,6 +131,15 @@ export function defaultStatusForCode(code: ErrorCode): number {
     // Refusing to modify the live theme is a deliberate safety refusal, not a
     // permission error - 409 (conflict with a safe-workflow rule).
     case 'THEME_PROTECTED':
+      return 409;
+    // Apply was attempted without a valid, current, unused preview. 409: the
+    // request conflicts with the required preview-then-apply workflow rather
+    // than being malformed.
+    case 'PREVIEW_REQUIRED':
+    case 'PREVIEW_NOT_FOUND':
+    case 'PREVIEW_EXPIRED':
+    case 'PREVIEW_ALREADY_APPLIED':
+    case 'PREVIEW_STALE':
       return 409;
     // A failed HMAC or state check is an authentication failure, not a 400:
     // the request was well-formed but could not be proven to come from Shopify.
