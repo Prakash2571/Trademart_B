@@ -23,6 +23,7 @@ const REAL_GRANTED = [
   'read_locations',
   'read_orders',
   'write_products',
+  'write_publications',
   'read_themes',
   'write_theme_code',
   'read_files',
@@ -199,6 +200,9 @@ describe('resolveCapabilities - config drift', () => {
       'read_orders',
       'read_customers',
       'read_themes',
+      // write_publications implies read_publications, satisfying both
+      // publication features without listing read_publications explicitly.
+      'write_publications',
     ]);
 
     assert.deepEqual(report.scopes.notRequested, []);

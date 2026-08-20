@@ -30,6 +30,10 @@ import {
 import { shopifyGraphql } from '../shopify/shopify.client';
 import { mapUserErrors } from '../shopify/shopify.errors';
 import { INVENTORY_ITEM_PRODUCT_QUERY } from '../shopify/graphql/inventory.queries';
+import {
+  getProductPublications,
+  publishProduct,
+} from '../shopify/publications/publications.service';
 import { getProduct, listProducts } from '../shopify/shopify.service';
 import type { ProductDto } from '../shopify/shopify.types';
 import { loadManualCostMap } from '../suppliers/manualCost.service';
@@ -627,10 +631,35 @@ export async function holdProductForReview(shopifyProductId: string): Promise<vo
 }
 
 /**
- * Approves a held product: clears the review and auto-hidden tags and publishes
- * it. This is the deliberate human step that lets a product into the shop.
+ * Structured result of an approval, so the UI can tell activation from
+ * publication. These are two distinct Shopify operations and either can fail
+ * independently: a product can be ACTIVE (draft flag cleared) yet still not
+ * visible because it was never published to a sales channel.
  */
-export async function approveProduct(shopifyProductId: string): Promise<void> {
+export interface ApproveResult {
+  shopifyProductId: string;
+  /** Review/auto-hidden tags removed and status set ACTIVE. */
+  activated: boolean;
+  tagsRemoved: string[];
+  /** Whether publication to a sales channel succeeded. */
+  published: boolean;
+  /** Channels the product is currently published on (best-effort read-back). */
+  publications: { publicationId: string; name: string; isPublished: boolean }[];
+  /** Set when activation succeeded but publication did not. */
+  publishError: string | null;
+}
+
+/**
+ * Approves a held product: clears the review and auto-hidden tags, sets it
+ * ACTIVE, and publishes it to the Online Store.
+ *
+ * Activation and publication are reported separately. If activation succeeds
+ * but publication fails (e.g. write_publications not granted), the product is
+ * ACTIVE-but-not-visible and the result says so - it does NOT pretend the whole
+ * operation succeeded, and it does not roll back the activation (no rollback is
+ * implemented; the operator can retry publish or unpublish deliberately).
+ */
+export async function approveProduct(shopifyProductId: string): Promise<ApproveResult> {
   if (!isAutomationEnabled()) {
     throw new AppError(
       'AUTOMATION_DISABLED',
@@ -638,11 +667,12 @@ export async function approveProduct(shopifyProductId: string): Promise<void> {
     );
   }
 
+  const tagsToRemove = [AUTOMATION_REVIEW_TAG, AUTOMATION_HIDDEN_TAG];
   const removal = await shopifyGraphql<{
     tagsRemove: { userErrors: { field?: string[] | null; message?: string }[] } | null;
   }>(
     TAGS_REMOVE_MUTATION,
-    { id: shopifyProductId, tags: [AUTOMATION_REVIEW_TAG, AUTOMATION_HIDDEN_TAG] },
+    { id: shopifyProductId, tags: tagsToRemove },
     { operation: 'automationApproveTagsRemove' },
   );
   const removalError = mapUserErrors(removal.data.tagsRemove?.userErrors);
@@ -650,7 +680,44 @@ export async function approveProduct(shopifyProductId: string): Promise<void> {
 
   // applyVisibility also strips the auto-hidden tag; harmless and idempotent.
   await applyVisibility(shopifyProductId, 'ACTIVE');
-  logger.info('Approved product for the storefront.', { shopifyProductId });
+
+  // Publish to the Online Store. ACTIVE alone does not make a product visible.
+  let published = false;
+  let publishError: string | null = null;
+  let publications: ApproveResult['publications'] = [];
+  try {
+    const result = await publishProduct(shopifyProductId);
+    published = true;
+    publications = result.state.map((entry) => ({
+      publicationId: entry.publicationId,
+      name: entry.name,
+      isPublished: entry.isPublished,
+    }));
+  } catch (error) {
+    // Activation already happened; report the publication failure honestly
+    // rather than throwing away the fact that the product is now ACTIVE.
+    publishError = error instanceof AppError ? `${error.code}: ${error.message}` : 'Publication failed.';
+    try {
+      publications = await getProductPublications(shopifyProductId);
+    } catch {
+      publications = [];
+    }
+  }
+
+  logger.info('Approved product for the storefront.', {
+    shopifyProductId,
+    published,
+    publishError,
+  });
+
+  return {
+    shopifyProductId,
+    activated: true,
+    tagsRemoved: tagsToRemove,
+    published,
+    publications,
+    publishError,
+  };
 }
 
 /** Most recent runs, newest first — the "what did automation just do?" view. */

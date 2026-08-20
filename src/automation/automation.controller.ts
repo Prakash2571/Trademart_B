@@ -264,8 +264,11 @@ automationRouter.post(
     }
     const productId = toShopifyGid(raw, 'Product');
 
-    await approveProduct(productId);
-    sendSuccess(res, { shopifyProductId: productId, status: 'ACTIVE', approved: true });
+    // Structured result: activation and publication are reported separately, so
+    // an ACTIVE-but-not-published outcome is visible rather than hidden behind a
+    // blanket "approved: true".
+    const result = await approveProduct(productId);
+    sendSuccess(res, result);
   }),
 );
 

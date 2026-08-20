@@ -284,10 +284,18 @@ describe('validateEnv - SHOPIFY_SCOPES', () => {
       'read_locations',
       'read_orders',
       'read_products',
+      'read_publications',
       'read_themes',
       'write_inventory',
       'write_products',
+      'write_publications',
     ]);
+  });
+
+  it('requests the publication scopes now that publishing is implemented', () => {
+    const scopes = validateEnv(VALID).config?.shopify.scopes ?? [];
+    assert.ok(scopes.includes('write_publications'), 'write_publications must be requested');
+    assert.ok(scopes.includes('read_publications'), 'read_publications must be requested');
   });
 
   it('defaults to the write scopes the mutations need', () => {
