@@ -68,8 +68,21 @@ export function isExpectedShopDomain(
   return headerDomain.trim().toLowerCase() === expectedDomain.trim().toLowerCase();
 }
 
-/** Webhook topics Trademart intends to subscribe to (registration comes later). */
+/**
+ * Topics Trademart registers, in Shopify's GraphQL enum form.
+ *
+ * `webhooks.service.ts` reconciles Shopify's registered subscriptions against
+ * this list, so adding a topic here is all that is needed to start receiving it.
+ *
+ * APP_UNINSTALLED is not a data topic but it is the only one with a real handler
+ * today: it clears the stored offline access token, which would otherwise sit in
+ * the database after the merchant removed the app.
+ */
 export const PLANNED_WEBHOOK_TOPICS = [
+  'APP_UNINSTALLED',
+  // Drives automation: a stock change can hide or restore a product, and a
+  // product change can move its cost per item.
+  'INVENTORY_LEVELS_UPDATE',
   'ORDERS_CREATE',
   'ORDERS_UPDATED',
   'ORDERS_CANCELLED',

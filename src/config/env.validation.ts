@@ -20,7 +20,23 @@ export type NodeEnv = 'development' | 'test' | 'production';
  *  STATIC_TOKEN       - a pre-issued token supplied via SHOPIFY_ACCESS_TOKEN
  *  NONE               - no credentials; Shopify routes report not configured
  */
-export type ShopifyAuthStrategy = 'CLIENT_CREDENTIALS' | 'STATIC_TOKEN' | 'NONE';
+export type ShopifyAuthStrategy =
+  | 'CLIENT_CREDENTIALS'
+  | 'STATIC_TOKEN'
+  | 'OAUTH_OFFLINE'
+  | 'NONE';
+
+/**
+ * Which token source the backend prefers.
+ *
+ *   auto  - the historical behaviour: static token, else client credentials.
+ *   oauth - prefer a per-merchant offline token captured by the redirect flow,
+ *           falling back to client credentials when no store has installed yet.
+ *
+ * This exists so adding OAuth cannot silently change how an already-working
+ * single-store deployment authenticates. `auto` is the default.
+ */
+export type ShopifyAuthMode = 'auto' | 'oauth';
 
 export interface ShopifyConfig {
   storeDomain: string;
@@ -30,10 +46,21 @@ export interface ShopifyConfig {
   clientSecret: string | null;
   webhookSecret: string | null;
   authStrategy: ShopifyAuthStrategy;
+  authMode: ShopifyAuthMode;
+  /** Scopes requested by the OAuth redirect flow, in Shopify's comma form. */
+  scopes: string[];
   /** Fully-qualified GraphQL Admin API endpoint. */
   graphqlEndpoint: string;
-  /** Endpoint used by the client credentials grant. */
+  /** Endpoint used by the client credentials grant AND the OAuth code exchange. */
   tokenEndpoint: string;
+  /**
+   * The exact value to paste into "Allowed redirection URL(s)" in the Shopify
+   * Dev Dashboard. Derived here so no caller has to rebuild it and get it wrong
+   * - Shopify compares this string exactly.
+   */
+  oauthRedirectUri: string | null;
+  /** Where webhook deliveries should be sent. Null until APP_URL is set. */
+  webhookCallbackUrl: string | null;
 }
 
 export interface AppConfig {
@@ -41,7 +68,31 @@ export interface AppConfig {
   isProduction: boolean;
   port: number;
   frontendUrl: string;
+  /**
+   * Public HTTPS origin of THIS backend, as reachable by Shopify. Distinct from
+   * frontendUrl (the browser app). Null when unset, which disables OAuth and
+   * webhook registration rather than guessing a URL Shopify cannot reach.
+   */
+  appUrl: string | null;
   mongoUri: string | null;
+  /** AES-256-GCM key for encrypting offline tokens at rest. */
+  tokenEncryptionKey: string | null;
+  /**
+   * Master kill switch for storefront writes (prices and visibility).
+   *
+   * Defaults to FALSE. Preview endpoints always work; nothing can mutate the
+   * shop until this is deliberately turned on, so deploying automation cannot
+   * change a live storefront by accident.
+   */
+  automationEnabled: boolean;
+  /**
+   * Whether webhook deliveries trigger automation runs automatically.
+   *
+   * Separate from `automationEnabled` on purpose: "Trademart may write" and
+   * "Trademart writes without me asking" are different levels of trust, and a
+   * merchant may reasonably want the first without the second.
+   */
+  automationOnWebhook: boolean;
   shopify: ShopifyConfig;
 }
 
@@ -56,9 +107,31 @@ export const DEFAULT_PORT = 4000;
 export const DEFAULT_FRONTEND_URL = 'http://localhost:3000';
 export const DEFAULT_SHOPIFY_API_VERSION = '2026-07';
 
+/**
+ * Scopes requested by the OAuth redirect flow when SHOPIFY_SCOPES is unset.
+ *
+ * Deliberately the minimum Trademart actually reads. `read_customers` is
+ * included because the dashboard's customer count uses `customersCount`, which
+ * fails outright without it.
+ */
+export const DEFAULT_SHOPIFY_SCOPES = [
+  'read_products',
+  'read_orders',
+  'read_customers',
+  'read_inventory',
+] as const;
+
+/** Path of the OAuth callback. Kept as a constant so config and docs agree. */
+export const OAUTH_CALLBACK_PATH = '/api/auth/callback';
+/** Path of the webhook receiver, matching webhooks.controller.ts. */
+export const WEBHOOK_RECEIVER_PATH = '/api/webhooks/shopify';
+
 const NODE_ENVS: readonly NodeEnv[] = ['development', 'test', 'production'];
-const MYSHOPIFY_DOMAIN = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/;
+const AUTH_MODES: readonly ShopifyAuthMode[] = ['auto', 'oauth'];
+export const MYSHOPIFY_DOMAIN = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/;
 const API_VERSION = /^\d{4}-\d{2}$/;
+/** Shopify scope names are lowercase snake_case, e.g. read_products. */
+const SCOPE_NAME = /^[a-z][a-z0-9_]*$/;
 
 type RawEnv = Record<string, string | undefined>;
 
@@ -67,6 +140,23 @@ function read(env: RawEnv, key: string): string | null {
   if (value === undefined) return null;
   const trimmed = value.trim();
   return trimmed.length === 0 ? null : trimmed;
+}
+
+/**
+ * Byte length of a hex or base64 encoded key, or -1 when it is neither.
+ *
+ * Buffer.from(..., 'base64') silently discards invalid characters, so the
+ * encoding is confirmed by pattern first - otherwise "not-a-real-key" would
+ * decode to some incidental number of bytes and could pass a length check.
+ */
+export function decodeKeyLength(value: string): number {
+  if (/^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0) {
+    return value.length / 2;
+  }
+  if (/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+    return Buffer.from(value, 'base64').length;
+  }
+  return -1;
 }
 
 export function validateEnv(env: RawEnv): EnvValidationResult {
@@ -117,6 +207,35 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
   } else {
     warnings.push(
       `FRONTEND_URL not set - defaulting CORS origin to ${DEFAULT_FRONTEND_URL}.`,
+    );
+  }
+
+  // ---- APP_URL -----------------------------------------------------------
+  //
+  // The backend's own public origin. Shopify has to be able to reach it, which
+  // is why localhost is called out explicitly: a tunnel is required locally.
+  const rawAppUrl = read(env, 'APP_URL');
+  let appUrl: string | null = null;
+  if (rawAppUrl !== null) {
+    if (!/^https?:\/\/.+/.test(rawAppUrl)) {
+      errors.push(
+        `APP_URL must start with http:// or https:// (received "${rawAppUrl}").`,
+      );
+    } else if (isProduction && !rawAppUrl.startsWith('https://')) {
+      // Shopify refuses non-HTTPS redirect URIs, and an OAuth code over plain
+      // HTTP is interceptable.
+      errors.push('APP_URL must use https:// when NODE_ENV=production.');
+    } else {
+      appUrl = rawAppUrl.replace(/\/+$/, '');
+      if (/^https?:\/\/(localhost|127\.0\.0\.1)/.test(appUrl)) {
+        warnings.push(
+          `APP_URL points at ${appUrl}, which Shopify cannot reach. OAuth callbacks and webhook deliveries will not arrive - use a public tunnel URL for local testing.`,
+        );
+      }
+    }
+  } else {
+    warnings.push(
+      'APP_URL not set - the OAuth redirect flow and webhook registration are disabled. Set it to this backend\'s public https origin to enable them.',
     );
   }
 
@@ -219,6 +338,136 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     );
   }
 
+  // ---- SHOPIFY_SCOPES ----------------------------------------------------
+  //
+  // Only used by the OAuth redirect flow. Under Shopify-managed installation the
+  // scopes come from shopify.app.toml instead, so a mismatch between the two is
+  // worth warning about but cannot be detected from here.
+  const rawScopes = read(env, 'SHOPIFY_SCOPES');
+  let scopes: string[] = [...DEFAULT_SHOPIFY_SCOPES];
+  if (rawScopes !== null) {
+    const parsed = rawScopes
+      .split(/[,\s]+/)
+      .map((entry) => entry.trim().toLowerCase())
+      .filter((entry) => entry.length > 0);
+    const invalid = parsed.filter((entry) => !SCOPE_NAME.test(entry));
+    if (invalid.length > 0) {
+      errors.push(
+        `SHOPIFY_SCOPES contains invalid scope name(s): ${invalid.join(', ')}. Use a comma-separated list like read_products,read_orders.`,
+      );
+    } else if (parsed.length === 0) {
+      errors.push('SHOPIFY_SCOPES was set but contained no scopes.');
+    } else {
+      // De-duplicate: Shopify rejects a repeated scope in the authorize URL.
+      scopes = [...new Set(parsed)];
+    }
+  }
+
+  // ---- SHOPIFY_AUTH_MODE -------------------------------------------------
+  const rawAuthMode = read(env, 'SHOPIFY_AUTH_MODE');
+  let authMode: ShopifyAuthMode = 'auto';
+  if (rawAuthMode !== null) {
+    const normalised = rawAuthMode.toLowerCase();
+    if ((AUTH_MODES as readonly string[]).includes(normalised)) {
+      authMode = normalised as ShopifyAuthMode;
+    } else {
+      errors.push(
+        `SHOPIFY_AUTH_MODE must be one of ${AUTH_MODES.join(', ')} (received "${rawAuthMode}").`,
+      );
+    }
+  }
+
+  // In oauth mode the effective strategy is OAUTH_OFFLINE, not client
+  // credentials - even though the client id/secret are still required, because
+  // they are what performs the handshake and signs the callback.
+  if (authMode === 'oauth' && accessToken === null) {
+    if (!hasClientCredentials) {
+      errors.push(
+        'SHOPIFY_AUTH_MODE=oauth requires SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET to run the handshake.',
+      );
+    }
+    if (appUrl === null) {
+      errors.push(
+        'SHOPIFY_AUTH_MODE=oauth requires APP_URL, which forms the redirect_uri Shopify calls back.',
+      );
+    }
+    authStrategy = 'OAUTH_OFFLINE';
+  }
+
+  // ---- TOKEN_ENCRYPTION_KEY ---------------------------------------------
+  //
+  // Required only by the OAuth flow, which must never write a token to Mongo in
+  // plaintext. Validated as 32 bytes of base64 or hex so a too-short key fails
+  // at boot instead of at the first install.
+  const tokenEncryptionKey = read(env, 'TOKEN_ENCRYPTION_KEY');
+  if (tokenEncryptionKey !== null && decodeKeyLength(tokenEncryptionKey) !== 32) {
+    errors.push(
+      'TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes. Generate one with: openssl rand -base64 32',
+    );
+  }
+  if (authMode === 'oauth' && tokenEncryptionKey === null) {
+    errors.push(
+      'TOKEN_ENCRYPTION_KEY is required when SHOPIFY_AUTH_MODE=oauth, because offline access tokens must be encrypted at rest.',
+    );
+  }
+
+  // ---- AUTOMATION_ENABLED ------------------------------------------------
+  //
+  // Off unless explicitly "true". Any other value is rejected rather than
+  // treated as falsy: a typo like AUTOMATION_ENABLED=yes silently disabling
+  // writes is confusing, and silently ENABLING them would be dangerous.
+  const rawAutomation = read(env, 'AUTOMATION_ENABLED');
+  let automationEnabled = false;
+  if (rawAutomation !== null) {
+    const normalised = rawAutomation.toLowerCase();
+    if (normalised === 'true') automationEnabled = true;
+    else if (normalised === 'false') automationEnabled = false;
+    else {
+      errors.push(
+        `AUTOMATION_ENABLED must be "true" or "false" (received "${rawAutomation}").`,
+      );
+    }
+  }
+  // ---- AUTOMATION_ON_WEBHOOK ---------------------------------------------
+  const rawOnWebhook = read(env, 'AUTOMATION_ON_WEBHOOK');
+  let automationOnWebhook = false;
+  if (rawOnWebhook !== null) {
+    const normalised = rawOnWebhook.toLowerCase();
+    if (normalised === 'true') automationOnWebhook = true;
+    else if (normalised === 'false') automationOnWebhook = false;
+    else {
+      errors.push(
+        `AUTOMATION_ON_WEBHOOK must be "true" or "false" (received "${rawOnWebhook}").`,
+      );
+    }
+  }
+  if (automationOnWebhook && !automationEnabled) {
+    // Not an error - the triggers simply stay dormant - but silently doing
+    // nothing would look like a bug.
+    warnings.push(
+      'AUTOMATION_ON_WEBHOOK=true but AUTOMATION_ENABLED is false, so webhook-triggered runs will be skipped. Enable both for hands-off syncing.',
+    );
+  }
+  if (automationOnWebhook && webhookSecret === null) {
+    warnings.push(
+      'AUTOMATION_ON_WEBHOOK=true but SHOPIFY_WEBHOOK_SECRET is not set, so every delivery is rejected and nothing will ever trigger.',
+    );
+  }
+
+  if (automationEnabled) {
+    // Writing prices/status needs write_products. Warn rather than error: the
+    // scopes may come from shopify.app.toml under managed installation, which
+    // this validator cannot see.
+    if (!scopes.includes('write_products')) {
+      warnings.push(
+        'AUTOMATION_ENABLED=true but SHOPIFY_SCOPES does not include write_products - price and visibility writes will fail with SHOPIFY_SCOPE_MISSING.',
+      );
+    }
+    warnings.push(
+      'AUTOMATION_ENABLED=true - Trademart may change product prices and visibility in the live store. Use POST /api/automation/preview first.',
+    );
+  }
+
   if (errors.length > 0) {
     return { config: null, errors, warnings };
   }
@@ -229,7 +478,11 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
       isProduction,
       port,
       frontendUrl,
+      appUrl,
       mongoUri,
+      tokenEncryptionKey,
+      automationEnabled,
+      automationOnWebhook,
       shopify: {
         storeDomain,
         apiVersion,
@@ -238,8 +491,12 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
         clientSecret,
         webhookSecret,
         authStrategy,
+        authMode,
+        scopes,
         graphqlEndpoint: `https://${storeDomain}/admin/api/${apiVersion}/graphql.json`,
         tokenEndpoint: `https://${storeDomain}/admin/oauth/access_token`,
+        oauthRedirectUri: appUrl === null ? null : `${appUrl}${OAUTH_CALLBACK_PATH}`,
+        webhookCallbackUrl: appUrl === null ? null : `${appUrl}${WEBHOOK_RECEIVER_PATH}`,
       },
     },
     errors,
