@@ -25,32 +25,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # setup-node's `cache: npm` hashes a lockfile to build the cache key and
+      # FAILS the whole job if none exists. A lockfile could not be generated
+      # where this repo was authored (the npm registry was unreachable), so if
+      # one is not committed we generate it here FIRST, using the runner's
+      # preinstalled node, which does have registry access. This runs before
+      # setup-node so the cache step finds the file, and lets the job use
+      # `npm ci` either way.
+      #
+      # Commit package-lock.json (npm install --package-lock-only) to make the
+      # install fully reproducible; this step then no-ops.
+      - name: Ensure a lockfile exists
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "Committed lockfile present."
+          else
+            echo "::warning title=No committed lockfile::Generating package-lock.json for this run only. Commit it (npm install --package-lock-only) for reproducible installs."
+            npm install --package-lock-only --no-audit --no-fund
+          fi
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          # Only meaningful once a lockfile is committed; harmless before then.
           cache: npm
 
-      # `npm ci` is the goal: it installs exactly what the lockfile pins and
-      # fails if package.json and the lockfile disagree. It REQUIRES a lockfile.
-      #
-      # No package-lock.json is committed yet (it could not be generated in the
-      # environment this was authored in - the npm registry was unreachable), so
-      # this step falls back to `npm install` and says so loudly rather than
-      # failing every PR before a single test runs.
-      #
-      # Generate and commit the lockfile, then this switches to `npm ci`
-      # automatically with no edit here:
-      #   npm install --package-lock-only && git add package-lock.json
       - name: Install dependencies
-        run: |
-          if [ -f package-lock.json ]; then
-            echo "Lockfile found - using npm ci (reproducible)."
-            npm ci
-          else
-            echo "::warning title=No lockfile::package-lock.json is missing, so this build is NOT reproducible. Run 'npm install --package-lock-only' and commit the result to enable npm ci."
-            npm install --no-audit --no-fund
-          fi
+        run: npm ci
 
       - name: Typecheck
         run: npm run typecheck

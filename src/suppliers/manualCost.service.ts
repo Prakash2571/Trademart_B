@@ -160,7 +160,12 @@ export async function loadManualCostMap(
   const productLevel = new Map<string, ManualCost>();
   const variantLevel = new Map<string, ManualCost>();
   for (const row of rows) {
-    if (row.supplierProductCost === null || row.currencyCode === null) continue;
+    // `== null` (not `=== null`) so both null AND undefined are excluded: a
+    // lean() row types these optional fields as `number | null | undefined`,
+    // and `=== null` alone left `undefined`, which is not assignable to
+    // ManualCost.amount/currencyCode (the real tsc build caught this; the
+    // types-stripped local compile did not).
+    if (row.supplierProductCost == null || row.currencyCode == null) continue;
     const cost: ManualCost = {
       amount: row.supplierProductCost,
       currencyCode: row.currencyCode,
