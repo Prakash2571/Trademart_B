@@ -346,3 +346,63 @@ describe('describeSupplierCostSupport', () => {
     assert.equal(await tradelleProvider.getSupplierCost?.('gid://shopify/Product/1'), null);
   });
 });
+
+
+describe('validateManualCostInput - frontend contract (canonical names)', () => {
+  // The exact body the ManualCostEditor / product-create flow send. These names
+  // (productId, amount, variantId, shippingCost) are the canonical contract;
+  // the validator originally read shopifyProductId/supplierProductCost, so every
+  // real PUT /costs failed with "supplierProductCost must be a number".
+  it('accepts productId + amount as the frontend sends them', () => {
+    const result = validateManualCostInput({
+      productId: '123',
+      amount: 12.5,
+      currencyCode: 'GBP',
+      override: true,
+      note: 'from the editor',
+    });
+    assert.equal(result.shopifyProductId, 'gid://shopify/Product/123');
+    assert.equal(result.supplierProductCost, 12.5);
+    assert.equal(result.override, true);
+    assert.equal(result.note, 'from the editor');
+  });
+
+  it('maps variantId to a variant GID', () => {
+    const result = validateManualCostInput({
+      productId: '123',
+      variantId: '456',
+      amount: 5,
+      currencyCode: 'GBP',
+    });
+    assert.equal(result.shopifyVariantId, 'gid://shopify/ProductVariant/456');
+  });
+
+  it('accepts shippingCost under its canonical name', () => {
+    const result = validateManualCostInput({
+      productId: '123',
+      amount: 5,
+      shippingCost: 2,
+      currencyCode: 'GBP',
+    });
+    assert.equal(result.supplierShippingCost, 2);
+  });
+
+  it('still rejects a zero amount sent by the frontend', () => {
+    assert.throws(
+      () => validateManualCostInput({ productId: '123', amount: 0, currencyCode: 'GBP' }),
+      (e: unknown) => e instanceof AppError && e.code === 'VALIDATION_ERROR',
+    );
+  });
+
+  it('prefers the canonical name when both are present', () => {
+    const result = validateManualCostInput({
+      productId: '123',
+      shopifyProductId: '999',
+      amount: 7,
+      supplierProductCost: 8,
+      currencyCode: 'GBP',
+    });
+    assert.equal(result.shopifyProductId, 'gid://shopify/Product/123');
+    assert.equal(result.supplierProductCost, 7);
+  });
+});

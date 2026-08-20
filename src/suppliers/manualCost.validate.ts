@@ -24,6 +24,20 @@ export interface ManualCostInput {
   note: string | null;
 }
 
+/**
+ * Reads a body field by its canonical name, falling back to a legacy alias.
+ *
+ * The API contract settled on `productId`/`variantId`/`amount`/`shippingCost`
+ * (the names the frontend and the GET/DELETE routes already use). The original
+ * validator read `shopifyProductId`/`supplierProductCost`, which no caller sent,
+ * so every PUT /costs failed with "supplierProductCost must be a number". Both
+ * names are accepted so older callers keep working; the canonical name wins.
+ */
+function pick(body: Record<string, unknown>, canonical: string, alias: string): unknown {
+  const value = body[canonical];
+  return value === undefined ? body[alias] : value;
+}
+
 const PROVIDERS: readonly SupplierClassification[] = ['TRADELLE', 'OTHER', 'UNKNOWN'];
 /** ISO-4217-ish: three ASCII letters. Not an exhaustive currency list. */
 const CURRENCY = /^[A-Za-z]{3}$/;
@@ -54,16 +68,16 @@ function optionalPositive(raw: unknown, field: string): number | null {
  * Throws VALIDATION_ERROR on any problem, so the controller stays a thin shell.
  */
 export function validateManualCostInput(body: Record<string, unknown>): ManualCostInput {
-  const rawProduct = body['shopifyProductId'];
+  const rawProduct = pick(body, 'productId', 'shopifyProductId');
   if (typeof rawProduct !== 'string' || rawProduct.trim().length === 0) {
-    throw new AppError('VALIDATION_ERROR', 'shopifyProductId is required.');
+    throw new AppError('VALIDATION_ERROR', 'productId is required.');
   }
   // Accepts a numeric id or a full GID and normalises to a Product GID; this
   // also rejects an Order/Customer GID passed by mistake.
   const shopifyProductId = toShopifyGid(rawProduct, 'Product');
 
   let shopifyVariantId: string | null = null;
-  const rawVariant = body['shopifyVariantId'];
+  const rawVariant = pick(body, 'variantId', 'shopifyVariantId');
   if (rawVariant !== undefined && rawVariant !== null && rawVariant !== '') {
     if (typeof rawVariant !== 'string') {
       throw new AppError('VALIDATION_ERROR', 'shopifyVariantId must be a string.');
@@ -106,8 +120,11 @@ export function validateManualCostInput(body: Record<string, unknown>): ManualCo
   return {
     shopifyProductId,
     shopifyVariantId,
-    supplierProductCost: requirePositive(body['supplierProductCost'], 'supplierProductCost'),
-    supplierShippingCost: optionalPositive(body['supplierShippingCost'], 'supplierShippingCost'),
+    supplierProductCost: requirePositive(pick(body, 'amount', 'supplierProductCost'), 'amount'),
+    supplierShippingCost: optionalPositive(
+      pick(body, 'shippingCost', 'supplierShippingCost'),
+      'shippingCost',
+    ),
     currencyCode: currencyRaw.toUpperCase(),
     provider,
     override: body['override'] === true,
