@@ -84,6 +84,13 @@ services:
       SHOPIFY_ACCESS_TOKEN: ${SHOPIFY_ACCESS_TOKEN:-}
       SHOPIFY_WEBHOOK_SECRET: ${SHOPIFY_WEBHOOK_SECRET:-}
 
+      # Store-safety mode. Advisory: dev/test/seed/smoke TOOLING refuses to
+      # mutate a non-development store unless ALLOW_LIVE_STORE_WRITES=true.
+      # Normal operator actions are unaffected. Shopify's real isDevelopmentStore
+      # overrides this when known.
+      SHOPIFY_STORE_MODE: ${SHOPIFY_STORE_MODE:-}
+      ALLOW_LIVE_STORE_WRITES: ${ALLOW_LIVE_STORE_WRITES:-false}
+
       # Scopes requested by the OAuth redirect flow. Ignored under Shopify-managed
       # installation, where shopify.app.toml is the source of truth.
       SHOPIFY_SCOPES: ${SHOPIFY_SCOPES:-}

@@ -55,6 +55,19 @@ export interface ShopifyConfig {
   webhookSecret: string | null;
   authStrategy: ShopifyAuthStrategy;
   authMode: ShopifyAuthMode;
+  /**
+   * Operator's declared store type. Advisory only - never trusted alone; the
+   * store-safety guard prefers Shopify's real isDevelopmentStore when known.
+   * Null when unset.
+   */
+  storeMode: 'development' | 'production' | null;
+  /**
+   * Whether dev/test TOOLING (smoke/seed/write-test scripts) may mutate the
+   * store when it is NOT a development store. Default false. Never gates normal
+   * operator actions - only automated tooling that could hit production by
+   * accident.
+   */
+  allowLiveStoreWrites: boolean;
   /** Scopes requested by the OAuth redirect flow, in Shopify's comma form. */
   scopes: string[];
   /** Fully-qualified GraphQL Admin API endpoint. */
@@ -579,6 +592,33 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     }
   }
 
+  // ---- Store-safety mode -------------------------------------------------
+  let storeMode: 'development' | 'production' | null = null;
+  const rawStoreMode = read(env, 'SHOPIFY_STORE_MODE');
+  if (rawStoreMode !== null) {
+    const normalised = rawStoreMode.toLowerCase();
+    if (normalised === 'development' || normalised === 'production') {
+      storeMode = normalised;
+    } else {
+      errors.push(
+        `SHOPIFY_STORE_MODE must be "development" or "production" (received "${rawStoreMode}").`,
+      );
+    }
+  }
+
+  let allowLiveStoreWrites = false;
+  const rawAllowLive = read(env, 'ALLOW_LIVE_STORE_WRITES');
+  if (rawAllowLive !== null) {
+    const normalised = rawAllowLive.toLowerCase();
+    if (normalised === 'true') allowLiveStoreWrites = true;
+    else if (normalised === 'false') allowLiveStoreWrites = false;
+    else {
+      errors.push(
+        `ALLOW_LIVE_STORE_WRITES must be "true" or "false" (received "${rawAllowLive}").`,
+      );
+    }
+  }
+
   const rawProtectReads = read(env, 'OPERATOR_PROTECT_READS');
   let protectReads = false;
   if (rawProtectReads !== null) {
@@ -654,6 +694,8 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
         webhookSecret,
         authStrategy,
         authMode,
+        storeMode,
+        allowLiveStoreWrites,
         scopes,
         graphqlEndpoint: `https://${storeDomain}/admin/api/${apiVersion}/graphql.json`,
         tokenEndpoint: `https://${storeDomain}/admin/oauth/access_token`,

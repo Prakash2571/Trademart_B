@@ -55,7 +55,9 @@ export type ErrorCode =
   | 'LOGIN_FAILED'
   | 'OPERATOR_NOT_CONFIGURED'
   // Storefront / theme safety
-  | 'THEME_PROTECTED';
+  | 'THEME_PROTECTED'
+  // Dev/test tooling attempted to write to a non-development store
+  | 'LIVE_STORE_WRITE_BLOCKED';
 
 export interface ErrorBody {
   success: false;
@@ -133,6 +135,10 @@ export function defaultStatusForCode(code: ErrorCode): number {
     // permission error - 409 (conflict with a safe-workflow rule).
     case 'THEME_PROTECTED':
       return 409;
+    // A dev/test tool refused to mutate a live store. 403: not a bad request,
+    // a deliberate safety refusal.
+    case 'LIVE_STORE_WRITE_BLOCKED':
+      return 403;
     // Apply was attempted without a valid, current, unused preview. 409: the
     // request conflicts with the required preview-then-apply workflow rather
     // than being malformed.

@@ -12,6 +12,7 @@ import { asyncHandler, sendSuccess } from '../common/http';
 import { AppError } from '../common/errors';
 import { config, isShopifyConfigured } from '../config';
 import { resolveCapabilities } from './capabilities';
+import { resolveStoreSafety } from './storeSafety';
 import { getLastThrottleStatus, getTokenDiagnostics } from './shopify.client';
 import { getShop } from './shopify.service';
 
@@ -78,6 +79,13 @@ shopifyRouter.get(
       hasStaticTokenOverride: config.shopify.accessToken !== null,
       hasWebhookSecret: config.shopify.webhookSecret !== null,
       token: getTokenDiagnostics(),
+      // Advisory store classification from config alone; refined with Shopify's
+      // real isDevelopmentStore in the connected branch below.
+      storeSafety: resolveStoreSafety({
+        shopIsDevelopmentStore: null,
+        storeMode: config.shopify.storeMode,
+        allowLiveStoreWrites: config.shopify.allowLiveStoreWrites,
+      }),
     };
 
     if (!isShopifyConfigured()) {
@@ -96,7 +104,13 @@ shopifyRouter.get(
 
     try {
       const shop = await getShop();
-      sendSuccess(res, { ...base, connected: true, shop, error: null });
+      // Now that Shopify's real flag is known, it overrides the config guess.
+      const storeSafety = resolveStoreSafety({
+        shopIsDevelopmentStore: shop.isDevelopmentStore,
+        storeMode: config.shopify.storeMode,
+        allowLiveStoreWrites: config.shopify.allowLiveStoreWrites,
+      });
+      sendSuccess(res, { ...base, storeSafety, connected: true, shop, error: null });
     } catch (error) {
       // Status must always answer 200 with a diagnosis - the dashboard relies
       // on it to render a connection banner rather than a crashed page.
