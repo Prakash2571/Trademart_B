@@ -230,8 +230,20 @@ curl -X POST http://localhost:4000/api/webhooks/unregister \
   -d '{"id":"gid://shopify/WebhookSubscription/123"}'
 ```
 
-Requires the **`write_webhooks`** scope. `read_webhooks` can list but not register;
-a missing scope surfaces as `SHOPIFY_SCOPE_MISSING` like any other.
+**There is no dedicated webhook scope.** Each topic requires the scope for the
+data it carries, so registration needs nothing beyond the read scopes the app
+already holds ([docs](https://shopify.dev/docs/apps/build/webhooks/subscribe)):
+
+| Topic | Scope needed |
+| --- | --- |
+| `APP_UNINSTALLED` | none |
+| `PRODUCTS_CREATE/UPDATE/DELETE` | `read_products` |
+| `ORDERS_*`, `FULFILLMENTS_*` | `read_orders` |
+| `CUSTOMERS_CREATE/UPDATE` | `read_customers` |
+| `INVENTORY_LEVELS_UPDATE` | `read_inventory` |
+
+A missing scope surfaces as `SHOPIFY_SCOPE_MISSING` for that topic only —
+registration isolates per-topic failures, so the others still register.
 
 `unregister` is a POST, not a DELETE, because a subscription id is a GID
 containing slashes (`gid://shopify/WebhookSubscription/123`) which does not fit a
@@ -305,7 +317,7 @@ form (`orders/create`) in the `X-Shopify-Topic` delivery header.
 | `DATABASE_UNAVAILABLE` on install | No MongoDB | Set `MONGODB_URI` |
 | `SHOPIFY_NOT_CONFIGURED` in `oauth` mode | No install completed | Visit `/api/auth/install?shop=...` |
 | Registration: `WEBHOOK_NOT_CONFIGURED` | No webhook secret | Set `SHOPIFY_WEBHOOK_SECRET` first |
-| Registration: `SHOPIFY_SCOPE_MISSING` | No `write_webhooks` | Add the scope, `shopify app deploy`, update the install |
+| Registration: `SHOPIFY_SCOPE_MISSING` on one topic | Missing the read scope for that topic's data | Add e.g. `read_customers` for `CUSTOMERS_*`, release a version, update the install |
 | No deliveries arrive | Nothing subscribed, or an unreachable URL | `GET /api/webhooks/subscriptions`; confirm `APP_URL` is public |
 | Deliveries rejected as `WEBHOOK_INVALID_SIGNATURE` | Wrong secret, or body was re-parsed | Confirm the secret; the receiver must stay mounted before `express.json()` |
 

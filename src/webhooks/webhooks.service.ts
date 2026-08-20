@@ -4,9 +4,21 @@
  * The decision logic lives in webhook.registration.ts (pure, unit tested); this
  * module only talks to Shopify and reports what happened.
  *
- * Requires the `write_webhooks` scope (`read_webhooks` alone can list but not
- * register). A missing scope surfaces as SHOPIFY_SCOPE_MISSING from the shared
- * error mapper, exactly like every other scope problem.
+ * SCOPES: there is no dedicated webhook scope. Each TOPIC requires the scope for
+ * the data it carries, so the scopes needed here are just the ones the app
+ * already holds to read that data:
+ *
+ *   APP_UNINSTALLED          - none
+ *   PRODUCTS_*               - read_products
+ *   ORDERS_* / FULFILLMENTS_*- read_orders
+ *   CUSTOMERS_*              - read_customers
+ *   INVENTORY_LEVELS_UPDATE  - read_inventory
+ *
+ * https://shopify.dev/docs/apps/build/webhooks/subscribe
+ *
+ * A missing scope surfaces as SHOPIFY_SCOPE_MISSING from the shared error mapper,
+ * exactly like every other scope problem — and only for the affected topic, since
+ * registration isolates per-topic failures.
  */
 
 import { AppError } from '../common/errors';

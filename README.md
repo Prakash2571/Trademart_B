@@ -354,7 +354,7 @@ curl http://localhost:4000/api/webhooks/subscriptions                # live stat
 ```
 
 Needs `APP_URL` (Shopify cannot reach localhost — use a tunnel),
-`SHOPIFY_WEBHOOK_SECRET`, and the `write_webhooks` scope. Registration is
+`SHOPIFY_WEBHOOK_SECRET`, and the read scope for each topic. Registration is
 idempotent: it reconciles against Shopify rather than blindly creating, so running
 it twice will not double your deliveries. Deliveries are de-duplicated by
 `X-Shopify-Webhook-Id`.
@@ -371,7 +371,13 @@ rules, the two different HMAC schemes, and a troubleshooting table.
 | `read_inventory` | `/shopify/inventory`, `totalInventory`, `inventoryQuantity`, cost per item | Products still load; inventory/cost fields return `null` and `meta.degraded` lists them |
 | `read_customers` | `/shopify/customers`, order customer, **the dashboard customer count** | `customersCount` fails with `SHOPIFY_SCOPE_MISSING`; the Customers stat shows as unavailable and the dashboard reports the issue under `shopify.counts.customers` |
 | `read_reports` | ShopifyQL analytics | Traffic endpoint reports `available: false` |
-| `write_webhooks` | `POST /api/webhooks/register` | Subscriptions cannot be registered; listing still works with `read_webhooks` |
+
+There is **no** dedicated webhook scope. Each webhook *topic* needs the scope for
+the data it carries — `PRODUCTS_*` needs `read_products`, `CUSTOMERS_*` needs
+`read_customers`, `INVENTORY_LEVELS_UPDATE` needs `read_inventory`, and
+`APP_UNINSTALLED` needs none. So registering subscriptions requires no extra
+scopes beyond the reads above
+([docs](https://shopify.dev/docs/apps/build/webhooks/subscribe)).
 | `write_products` | `POST /api/automation/apply` | Price and visibility changes fail with `SHOPIFY_SCOPE_MISSING`; preview still works |
 
 List reads that hit a missing scope automatically retry a **reduced query** and
@@ -647,8 +653,9 @@ curl -X POST  http://localhost:4000/api/webhooks/register            # apply
 ```
 
 Registration reconciles against Shopify instead of blindly creating, so it is safe
-to re-run; a topic already pointing at the right URL is left alone. Requires the
-`write_webhooks` scope.
+to re-run; a topic already pointing at the right URL is left alone. No dedicated
+webhook scope is needed — each topic uses the read scope for its own data, so a
+topic you lack the scope for is the only one that fails.
 
 Registered topics: app uninstalled, inventory levels update, order
 create/update/cancel, fulfillment create/update, product create/update/delete,
