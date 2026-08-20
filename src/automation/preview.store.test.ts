@@ -26,14 +26,24 @@ const SHOP = 'teststore.myshopify.com';
 const RULES_A = { price: { enabled: true, targetMarginPercentage: 30 } } as unknown as AutomationRules;
 const RULES_B = { price: { enabled: true, targetMarginPercentage: 45 } } as unknown as AutomationRules;
 
-function record(rules: AutomationRules, store = SHOP) {
+/** Fixed plan hashes standing in for a concrete action plan. */
+const PLAN_A = 'planhash-A';
+const PLAN_B = 'planhash-B';
+
+function record(rules: AutomationRules, store = SHOP, planHash = PLAN_A) {
   return recordPreview({
     rulesHash: computeRulesHash(rules),
+    planHash,
     storeDomain: store,
     query: undefined,
     maxProducts: undefined,
     overrides: undefined,
   });
+}
+
+/** consumePreview with the current rules+plan hashes. */
+function consume(previewId: string, rules: AutomationRules, planHash = PLAN_A) {
+  return consumePreview(previewId, { rulesHash: computeRulesHash(rules), planHash });
 }
 
 function code(fn: () => unknown): string {
@@ -74,14 +84,14 @@ describe('a valid preview can be applied exactly once', () => {
   it('accepts the matching hash and marks it used', () => {
     const token = record(RULES_A);
     const found = findApplicablePreview(token.previewId, SHOP);
-    const consumed = consumePreview(found.previewId, computeRulesHash(RULES_A));
+    const consumed = consume(found.previewId, RULES_A);
     assert.equal(consumed.previewId, token.previewId);
   });
 
   it('refuses to apply the same preview twice (single-use)', () => {
     const token = record(RULES_A);
     findApplicablePreview(token.previewId, SHOP);
-    consumePreview(token.previewId, computeRulesHash(RULES_A));
+    consume(token.previewId, RULES_A);
 
     // A replay is now rejected at the find step.
     assert.equal(
@@ -105,18 +115,23 @@ describe('a preview is bound to its store and rules', () => {
     findApplicablePreview(token.previewId, SHOP);
     // The saved rules now hash to RULES_B - the preview no longer describes what
     // apply would do.
-    assert.equal(
-      code(() => consumePreview(token.previewId, computeRulesHash(RULES_B))),
-      'PREVIEW_STALE',
-    );
+    assert.equal(code(() => consume(token.previewId, RULES_B)), 'PREVIEW_STALE');
   });
 
-  it('does not consume a preview that failed the rules check', () => {
+  it('rejects when the action plan changed even though rules are identical', () => {
+    // Same rules, but Shopify/cost data moved so the concrete plan differs.
+    const token = record(RULES_A, SHOP, PLAN_A);
+    findApplicablePreview(token.previewId, SHOP);
+    assert.equal(code(() => consume(token.previewId, RULES_A, PLAN_B)), 'PREVIEW_STALE');
+  });
+
+  it('does not consume a preview that failed the rules or plan check', () => {
     const token = record(RULES_A);
-    // Stale attempt does not mark it applied...
-    code(() => consumePreview(token.previewId, computeRulesHash(RULES_B)));
+    // Stale attempts do not mark it applied...
+    code(() => consume(token.previewId, RULES_B));
+    code(() => consume(token.previewId, RULES_A, PLAN_B));
     // ...so a correct apply still succeeds.
-    const consumed = consumePreview(token.previewId, computeRulesHash(RULES_A));
+    const consumed = consume(token.previewId, RULES_A);
     assert.equal(consumed.previewId, token.previewId);
   });
 });

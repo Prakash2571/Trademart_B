@@ -24,11 +24,13 @@ import {
 } from '../suppliers/supplier.registry';
 import {
   approveProduct,
+  executePreparedPlan,
   getStoredRules,
+  hashPlan,
   listAutomationRuns,
+  prepareAutomationPlan,
   resolveEffectiveRules,
   saveRules,
-  runAutomation,
 } from './automation.service';
 import {
   computeRulesHash,
@@ -191,20 +193,22 @@ automationRouter.post(
             fallback: 250,
           });
 
-    const report = await runAutomation({
-      // Hardcoded, not read from input: this route must never be able to write,
-      // whatever the caller sends.
-      dryRun: true,
+    // Prepare (read-only) then report the dry run over that exact plan, so the
+    // token binds to the concrete plan the operator sees - not just the rules.
+    const prepared = await prepareAutomationPlan({
       trigger: 'manual',
       query,
       rules: overrides,
       maxProducts,
     });
+    const report = await executePreparedPlan(prepared, { dryRun: true, trigger: 'manual' });
 
-    // Issue a single-use token bound to the effective rules and store, so a
-    // later apply can prove it corresponds to THIS preview (see preview.store).
+    // Single-use token bound to the store, the effective rules AND the concrete
+    // action plan, so a later apply can prove it corresponds to THIS preview
+    // even if Shopify/cost data shifts underneath (see preview.store).
     const preview = recordPreview({
-      rulesHash: computeRulesHash(report.rules),
+      rulesHash: computeRulesHash(prepared.rules),
+      planHash: hashPlan(prepared.plan),
       storeDomain: report.shopDomain,
       query,
       maxProducts,
@@ -226,21 +230,25 @@ automationRouter.post(
     // change or store switch after previewing invalidates the token.
     const previewId = parseStringParam(body['previewId'], 'previewId', { maxLength: 100 });
     const record = findApplicablePreview(previewId, config.shopify.storeDomain);
-    // Recompute the effective rules the preview's overrides would produce NOW;
-    // if the saved rules changed since the preview, the hash differs and the
-    // token is rejected as stale.
-    const currentEffective = await resolveEffectiveRules(record.overrides);
-    consumePreview(record.previewId, computeRulesHash(currentEffective));
 
-    // runAutomation enforces the kill switch itself. Replays the exact scope
-    // (rules overrides, query, maxProducts) the preview was generated with.
-    const report = await runAutomation({
-      dryRun: false,
+    // Re-prepare the plan NOW (read-only), from the preview's exact scope. If
+    // the saved rules OR the underlying product/cost data changed since the
+    // preview, the rules hash or the plan hash differs and consumePreview
+    // rejects it as PREVIEW_STALE - nothing is applied.
+    const prepared = await prepareAutomationPlan({
       trigger: 'manual',
       query: record.query,
       rules: record.overrides,
       maxProducts: record.maxProducts,
     });
+    consumePreview(record.previewId, {
+      rulesHash: computeRulesHash(prepared.rules),
+      planHash: hashPlan(prepared.plan),
+    });
+
+    // Execute the SAME prepared plan that was just verified - no re-fetch or
+    // re-plan between verification and execution. Takes the automation lock.
+    const report = await executePreparedPlan(prepared, { dryRun: false, trigger: 'manual' });
     sendSuccess(res, report, { dryRun: false, previewId: record.previewId });
   }),
 );

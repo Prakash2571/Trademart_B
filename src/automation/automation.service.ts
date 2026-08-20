@@ -15,9 +15,15 @@
  *   4. Every applied action records its previous value, so a run is reversible.
  */
 
+import { createHash } from 'node:crypto';
+
 import { AppError, toAppError } from '../common/errors';
 import { logger } from '../common/logger';
 import { config, isAutomationEnabled } from '../config';
+import {
+  acquireAutomationLock,
+  releaseAutomationLock,
+} from './automation.lock';
 import { AutomationRunModel } from '../database/models/AutomationRun';
 import { AutomationSettingsModel } from '../database/models/AutomationSettings';
 import { getDatabaseStatus } from '../database/mongo';
@@ -318,24 +324,32 @@ async function applyPrices(productId: string, actions: PriceAction[]): Promise<v
 }
 
 /**
- * Builds and optionally applies an automation plan.
- *
- * Preview (`dryRun: true`) works regardless of the kill switch; applying does not.
+ * A fully-decided automation plan plus the context to execute and audit it,
+ * built WITHOUT any writes. Preview hashes this; apply re-derives it, checks the
+ * hash matches the preview, and executes THIS object - so nothing is re-fetched
+ * or re-planned between verification and execution.
  */
-export async function runAutomation(options: RunOptions): Promise<AutomationReport> {
+export interface PreparedPlan {
+  rules: AutomationRules;
+  plan: AutomationPlan;
+  degraded: string[];
+  notes: string[];
+}
+
+/**
+ * Fetches products, loads costs, and builds the plan. Read-only: this never
+ * writes to Shopify, so it is safe to run for both preview and the
+ * verification step of apply.
+ */
+export async function prepareAutomationPlan(
+  options: Omit<RunOptions, 'dryRun'>,
+): Promise<PreparedPlan> {
   const rules = await resolveEffectiveRules(options.rules);
   const problems = validateAutomationRules(rules);
   if (problems.length > 0) {
     throw new AppError('AUTOMATION_RULES_INVALID', 'Automation rules are invalid.', {
       details: { problems },
     });
-  }
-
-  if (!options.dryRun && !isAutomationEnabled()) {
-    throw new AppError(
-      'AUTOMATION_DISABLED',
-      'Storefront writes are disabled. Set AUTOMATION_ENABLED=true to allow Trademart to change prices and product visibility, or use POST /api/automation/preview to see what it would do.',
-    );
   }
 
   const notes: string[] = [];
@@ -382,6 +396,99 @@ export async function runAutomation(options: RunOptions): Promise<AutomationRepo
   }
 
   const plan = buildAutomationPlan(products, rules, manualCosts);
+  return { rules, plan, degraded, notes };
+}
+
+/**
+ * Deterministic hash of the CONCRETE action plan - the exact from->to changes,
+ * not the rules that produced them.
+ *
+ * This is what binds a preview to what the operator reviewed. Between preview
+ * and apply the underlying Shopify or cost data can change so that the same
+ * rules now produce different price/visibility moves (£20->£25 becomes
+ * £18->£23). Comparing this hash catches that and refuses to apply a plan the
+ * operator never saw. Sorted by a stable key so plan ordering cannot affect it.
+ */
+export function hashPlan(plan: AutomationPlan): string {
+  const normalized = plan.actions
+    .map((action) =>
+      action.type === 'price'
+        ? {
+            t: 'price',
+            p: action.shopifyProductId,
+            v: action.shopifyVariantId,
+            from: action.from.toFixed(2),
+            to: action.to.toFixed(2),
+            c: action.currencyCode,
+          }
+        : {
+            t: 'visibility',
+            p: action.shopifyProductId,
+            v: null,
+            from: action.from,
+            to: action.to,
+            c: null,
+          },
+    )
+    .sort((a, b) => `${a.t}:${a.p}:${a.v ?? ''}`.localeCompare(`${b.t}:${b.p}:${b.v ?? ''}`));
+  return createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
+}
+
+/**
+ * Builds and optionally applies an automation plan.
+ *
+ * Thin composition of prepare + execute, kept for callers (e.g. webhook
+ * triggers) that do not need the preview-token round trip.
+ */
+export async function runAutomation(options: RunOptions): Promise<AutomationReport> {
+  if (!options.dryRun && !isAutomationEnabled()) {
+    throw new AppError(
+      'AUTOMATION_DISABLED',
+      'Storefront writes are disabled. Set AUTOMATION_ENABLED=true to allow Trademart to change prices and product visibility, or use POST /api/automation/preview to see what it would do.',
+    );
+  }
+  const prepared = await prepareAutomationPlan(options);
+  return executePreparedPlan(prepared, {
+    dryRun: options.dryRun,
+    trigger: options.trigger,
+  });
+}
+
+/**
+ * Executes (or, for a dry run, just reports) an already-prepared plan.
+ *
+ * A real apply takes the store-level automation lock so two applies cannot race
+ * (operator double-click, or manual vs webhook). Preview never locks.
+ */
+export async function executePreparedPlan(
+  prepared: PreparedPlan,
+  options: { dryRun: boolean; trigger?: RunOptions['trigger']; requestId?: string | null },
+): Promise<AutomationReport> {
+  if (!options.dryRun && !isAutomationEnabled()) {
+    throw new AppError(
+      'AUTOMATION_DISABLED',
+      'Storefront writes are disabled. Set AUTOMATION_ENABLED=true to allow Trademart to change prices and product visibility, or use POST /api/automation/preview to see what it would do.',
+    );
+  }
+
+  // Serialise real applies. Acquired before any await so a concurrent apply is
+  // rejected immediately rather than interleaving writes.
+  if (!options.dryRun) {
+    acquireAutomationLock({ trigger: options.trigger ?? 'manual', requestId: options.requestId });
+  }
+  try {
+    return await runPreparedPlan(prepared, options);
+  } finally {
+    if (!options.dryRun) releaseAutomationLock();
+  }
+}
+
+/** Inner executor. Assumes the lock (if needed) is already held. */
+async function runPreparedPlan(
+  prepared: PreparedPlan,
+  options: { dryRun: boolean; trigger?: RunOptions['trigger'] },
+): Promise<AutomationReport> {
+  const { rules, plan, degraded, notes } = prepared;
 
   const actions: AppliedAction[] = [];
   let applied = 0;

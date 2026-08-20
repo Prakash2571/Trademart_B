@@ -42,6 +42,7 @@ export type ErrorCode =
   | 'AUTOMATION_DISABLED'
   | 'AUTOMATION_RULES_INVALID'
   | 'AUTOMATION_PRECONDITION_FAILED'
+  | 'AUTOMATION_ALREADY_RUNNING'
   // Automation preview -> apply enforcement
   | 'PREVIEW_REQUIRED'
   | 'PREVIEW_NOT_FOUND'
@@ -140,6 +141,9 @@ export function defaultStatusForCode(code: ErrorCode): number {
     case 'PREVIEW_EXPIRED':
     case 'PREVIEW_ALREADY_APPLIED':
     case 'PREVIEW_STALE':
+      return 409;
+    // A second automation apply arrived while one was already running.
+    case 'AUTOMATION_ALREADY_RUNNING':
       return 409;
     // A failed HMAC or state check is an authentication failure, not a 400:
     // the request was well-formed but could not be proven to come from Shopify.

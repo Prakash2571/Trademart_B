@@ -33,6 +33,8 @@ export const PREVIEW_TTL_MS = 10 * 60_000;
 interface PreviewRecord {
   previewId: string;
   rulesHash: string;
+  /** Hash of the concrete action plan the operator reviewed. */
+  planHash: string;
   storeDomain: string;
   /** Replayed verbatim on apply so the applied scope matches the preview. */
   query: string | undefined;
@@ -47,6 +49,7 @@ interface PreviewRecord {
 export interface PreviewToken {
   previewId: string;
   rulesHash: string;
+  planHash: string;
   storeDomain: string;
   generatedAt: string;
   expiresAt: string;
@@ -85,6 +88,7 @@ function prune(now: number): void {
 /** Records a preview and returns its token. */
 export function recordPreview(input: {
   rulesHash: string;
+  planHash: string;
   storeDomain: string;
   query: string | undefined;
   maxProducts: number | undefined;
@@ -96,6 +100,7 @@ export function recordPreview(input: {
   const record: PreviewRecord = {
     previewId: randomUUID(),
     rulesHash: input.rulesHash,
+    planHash: input.planHash,
     storeDomain: input.storeDomain,
     query: input.query,
     maxProducts: input.maxProducts,
@@ -109,6 +114,7 @@ export function recordPreview(input: {
   return {
     previewId: record.previewId,
     rulesHash: record.rulesHash,
+    planHash: record.planHash,
     storeDomain: record.storeDomain,
     generatedAt: new Date(record.generatedAt).toISOString(),
     expiresAt: new Date(record.expiresAt).toISOString(),
@@ -171,17 +177,28 @@ export function findApplicablePreview(
  * hash from the record's overrides. A rules change since the preview is
  * reported as PREVIEW_STALE and the preview is NOT consumed.
  */
-export function consumePreview(previewId: string, currentRulesHash: string): PreviewRecord {
+export function consumePreview(
+  previewId: string,
+  current: { rulesHash: string; planHash: string },
+): PreviewRecord {
   const record = previews.get(previewId);
   if (record === undefined || record.applied) {
     // Re-checked to close the read-then-write gap; the earlier find already
     // reported the friendly message for the common cases.
     throw new AppError('PREVIEW_NOT_FOUND', 'That preview is no longer applicable. Preview again.');
   }
-  if (record.rulesHash !== currentRulesHash) {
+  if (record.rulesHash !== current.rulesHash) {
     throw new AppError(
       'PREVIEW_STALE',
       'The automation rules changed after this preview was generated, so it no longer describes what would happen. Preview again, then apply.',
+    );
+  }
+  if (record.planHash !== current.planHash) {
+    // The rules are unchanged, but the underlying Shopify/cost data moved, so
+    // the concrete price/visibility changes are no longer the ones reviewed.
+    throw new AppError(
+      'PREVIEW_STALE',
+      'Product or cost data changed after this preview, so the exact changes would differ from what you reviewed. Preview again, then apply.',
     );
   }
   record.applied = true;
