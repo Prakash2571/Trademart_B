@@ -54,7 +54,7 @@ All secrets live here and **never** leave the server. Never commit `.env`.
 | `SHOPIFY_CLIENT_ID` | no in dev, **yes in prod** | — | From the Dev Dashboard. Half a pair is a startup error. |
 | `SHOPIFY_CLIENT_SECRET` | no in dev, **yes in prod** | — | Paired with the client id. Also signs/verifies the OAuth HMAC. |
 | `SHOPIFY_ACCESS_TOKEN` | no | — | **Optional override.** Disables automatic refresh — see below. |
-| `SHOPIFY_WEBHOOK_SECRET` | no | — | Required before webhook deliveries are accepted. |
+| `SHOPIFY_WEBHOOK_SECRET` | no | falls back to `SHOPIFY_CLIENT_SECRET` | Leave blank normally — Shopify signs app webhooks with the client secret. Set it only for webhooks created by hand in the Shopify admin. |
 | `SHOPIFY_SCOPES` | no | `read_products,read_orders,read_customers,read_inventory` | Scopes requested by the OAuth flow. Ignored under managed installation. |
 | `SHOPIFY_AUTH_MODE` | no | `auto` | `auto` = client credentials grant. `oauth` = use the stored per-merchant offline token. |
 | `TOKEN_ENCRYPTION_KEY` | only for `oauth` | — | 32 bytes (hex or base64) encrypting offline tokens at rest. `openssl rand -base64 32`. |
@@ -354,7 +354,8 @@ curl http://localhost:4000/api/webhooks/subscriptions                # live stat
 ```
 
 Needs `APP_URL` (Shopify cannot reach localhost — use a tunnel),
-`SHOPIFY_WEBHOOK_SECRET`, and the read scope for each topic. Registration is
+a signing secret (defaults to `SHOPIFY_CLIENT_SECRET`), and the read scope for
+each topic. Registration is
 idempotent: it reconciles against Shopify rather than blindly creating, so running
 it twice will not double your deliveries. Deliveries are de-duplicated by
 `X-Shopify-Webhook-Id`.
@@ -644,8 +645,9 @@ npm install -g @shopify/cli@latest
 shopify app dev            # prints a public https URL
 ```
 
-Set `APP_URL` to that https URL and set `SHOPIFY_WEBHOOK_SECRET` — without the
-secret every delivery is rejected with `WEBHOOK_NOT_CONFIGURED`. Then register:
+Set `APP_URL` to that https URL. The webhook signing secret needs no separate
+value — Shopify signs app deliveries with `SHOPIFY_CLIENT_SECRET`, which the
+backend uses automatically. Then register:
 
 ```bash
 curl -X POST "http://localhost:4000/api/webhooks/register?dryRun=1"  # preview
