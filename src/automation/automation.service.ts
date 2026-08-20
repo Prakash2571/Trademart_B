@@ -745,26 +745,33 @@ export async function holdProductForReview(shopifyProductId: string): Promise<vo
  */
 export interface ApproveResult {
   shopifyProductId: string;
-  /** Review/auto-hidden tags removed and status set ACTIVE. */
+  /** Status set ACTIVE and review/auto-hidden tags removed. */
   activated: boolean;
   tagsRemoved: string[];
-  /** Whether publication to a sales channel succeeded. */
+  /** Whether publication to a sales channel succeeded and was verified. */
   published: boolean;
   /** Channels the product is currently published on (best-effort read-back). */
   publications: { publicationId: string; name: string; isPublished: boolean }[];
-  /** Set when activation succeeded but publication did not. */
+  /** Set when publication failed; the product was kept DRAFT and in review. */
   publishError: string | null;
 }
 
 /**
- * Approves a held product: clears the review and auto-hidden tags, sets it
- * ACTIVE, and publishes it to the Online Store.
+ * Approves a held product.
  *
- * Activation and publication are reported separately. If activation succeeds
- * but publication fails (e.g. write_publications not granted), the product is
- * ACTIVE-but-not-visible and the result says so - it does NOT pretend the whole
- * operation succeeded, and it does not roll back the activation (no rollback is
- * implemented; the operator can retry publish or unpublish deliberately).
+ * ORDER MATTERS for safety. Publication is attempted and VERIFIED first, while
+ * the product is still DRAFT and still carries the review tag. Only once
+ * publication is confirmed is the product set ACTIVE and the review tag removed:
+ *
+ *   DRAFT + review tag  ->  publish  ->  verify  ->  set ACTIVE  ->  remove tag
+ *
+ * If publication fails (or cannot be verified), the product is left exactly as
+ * it was - DRAFT, review-tagged, and therefore still in /products/review - so a
+ * failed approval can never drop a product out of the queue in an
+ * ACTIVE-but-invisible limbo. No rollback is needed because nothing was changed.
+ *
+ * Publishing a DRAFT product is safe: channel availability and draft/active
+ * status are independent, so it stays invisible until the ACTIVE step.
  */
 export async function approveProduct(shopifyProductId: string): Promise<ApproveResult> {
   if (!isAutomationEnabled()) {
@@ -773,6 +780,56 @@ export async function approveProduct(shopifyProductId: string): Promise<ApproveR
       'Storefront writes are disabled, so a product cannot be published. Set AUTOMATION_ENABLED=true.',
     );
   }
+
+  // 1. Publish first, then verify at least one channel reports it published.
+  let publications: ApproveResult['publications'] = [];
+  try {
+    const result = await publishProduct(shopifyProductId);
+    publications = result.state.map((entry) => ({
+      publicationId: entry.publicationId,
+      name: entry.name,
+      isPublished: entry.isPublished,
+    }));
+    const verified = publications.some((entry) => entry.isPublished);
+    if (!verified) {
+      logger.warn('Approval kept product in review: publish returned but no channel is published.', {
+        shopifyProductId,
+      });
+      return {
+        shopifyProductId,
+        activated: false,
+        tagsRemoved: [],
+        published: false,
+        publications,
+        publishError:
+          'Publish returned but no sales channel reports the product as published. The product was kept as DRAFT and remains in the review queue.',
+      };
+    }
+  } catch (error) {
+    const publishError =
+      error instanceof AppError ? `${error.code}: ${error.message}` : 'Publication failed.';
+    try {
+      publications = await getProductPublications(shopifyProductId);
+    } catch {
+      publications = [];
+    }
+    logger.warn('Approval kept product in review: publication failed.', {
+      shopifyProductId,
+      publishError,
+    });
+    return {
+      shopifyProductId,
+      activated: false,
+      tagsRemoved: [],
+      published: false,
+      publications,
+      publishError,
+    };
+  }
+
+  // 2. Publication confirmed. Make it visible, then clear the review gate.
+  // applyVisibility also strips the auto-hidden tag; harmless and idempotent.
+  await applyVisibility(shopifyProductId, 'ACTIVE');
 
   const tagsToRemove = [AUTOMATION_REVIEW_TAG, AUTOMATION_HIDDEN_TAG];
   const removal = await shopifyGraphql<{
@@ -785,45 +842,15 @@ export async function approveProduct(shopifyProductId: string): Promise<ApproveR
   const removalError = mapUserErrors(removal.data.tagsRemove?.userErrors);
   if (removalError !== null) throw removalError;
 
-  // applyVisibility also strips the auto-hidden tag; harmless and idempotent.
-  await applyVisibility(shopifyProductId, 'ACTIVE');
-
-  // Publish to the Online Store. ACTIVE alone does not make a product visible.
-  let published = false;
-  let publishError: string | null = null;
-  let publications: ApproveResult['publications'] = [];
-  try {
-    const result = await publishProduct(shopifyProductId);
-    published = true;
-    publications = result.state.map((entry) => ({
-      publicationId: entry.publicationId,
-      name: entry.name,
-      isPublished: entry.isPublished,
-    }));
-  } catch (error) {
-    // Activation already happened; report the publication failure honestly
-    // rather than throwing away the fact that the product is now ACTIVE.
-    publishError = error instanceof AppError ? `${error.code}: ${error.message}` : 'Publication failed.';
-    try {
-      publications = await getProductPublications(shopifyProductId);
-    } catch {
-      publications = [];
-    }
-  }
-
-  logger.info('Approved product for the storefront.', {
-    shopifyProductId,
-    published,
-    publishError,
-  });
+  logger.info('Approved and published product for the storefront.', { shopifyProductId });
 
   return {
     shopifyProductId,
     activated: true,
     tagsRemoved: tagsToRemove,
-    published,
+    published: true,
     publications,
-    publishError,
+    publishError: null,
   };
 }
 
