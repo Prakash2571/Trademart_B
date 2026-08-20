@@ -29,24 +29,50 @@ import {
 
 type UserErrors = { field?: string[] | null; message?: string }[];
 
+/**
+ * A created variant with enough identity to map it back to the form row the
+ * operator entered, so manual costs can be saved against the real Shopify
+ * variant id without a second round-trip or assuming input order.
+ */
+export interface CreatedVariant {
+  shopifyVariantId: string;
+  sku: string | null;
+  optionValues: { name: string; value: string }[];
+}
+
 export interface ProductCreateResult {
   shopifyProductId: string;
   title: string;
   status: string;
   variantsCreated: number;
   mediaAttached: number;
+  /**
+   * The variants that now exist on the product, with their SKU and selected
+   * option values. When explicit variants were supplied these are the created
+   * ones; otherwise it is the single default variant productCreate made. The
+   * caller maps its form rows to these (by SKU, then by option values) to
+   * persist per-variant manual costs.
+   */
+  variants: CreatedVariant[];
 }
 
 interface CreateResponse {
   productCreate: {
-    product: { id: string; title: string; status: string } | null;
+    product: {
+      id: string;
+      title: string;
+      status: string;
+      variants: { edges: { node: { id: string } }[] } | null;
+    } | null;
     userErrors: UserErrors;
   } | null;
 }
 
 interface VariantsResponse {
   productVariantsBulkCreate: {
-    productVariants: { id: string }[] | null;
+    productVariants:
+      | { id: string; sku: string | null; selectedOptions: { name: string; value: string }[] }[]
+      | null;
     userErrors: UserErrors;
   } | null;
 }
@@ -77,6 +103,7 @@ export async function createProduct(
 
   // Step 2: replace the default standalone variant with the real ones.
   let variantsCreated = 0;
+  let createdVariants: CreatedVariant[] = [];
   const variantInput = buildVariantsCreateInput(request);
   if (variantInput.length > 0) {
     const variants = await shopifyGraphql<VariantsResponse>(
@@ -95,7 +122,20 @@ export async function createProduct(
         { details: variantError.details },
       );
     }
-    variantsCreated = variants.data.productVariantsBulkCreate?.productVariants?.length ?? 0;
+    const created = variants.data.productVariantsBulkCreate?.productVariants ?? [];
+    variantsCreated = created.length;
+    createdVariants = created.map((v) => ({
+      shopifyVariantId: v.id,
+      sku: v.sku ?? null,
+      optionValues: v.selectedOptions ?? [],
+    }));
+  } else {
+    // No explicit variants: the product keeps productCreate's default variant.
+    // Return its id so a single manual cost can still be attached.
+    const defaultId = product.variants?.edges?.[0]?.node.id ?? null;
+    if (defaultId !== null) {
+      createdVariants = [{ shopifyVariantId: defaultId, sku: null, optionValues: [] }];
+    }
   }
 
   logger.info('Created Shopify product.', {
@@ -111,5 +151,6 @@ export async function createProduct(
     status: product.status,
     variantsCreated,
     mediaAttached: media.length,
+    variants: createdVariants,
   };
 }
