@@ -39,6 +39,30 @@ export const PRODUCT_STATUS_UPDATE_MUTATION = /* GraphQL */ `
   }
 `;
 
+/**
+ * General scalar update: title, descriptionHtml, vendor, productType, status.
+ * Only the fields present in `product` are changed; tags and variants are NOT
+ * set here (they go through their own surgical mutations).
+ */
+export const PRODUCT_UPDATE_MUTATION = /* GraphQL */ `
+  mutation TrademartProductUpdate($product: ProductUpdateInput!) {
+    productUpdate(product: $product) {
+      product {
+        id
+        title
+        vendor
+        productType
+        status
+        updatedAt
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
 /** Adds tags without disturbing existing ones. */
 export const TAGS_ADD_MUTATION = /* GraphQL */ `
   mutation TrademartTagsAdd($id: ID!, $tags: [String!]!) {
@@ -84,6 +108,7 @@ export const PRODUCT_VARIANTS_PRICE_UPDATE_MUTATION = /* GraphQL */ `
       productVariants {
         id
         price
+        compareAtPrice
         updatedAt
       }
       userErrors {
