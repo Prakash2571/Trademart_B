@@ -44,6 +44,14 @@ services:
       context: ..
       dockerfile: Dockerfile
       target: runtime
+      args:
+        # Baked into the image and surfaced by GET /api/version, so a running
+        # container can be tied back to a commit. Without this a locally built
+        # `:latest` is indistinguishable from any other `:latest`.
+        GIT_SHA: ${GIT_SHA:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    # Tag with the git SHA as well as IMAGE_TAG when you can - a rollback needs a
+    # previous image that still exists. See docs/DEPLOYMENT.md.
     image: trademart-backend:${IMAGE_TAG:-latest}
     <<: *defaults
     environment:
@@ -93,6 +101,27 @@ services:
       AUTOMATION_ENABLED: ${AUTOMATION_ENABLED:-false}
       AUTOMATION_ON_WEBHOOK: ${AUTOMATION_ON_WEBHOOK:-false}
 
+      # ---- Store safety ----------------------------------------------------
+      # Declares whether this points at a development store or a real one.
+      # Defaults to `production`, so an undeclared store is assumed real.
+      # Verified against Shopify's own plan.partnerDevelopment - see
+      # GET /api/diagnostics/store-mode.
+      SHOPIFY_STORE_MODE: ${SHOPIFY_STORE_MODE:-production}
+      # Lets AUTOMATED tooling (tests, seed and smoke scripts) write to a
+      # non-development store. Default false. Does NOT affect a signed-in
+      # operator running their own shop.
+      ALLOW_LIVE_STORE_WRITES: ${ALLOW_LIVE_STORE_WRITES:-false}
+      # Optional pin for the Online Store sales channel; normally discovered.
+      SHOPIFY_ONLINE_STORE_PUBLICATION_ID: ${SHOPIFY_ONLINE_STORE_PUBLICATION_ID:-}
+      # Server-side cap on a single stock change. Larger needs confirmLargeChange.
+      MAX_INVENTORY_DELTA: ${MAX_INVENTORY_DELTA:-500}
+
+      # ---- Retention (enforced by MongoDB TTL indexes) ---------------------
+      RETENTION_WEBHOOK_EVENT_DAYS: ${RETENTION_WEBHOOK_EVENT_DAYS:-45}
+      RETENTION_IDEMPOTENCY_HOURS: ${RETENTION_IDEMPOTENCY_HOURS:-48}
+      RETENTION_AUDIT_DAYS: ${RETENTION_AUDIT_DAYS:-730}
+      AUTOMATION_PREVIEW_TTL_MINUTES: ${AUTOMATION_PREVIEW_TTL_MINUTES:-15}
+
       # ---- Operator authentication ----------------------------------------
       # Protects every write endpoint. Fails closed: with none of these set,
       # management endpoints refuse with UNAUTHORIZED rather than being open.
@@ -108,6 +137,42 @@ services:
     expose:
       - "4000"
     networks: [trademart]
+    # ---- Container hardening -----------------------------------------------
+    # read_only root filesystem: the app writes nothing to disk (logs go to
+    # stdout, state goes to Mongo), so this costs nothing and removes a whole
+    # class of post-compromise persistence.
+    read_only: true
+    # /tmp is the one writable path Node may need (e.g. for a V8 scratch file).
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    security_opt:
+      # Blocks setuid escalation inside the container.
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # The image already runs as `node`; stated explicitly so a base-image change
+    # cannot silently promote this to root.
+    user: node
+    # Bounded so one runaway request cannot starve nginx or Mongo on a small host.
+    # Raise `limits` if a large catalogue scan is ever OOM-killed.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+    healthcheck:
+      # LIVENESS. /api/health/ready would fail when Mongo is unreachable, and a
+      # restart cannot fix a database that lives elsewhere - that turns a blip
+      # into a crash loop. Poll /api/health/ready separately to route traffic.
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "fetch('http://127.0.0.1:4000/api/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
 
   # ------------------------------------------------------------ frontend ------
   frontend:
@@ -119,6 +184,8 @@ services:
         # Inlined into the browser bundle at build time. Rebuild the image
         # (./start.sh or `docker compose build frontend`) after changing it.
         NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-/api}
+        GIT_SHA: ${GIT_SHA:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
     image: trademart-frontend:${IMAGE_TAG:-latest}
     <<: *defaults
     environment:
@@ -128,6 +195,23 @@ services:
     expose:
       - "3000"
     networks: [trademart]
+    read_only: true
+    tmpfs:
+      # Next.js writes its cache under .next/cache at runtime, so that path has to
+      # be writable even though the rest of the filesystem is not.
+      - /tmp:rw,noexec,nosuid,size=32m
+      - /app/.next/cache:rw,noexec,nosuid,size=128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    user: node
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
 
   # --------------------------------------------------------------- nginx ------
   nginx:
@@ -148,6 +232,14 @@ services:
       - letsencrypt:/etc/letsencrypt:ro
       - certbot_www:/var/www/certbot:ro
       - nginx_logs:/var/log/nginx
+    # nginx is NOT read_only: it writes its pid file and proxy temp files. Dropping
+    # privileges is still worthwhile, and it needs NET_BIND_SERVICE to bind :80.
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 192M
     # service_started, not service_healthy: nginx must come up even when the
     # backend is crash-looping, otherwise a bad env var takes the whole site
     # offline instead of just the /api routes. Upstreams are re-resolved via

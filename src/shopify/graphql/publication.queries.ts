@@ -103,6 +103,38 @@ export const PUBLISHABLE_PUBLISH_MUTATION = /* GraphQL */ `
   }
 `;
 
+/**
+ * Bulk audit document for the integrity checks.
+ *
+ * Fetches status, tags and Online Store publication state together, so
+ * disagreements between them can be found in one pass instead of one query per
+ * product. `publishedOnPublication` is per-node, which is what makes this
+ * possible at all.
+ */
+export const PRODUCTS_PUBLICATION_AUDIT_QUERY = /* GraphQL */ `
+  query TrademartProductsPublicationAudit(
+    $first: Int!
+    $after: String
+    $publicationId: ID!
+  ) {
+    products(first: $first, after: $after) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      edges {
+        node {
+          id
+          title
+          status
+          tags
+          publishedOnPublication(publicationId: $publicationId)
+        }
+      }
+    }
+  }
+`;
+
 /** Removes a product from one or more publications. */
 export const PUBLISHABLE_UNPUBLISH_MUTATION = /* GraphQL */ `
   mutation TrademartPublishableUnpublish($id: ID!, $input: [PublicationInput!]!) {

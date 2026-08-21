@@ -13,7 +13,9 @@
 
 import { Router } from 'express';
 
+import { recordAudit } from '../audit/audit.service';
 import { AppError } from '../common/errors';
+import { idempotent } from '../common/idempotency';
 import { asyncHandler, sendSuccess } from '../common/http';
 import { parseIntParam, parseStringParam, toShopifyGid } from '../common/validate';
 import { config, isAutomationEnabled, isAutomationOnWebhookEnabled } from '../config';
@@ -178,6 +180,11 @@ automationRouter.post(
 
 automationRouter.post(
   '/automation/apply',
+  // Belt and braces alongside the single-use preview token. The token already
+  // makes a replayed apply impossible, but an Idempotency-Key additionally lets a
+  // client that never saw the response learn what happened, rather than being
+  // told PREVIEW_ALREADY_APPLIED and having to guess whether it worked.
+  idempotent('POST /api/automation/apply'),
   asyncHandler(async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const scope = readScope(body);
@@ -186,19 +193,57 @@ automationRouter.post(
     // data, compares its fingerprint against the reviewed one, and refuses with
     // PREVIEW_STALE if anything moved - so this endpoint can only ever execute a
     // plan a human actually looked at.
-    const report = await applyAutomation({
-      trigger: 'manual',
-      previewId: parseStringParam(body['previewId'], 'previewId', { maxLength: 100 }),
-      query: scope.query,
-      rules: readRuleOverrides(body),
-      maxProducts: scope.maxProducts,
-    });
+    const previewId = parseStringParam(body['previewId'], 'previewId', { maxLength: 100 });
 
-    sendSuccess(res, report, {
-      dryRun: false,
-      previewId: report.preview?.previewId ?? null,
-      planHash: report.planHash,
-    });
+    try {
+      const report = await applyAutomation({
+        trigger: 'manual',
+        previewId,
+        query: scope.query,
+        rules: readRuleOverrides(body),
+        maxProducts: scope.maxProducts,
+      });
+
+      await recordAudit({
+        action: 'AUTOMATION_APPLY',
+        resourceType: 'AUTOMATION',
+        resourceId: report.planHash,
+        after: {
+          summary: report.summary,
+          // The action list itself lives in automation_runs, which records each
+          // action's previous value. Duplicating it here would bloat every entry
+          // without adding anything.
+          auditRunId: report.auditRunId,
+        },
+        metadata: {
+          previewId,
+          planHash: report.planHash,
+          rulesHash: report.rulesHash,
+          scope: report.scope,
+        },
+        // A run in which some actions failed is not a clean success.
+        result: report.summary.failed > 0 ? 'FAILURE' : 'SUCCESS',
+      });
+
+      sendSuccess(res, report, {
+        dryRun: false,
+        previewId: report.preview?.previewId ?? null,
+        planHash: report.planHash,
+      });
+    } catch (error) {
+      // Every refusal is recorded: PREVIEW_STALE, PREVIEW_EXPIRED and
+      // AUTOMATION_ALREADY_RUNNING are the entries that explain why a bulk change
+      // an operator expected did not happen.
+      await recordAudit({
+        action: 'AUTOMATION_APPLY',
+        resourceType: 'AUTOMATION',
+        resourceId: previewId ?? null,
+        metadata: { previewId, scope },
+        result: 'FAILURE',
+        error,
+      });
+      throw error;
+    }
   }),
 );
 
@@ -260,13 +305,28 @@ automationRouter.put(
         'A rules object is required, e.g. { "rules": { "price": { "enabled": true } } }.',
       );
     }
+    // The previous stored overrides, so a rule change is reversible. Rules decide
+    // future prices, so "what were the rules yesterday?" is a question worth
+    // being able to answer.
+    const previous = await getStoredRules();
     const effective = await saveRules(overrides);
+
+    await recordAudit({
+      action: 'AUTOMATION_RULE_UPDATE',
+      resourceType: 'AUTOMATION',
+      resourceId: null,
+      before: previous,
+      after: overrides,
+      metadata: { effective },
+    });
+
     sendSuccess(res, { stored: overrides, effective });
   }),
 );
 
 automationRouter.post(
   '/automation/approve',
+  idempotent('POST /api/automation/approve'),
   asyncHandler(async (req, res) => {
     // The deliberate human step: clears the review gate and publishes. Separate
     // from apply because approving is a decision, not a rule evaluation.
@@ -282,7 +342,39 @@ automationRouter.post(
     // but still tagged, or published but not visible, and the caller has to be
     // able to tell those apart. A hard-coded status:'ACTIVE' - which is what this
     // used to return - was a claim, not an observation.
-    const result = await approveProduct(productId);
+    let result;
+    try {
+      result = await approveProduct(productId);
+    } catch (error) {
+      // A failed approval leaves the product DRAFT and still in the review queue.
+      // Recording that is how an operator learns the queue item is a retry rather
+      // than something new.
+      await recordAudit({
+        action: 'PRODUCT_APPROVE',
+        resourceType: 'PRODUCT',
+        resourceId: productId,
+        result: 'FAILURE',
+        error,
+        metadata: { stillInReviewQueue: true },
+      });
+      throw error;
+    }
+
+    await recordAudit({
+      action: 'PRODUCT_APPROVE',
+      resourceType: 'PRODUCT',
+      resourceId: productId,
+      before: { status: 'DRAFT', inReviewQueue: true },
+      after: {
+        status: result.status,
+        publishedToOnlineStore: result.publishedToOnlineStore,
+        visibleToCustomers: result.visibleToCustomers,
+        reviewTagRemoved: result.reviewTagRemoved,
+      },
+      result: result.visibleToCustomers ? 'SUCCESS' : 'FAILURE',
+      metadata: { warnings: result.warnings },
+    });
+
     sendSuccess(res, result, {
       approved: result.visibleToCustomers,
       partialSuccess: result.warnings.length > 0,

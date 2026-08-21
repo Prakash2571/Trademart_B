@@ -17,6 +17,7 @@ import { logger } from '../common/logger';
 import { config } from '../config';
 import { getTokenProvider } from './token';
 import type { ShopifyTokenProvider, TokenDiagnostics } from './token/token.types';
+import { recordShopifyOutcome } from './rateLimit.service';
 import {
   mapGraphqlErrors,
   mapHttpFailure,
@@ -192,10 +193,14 @@ export async function shopifyGraphql<T>(
           attempt,
         });
       }
+      // Feeds the circuit breaker. A success resets the failure count, which is
+      // what lets the breaker close again without a separate probe.
+      recordShopifyOutcome({ ok: true });
       return result;
     } catch (error) {
       const appError = error instanceof AppError ? error : mapNetworkFailure(error);
       lastError = appError;
+      recordShopifyOutcome({ ok: false, code: appError.code });
 
       // Shopify rejected the token. If we can mint a new one (client
       // credentials), the token was probably revoked or rotated early - discard

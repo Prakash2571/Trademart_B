@@ -316,11 +316,13 @@ export function mapTokenFailure(
 export function mapNetworkFailure(error: unknown): AppError {
   const reason = error instanceof Error ? error.message : 'Unknown network error.';
   if (/abort/i.test(reason)) {
-    return new AppError(
-      'SHOPIFY_NETWORK_ERROR',
-      'The request to Shopify timed out.',
-      { retryable: true, details: { reason } },
-    );
+    // A timeout is distinct from being unable to reach Shopify at all: the
+    // request may well have been received and acted upon, which matters when
+    // deciding whether retrying is safe.
+    return new AppError('SHOPIFY_TIMEOUT', 'The request to Shopify timed out.', {
+      retryable: true,
+      details: { reason },
+    });
   }
   return new AppError(
     'SHOPIFY_NETWORK_ERROR',

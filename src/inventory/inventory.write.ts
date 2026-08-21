@@ -21,6 +21,87 @@ export interface InventorySetRequest {
   locationId: string;
   quantity: number;
   name: InventoryQuantityName;
+  /**
+   * The quantity the caller believes is currently set.
+   *
+   * When supplied, the write is refused with PRODUCT_CHANGED if Shopify disagrees.
+   * This is what stops a stale browser tab overwriting a newer change: the
+   * operator opened the page when stock was 40, someone sold 5, and saving "40"
+   * would silently put the 5 back.
+   */
+  expectedQuantity?: number;
+  /**
+   * Explicit acknowledgement of a change larger than MAX_INVENTORY_DELTA.
+   *
+   * Enforced on the SERVER. The frontend also confirms large changes, but a
+   * browser dialog is not a control - anything reachable with curl has to be
+   * checked here too.
+   */
+  confirmLargeChange: boolean;
+}
+
+/**
+ * Decides whether a stock change is allowed, given the current value.
+ *
+ * Pure and separate from the Shopify call so the rule is unit testable without a
+ * network: the interesting cases are all about arithmetic and thresholds.
+ */
+export interface InventoryChangeAssessment {
+  from: number | null;
+  to: number;
+  /** Absolute size of the change. Null when the current value is unknown. */
+  delta: number | null;
+  requiresConfirmation: boolean;
+  allowed: boolean;
+  reason: string | null;
+}
+
+export function assessInventoryChange(
+  current: number | null,
+  request: InventorySetRequest,
+  maxDelta: number,
+): InventoryChangeAssessment {
+  const to = request.quantity;
+
+  // Unknown current value: the delta cannot be computed, so the cap cannot be
+  // enforced. Requiring confirmation is the conservative choice - it is the only
+  // way to avoid either blocking a legitimate write or waving through an
+  // arbitrarily large one.
+  if (current === null) {
+    return {
+      from: null,
+      to,
+      delta: null,
+      requiresConfirmation: true,
+      allowed: request.confirmLargeChange,
+      reason: request.confirmLargeChange
+        ? null
+        : `The current quantity could not be read, so a change of unknown size cannot be checked against the ${maxDelta}-unit limit. Send confirmLargeChange: true to proceed anyway.`,
+    };
+  }
+
+  const delta = Math.abs(to - current);
+  const requiresConfirmation = delta > maxDelta;
+
+  if (requiresConfirmation && !request.confirmLargeChange) {
+    return {
+      from: current,
+      to,
+      delta,
+      requiresConfirmation: true,
+      allowed: false,
+      reason: `Changing stock from ${current} to ${to} is a change of ${delta} units, which exceeds the ${maxDelta}-unit limit. Send confirmLargeChange: true if that is intended.`,
+    };
+  }
+
+  return {
+    from: current,
+    to,
+    delta,
+    requiresConfirmation,
+    allowed: true,
+    reason: null,
+  };
 }
 
 function requireGid(raw: unknown, resource: string, field: string): string {
@@ -63,7 +144,33 @@ export function validateInventorySet(body: Record<string, unknown>): InventorySe
     name = raw as InventoryQuantityName;
   }
 
-  return { inventoryItemId, locationId, quantity: rawQuantity, name };
+  const request: InventorySetRequest = {
+    inventoryItemId,
+    locationId,
+    quantity: rawQuantity,
+    name,
+    confirmLargeChange: false,
+  };
+
+  if (body['expectedQuantity'] !== undefined && body['expectedQuantity'] !== null) {
+    const expected = body['expectedQuantity'];
+    if (typeof expected !== 'number' || !Number.isInteger(expected) || expected < 0) {
+      throw new AppError(
+        'VALIDATION_ERROR',
+        'expectedQuantity must be a non-negative integer - the quantity you believe is currently set.',
+      );
+    }
+    request.expectedQuantity = expected;
+  }
+
+  if (body['confirmLargeChange'] !== undefined && body['confirmLargeChange'] !== null) {
+    if (typeof body['confirmLargeChange'] !== 'boolean') {
+      throw new AppError('VALIDATION_ERROR', 'confirmLargeChange must be true or false.');
+    }
+    request.confirmLargeChange = body['confirmLargeChange'];
+  }
+
+  return request;
 }
 
 /**

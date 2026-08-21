@@ -31,6 +31,7 @@ import {
 import { shopifyGraphql } from '../shopify/shopify.client';
 import { mapUserErrors } from '../shopify/shopify.errors';
 import { INVENTORY_ITEM_PRODUCT_QUERY } from '../shopify/graphql/inventory.queries';
+import { assertShopifyHealthyForBulkWrites } from '../shopify/rateLimit.service';
 import {
   tryGetProductPublicationState,
   tryPublishToOnlineStore,
@@ -684,6 +685,14 @@ export async function applyAutomation(
       'Storefront writes are disabled. Set AUTOMATION_ENABLED=true to allow Trademart to change prices and product visibility, or use POST /api/automation/preview to see what it would do.',
     );
   }
+
+  // Refuse a bulk write while Shopify is failing persistently. Checked before the
+  // lock so a degraded dependency does not also block the store for other work.
+  //
+  // Preview is deliberately NOT gated on this: a preview only needs reads, and
+  // being able to look at the store while writes are paused is more useful than
+  // failing everything at once.
+  assertShopifyHealthyForBulkWrites();
 
   return withAutomationLock({ trigger: options.trigger ?? 'manual' }, async () => {
     const prepared = await prepareAutomationPlan(options);

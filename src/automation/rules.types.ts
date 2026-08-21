@@ -158,6 +158,29 @@ export interface AutomationRules {
   maxItemsPerRun: number;
 }
 
+/* ------------------------------------------------------------ tag names ---- */
+//
+// Declared before DEFAULT_AUTOMATION_RULES because the defaults reference them.
+// Each is exported so the backend, the frontend and the integrity diagnostics all
+// use one spelling: a typo'd exemption tag silently stops exempting anything, and
+// that is not a failure anyone would notice until a price had already changed.
+
+/** Tag automation applies when it hides a product, so it knows what it owns. */
+export const AUTOMATION_HIDDEN_TAG = 'trademart:auto-hidden';
+
+/**
+ * Tag applied to a newly imported product that is being held back for review.
+ * Distinct from AUTOMATION_HIDDEN_TAG so "never shown yet" is not confused with
+ * "was live, then went out of stock".
+ */
+export const AUTOMATION_REVIEW_TAG = 'trademart:needs-review';
+
+/** The permanent opt-out: automation never touches a product carrying this. */
+export const NO_AUTOMATION_TAG = 'trademart:no-automation';
+
+/** A product whose price a human manages by hand. */
+export const MANUAL_PRICING_TAG = 'trademart:manual';
+
 /**
  * Deliberately cautious defaults.
  *
@@ -195,19 +218,9 @@ export const DEFAULT_AUTOMATION_RULES: AutomationRules = {
     includeVendors: [],
     newProductPolicy: 'draft',
   },
-  exemptTags: ['trademart:manual', 'trademart:no-automation'],
+  exemptTags: [MANUAL_PRICING_TAG, NO_AUTOMATION_TAG],
   maxItemsPerRun: 50,
 };
-
-/** Tag automation applies when it hides a product, so it knows what it owns. */
-export const AUTOMATION_HIDDEN_TAG = 'trademart:auto-hidden';
-
-/**
- * Tag applied to a newly imported product that is being held back for review.
- * Distinct from AUTOMATION_HIDDEN_TAG so "never shown yet" is not confused with
- * "was live, then went out of stock".
- */
-export const AUTOMATION_REVIEW_TAG = 'trademart:needs-review';
 
 const PRICING_MODES: readonly PricingMode[] = ['margin', 'multiplier', 'fixed_uplift'];
 const SELECTION_MODES: readonly SelectionMode[] = ['all', 'tagged', 'vendor'];

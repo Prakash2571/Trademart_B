@@ -31,7 +31,12 @@ import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 
 import { errorHandler, notFoundHandler } from './common/errorHandler';
+import { httpLogger } from './common/httpLogger';
+import { REQUEST_ID_HEADER, requestIdMiddleware } from './common/requestId';
+import { helmetOptions } from './common/securityHeaders';
 import { analyticsRouter } from './analytics/analytics.controller';
+import { auditRouter } from './audit/audit.controller';
+import { diagnosticsRouter } from './diagnostics/diagnostics.controller';
 import { automationRouter } from './automation/automation.controller';
 import { oauthRouter } from './auth/oauth.controller';
 import { operatorRouter } from './auth/operator/operator.controller';
@@ -65,7 +70,13 @@ export function createApp(): Express {
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
 
-  app.use(helmet());
+  // FIRST, before anything that can fail. Every log line, error body and audit
+  // row produced while serving this request needs the correlation id - including
+  // failures inside body parsing, rate limiting and CORS, which happen below.
+  app.use(requestIdMiddleware());
+  app.use(httpLogger());
+
+  app.use(helmet(helmetOptions()));
 
   // Only the configured frontend origin may call this API from a browser.
   //
@@ -83,9 +94,22 @@ export function createApp(): Express {
       // /api/automation/rules, which existed but was unreachable from a browser
       // because preflight rejected the method).
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'X-CSRF-Token', 'Authorization'],
+      // Idempotency-Key and X-Request-ID must be listed or the browser's
+      // preflight rejects them, which would silently disable both features for
+      // every cross-origin request from the console.
+      allowedHeaders: [
+        'Content-Type',
+        'X-CSRF-Token',
+        'Authorization',
+        'Idempotency-Key',
+        REQUEST_ID_HEADER,
+      ],
       credentials: true,
       maxAge: 86400,
+      // Lets the browser read the correlation id off the response so the frontend
+      // can show it next to an error. Without this, a cross-origin fetch cannot
+      // see the header at all and the id would be backend-only.
+      exposedHeaders: [REQUEST_ID_HEADER],
     }),
   );
 
@@ -150,6 +174,16 @@ export function createApp(): Express {
   // Storefront/theme reads. Read-only: no write path exists yet, and the live
   // theme is never modified directly (see themes/theme.guard.ts).
   app.use('/api', requireOperatorForReads, themesRouter);
+  // The audit trail. Read-only by design - there is no delete or edit route,
+  // because an audit trail alterable through the API it audits is not evidence.
+  // Guarded as a READ, but note it names operators and what they changed, so
+  // OPERATOR_PROTECT_READS=true is strongly recommended in production.
+  app.use('/api', requireOperatorForReads, auditRouter);
+
+  // Diagnostics: integrity findings, store mode, Shopify rate limit, version.
+  // Read-only, and mounted with the read guard so cost/margin-adjacent findings
+  // follow the same access rule as the rest of the read surface.
+  app.use('/api', requireOperatorForReads, diagnosticsRouter);
   app.use('/api', requireOperatorForReads, pricingRouter);
   app.use('/api', requireOperatorForReads, analyticsRouter);
   app.use('/api', requireOperatorForReads, suppliersRouter);

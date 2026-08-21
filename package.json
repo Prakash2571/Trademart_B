@@ -12,9 +12,12 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsc -p tsconfig.test.json && node --test \"dist-test/**/*.test.js\"",
+    "test": "NODE_ENV=test tsc -p tsconfig.test.json && NODE_ENV=test node --test \"dist-test/**/*.test.js\"",
     "shopify:ping": "tsx src/scripts/shopifyPing.ts",
-    "operator:hash": "tsx src/scripts/hashOperatorPassword.ts"
+    "operator:hash": "tsx src/scripts/hashOperatorPassword.ts",
+    "guard:dev-store": "tsx src/scripts/guardDevStore.ts",
+    "smoke": "./scripts/smoke-test.sh",
+    "verify:lockfile": "npm ci --dry-run"
   },
   "dependencies": {
     "cors": "^2.8.5",

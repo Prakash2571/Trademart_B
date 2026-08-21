@@ -1,0 +1,145 @@
+name: CI
+
+# Every push and PR. The backend previously had no CI at all, so a type error or
+# a failing test could reach main unnoticed.
+#
+# REPRODUCIBLE BUILDS
+# -------------------
+# `npm ci` is used unconditionally, and the lockfile is verified against
+# package.json before anything else runs. There is deliberately NO `npm install`
+# fallback: a fallback means the thing CI builds is not the thing the lockfile
+# describes, which is the exact property this job exists to guarantee. A missing
+# or inconsistent lockfile FAILS the build with instructions rather than quietly
+# resolving whatever is newest that day.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  lockfile:
+    name: lockfile is present and consistent
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Lockfile must be committed
+        run: |
+          if [ ! -f package-lock.json ]; then
+            echo "::error title=Missing package-lock.json::A committed lockfile is required for reproducible builds. Generate and commit one:"
+            echo ""
+            echo "    npm install --package-lock-only"
+            echo "    git add package-lock.json && git commit -m 'chore: commit lockfile for reproducible builds'"
+            echo ""
+            echo "Without it, CI and Docker resolve whatever versions happen to be newest, so two builds of the same commit can differ."
+            exit 1
+          fi
+          echo "package-lock.json is present."
+
+      - name: Lockfile must agree with package.json
+        # `npm ci` is the check: it exits non-zero when the lockfile is out of sync
+        # with package.json, which is precisely the inconsistency to catch. It also
+        # warms the install for nothing, so --dry-run keeps it cheap.
+        run: |
+          if ! npm ci --dry-run > lockfile-check.log 2>&1; then
+            echo "::error title=Lockfile out of sync::package-lock.json does not match package.json. Run 'npm install' and commit the updated lockfile."
+            cat lockfile-check.log
+            exit 1
+          fi
+          echo "package-lock.json is consistent with package.json."
+
+      - name: Lockfile version integrity
+        # lockfileVersion 1 has no integrity guarantees worth relying on.
+        run: |
+          VERSION=$(node -p "require('./package-lock.json').lockfileVersion")
+          echo "lockfileVersion=$VERSION"
+          if [ "$VERSION" -lt 2 ]; then
+            echo "::error title=Old lockfile format::lockfileVersion $VERSION lacks integrity hashes for the full tree. Regenerate with npm 8 or newer."
+            exit 1
+          fi
+
+  verify:
+    name: typecheck, test, build
+    needs: lockfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      # No fallback. See the note at the top of this file.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        # NODE_ENV=test additionally makes the live-store guard refuse any
+        # automated write, so a test that reached for Shopify would be blocked
+        # rather than mutating a real store.
+        env:
+          NODE_ENV: test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Assert the build output the Docker image expects exists
+        run: |
+          test -f dist/server.js \
+            || { echo "::error title=No build output::dist/server.js is missing, so the Docker image would build and then fail to start."; exit 1; }
+          echo "dist/server.js present"
+
+  docker:
+    name: docker image
+    needs: lockfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: false
+          # Baked in so GET /api/version can identify exactly what is deployed.
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+# ---------------------------------------------------------------------------
+# Branch protection (manual step)
+#
+# Settings -> Branches -> add a rule for `main`:
+#   - Require a pull request before merging
+#   - Require status checks to pass:
+#       "lockfile is present and consistent"
+#       "typecheck, test, build"
+#       "docker image"
+#   - Require branches to be up to date before merging
+# ---------------------------------------------------------------------------

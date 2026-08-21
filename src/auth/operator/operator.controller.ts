@@ -13,9 +13,11 @@
 import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 
+import { recordAudit } from '../../audit/audit.service';
 import { AppError } from '../../common/errors';
 import { asyncHandler, sendSuccess } from '../../common/http';
 import { logger } from '../../common/logger';
+import { setActor } from '../../common/requestContext';
 import {
   config,
   isOperatorConfigured,
@@ -121,6 +123,17 @@ operatorRouter.post(
     if (!usernameOk || !passwordOk) {
       // One generic message for both cases - never "no such user".
       logger.warn('Failed operator sign-in attempt.', { ip: req.ip });
+      // Audited as a security event. A run of these from one address is the
+      // signal that matters, and it is invisible if only successes are recorded.
+      // The ATTEMPTED username is stored; the password never is.
+      await recordAudit({
+        action: 'LOGIN_FAILED',
+        resourceType: 'SESSION',
+        actor: username.length === 0 ? 'unknown' : username,
+        authMethod: 'SESSION',
+        result: 'FAILURE',
+        metadata: { ip: req.ip ?? null, reason: 'Invalid username or password.' },
+      });
       throw new AppError('LOGIN_FAILED', 'Invalid username or password.');
     }
 
@@ -129,6 +142,18 @@ operatorRouter.post(
     }
 
     logger.info('Operator signed in.', { username: expectedUser });
+    // A fresh token is minted here rather than any earlier cookie being reused,
+    // which is what prevents session fixation: a pre-login cookie an attacker
+    // planted cannot survive a successful sign-in.
+    setActor(expectedUser, 'SESSION');
+    await recordAudit({
+      action: 'LOGIN',
+      resourceType: 'SESSION',
+      actor: expectedUser,
+      authMethod: 'SESSION',
+      after: { sessionTtlHours: Math.round(config.operator.sessionTtlMs / 3_600_000) },
+      metadata: { ip: req.ip ?? null },
+    });
     sendSuccess(res, {
       username: expectedUser,
       method: 'SESSION',
@@ -151,6 +176,13 @@ operatorRouter.post(
 
     if (operator !== null) {
       logger.info('Operator signed out.', { username: operator.username });
+      await recordAudit({
+        action: 'LOGOUT',
+        resourceType: 'SESSION',
+        actor: operator.username,
+        authMethod: operator.method,
+        metadata: { ip: req.ip ?? null },
+      });
     }
     sendSuccess(res, { signedOut: true });
   }),

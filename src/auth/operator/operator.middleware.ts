@@ -29,6 +29,7 @@ import type { NextFunction, Request, RequestHandler, Response } from 'express';
 
 import { AppError } from '../../common/errors';
 import { logger } from '../../common/logger';
+import { setActor } from '../../common/requestContext';
 import { config, isOperatorConfigured } from '../../config';
 import {
   CSRF_COOKIE,
@@ -190,6 +191,10 @@ export const requireOperator: RequestHandler = (
   }
 
   req.operator = operator;
+  // Publishes the identity into the request context so every log line and audit
+  // entry produced downstream is attributable, without each of them having to be
+  // handed the operator explicitly.
+  setActor(operator.username, operator.method);
   next();
 };
 
@@ -208,7 +213,10 @@ export const requireOperatorForWrites: RequestHandler = (
   if (!methodRequiresCsrf(req.method)) {
     // Read-only: attach the operator if present, but never demand one.
     const operator = resolveOperator(req, res);
-    if (operator !== null) req.operator = operator;
+    if (operator !== null) {
+      req.operator = operator;
+      setActor(operator.username, operator.method);
+    }
     next();
     return;
   }
@@ -226,7 +234,10 @@ export const requireOperatorForReads: RequestHandler = (
 ) => {
   if (!config.operator.protectReads) {
     const operator = resolveOperator(req, res);
-    if (operator !== null) req.operator = operator;
+    if (operator !== null) {
+      req.operator = operator;
+      setActor(operator.username, operator.method);
+    }
     next();
     return;
   }

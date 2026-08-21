@@ -67,6 +67,49 @@ export async function listManualCosts(
   }));
 }
 
+/**
+ * Reads one stored manual cost, or null.
+ *
+ * Exists so a write can record what the value WAS before changing it. A manual
+ * cost is a hand-entered number that exists nowhere else - not in Shopify, not
+ * with the supplier - so without a `before` value an audit entry cannot make the
+ * change reversible.
+ *
+ * Returns null rather than throwing when there is no database: the caller is
+ * about to fail on its own write anyway, and an audit lookup must never be the
+ * thing that reports the problem.
+ */
+export async function findManualCost(
+  shopifyProductId: string,
+  shopifyVariantId: string | null,
+): Promise<StoredManualCost | null> {
+  if (getDatabaseStatus().status !== 'connected') return null;
+
+  const row = await SupplierProductModel.findOne({
+    shopDomain: config.shopify.storeDomain,
+    shopifyProductId,
+    shopifyVariantId,
+    costSource: 'MANUAL',
+  }).lean();
+
+  if (row === null || row === undefined) return null;
+
+  return {
+    shopifyProductId: row.shopifyProductId,
+    shopifyVariantId: row.shopifyVariantId ?? null,
+    provider: row.provider,
+    supplierProductCost: row.supplierProductCost ?? null,
+    supplierShippingCost: row.supplierShippingCost ?? null,
+    currencyCode: row.currencyCode ?? null,
+    costSource: row.costSource,
+    note: (row as { note?: string | null }).note ?? null,
+    updatedAt:
+      (row as { updatedAt?: Date }).updatedAt instanceof Date
+        ? (row as { updatedAt: Date }).updatedAt.toISOString()
+        : null,
+  };
+}
+
 /** Creates or updates the manual cost for a product/variant. */
 export async function upsertManualCost(input: ManualCostInput): Promise<StoredManualCost> {
   requireDatabase();
