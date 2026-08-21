@@ -114,8 +114,38 @@ export interface AppConfig {
    * merchant may reasonably want the first without the second.
    */
   automationOnWebhook: boolean;
+  /**
+   * Largest absolute inventory change a normal write may make without the caller
+   * setting `confirmLargeChange: true`. Enforced SERVER-side; a frontend
+   * confirmation dialog is not a control, because anything reachable with curl
+   * has to be checked here too.
+   */
+  maxInventoryDelta: number;
+  retention: RetentionConfig;
   operator: OperatorConfig;
   shopify: ShopifyConfig;
+}
+
+/**
+ * How long each class of operational data is kept.
+ *
+ * Expressed here rather than hard-coded in the models so the policy is visible in
+ * one place and reviewable against docs/BACKUP_AND_RECOVERY.md. All are enforced
+ * by MongoDB TTL indexes rather than a cleanup job.
+ */
+export interface RetentionConfig {
+  /**
+   * Webhook delivery records, INCLUDING their payloads. Payloads can contain
+   * customer and order data, so they are deliberately not kept indefinitely.
+   */
+  webhookEventDays: number;
+  /** Idempotency keys. Long enough to cover a client retry storm, no longer. */
+  idempotencyKeyHours: number;
+  /**
+   * Operator audit entries. Longest retention by design: "who changed this
+   * price" must still be answerable months later.
+   */
+  auditLogDays: number;
 }
 
 export interface OperatorConfig {
@@ -195,6 +225,33 @@ function read(env: RawEnv, key: string): string | null {
   if (value === undefined) return null;
   const trimmed = value.trim();
   return trimmed.length === 0 ? null : trimmed;
+}
+
+/**
+ * Bounded integer, with a default.
+ *
+ * Out-of-range is an ERROR rather than a silent clamp: these values are safety
+ * limits and retention periods, and quietly substituting a different number than
+ * the operator wrote is how a guardrail ends up not being the one they think.
+ */
+function readInt(
+  env: RawEnv,
+  key: string,
+  options: { min: number; max: number; fallback: number },
+  errors: string[],
+): number {
+  const raw = read(env, key);
+  if (raw === null) return options.fallback;
+  if (!/^\d+$/.test(raw)) {
+    errors.push(`${key} must be a non-negative integer (received "${raw}").`);
+    return options.fallback;
+  }
+  const parsed = Number(raw);
+  if (parsed < options.min || parsed > options.max) {
+    errors.push(`${key} must be between ${options.min} and ${options.max}.`);
+    return options.fallback;
+  }
+  return parsed;
 }
 
 /**
@@ -659,6 +716,37 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     );
   }
 
+  // ---- MAX_INVENTORY_DELTA ------------------------------------------------
+  const maxInventoryDelta = readInt(
+    env,
+    'MAX_INVENTORY_DELTA',
+    { min: 1, max: 1_000_000, fallback: 500 },
+    errors,
+  );
+
+  // ---- Retention ----------------------------------------------------------
+  const retention: RetentionConfig = {
+    webhookEventDays: readInt(
+      env,
+      'RETENTION_WEBHOOK_EVENT_DAYS',
+      { min: 1, max: 365, fallback: 45 },
+      errors,
+    ),
+    idempotencyKeyHours: readInt(
+      env,
+      'RETENTION_IDEMPOTENCY_HOURS',
+      { min: 1, max: 720, fallback: 48 },
+      errors,
+    ),
+    auditLogDays: readInt(
+      env,
+      'RETENTION_AUDIT_DAYS',
+      // Floor of 30 days: a shorter audit trail would defeat its purpose.
+      { min: 30, max: 3650, fallback: 730 },
+      errors,
+    ),
+  };
+
   if (errors.length > 0) {
     return { config: null, errors, warnings };
   }
@@ -674,6 +762,8 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
       tokenEncryptionKey,
       automationEnabled,
       automationOnWebhook,
+      maxInventoryDelta,
+      retention,
       operator: {
         username: operatorUsername,
         passwordHash: operatorPasswordHash,

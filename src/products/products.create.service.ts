@@ -56,6 +56,24 @@ export interface ProductCreateResult {
   published: boolean;
   /** Set when publish was requested but failed; the product was left DRAFT. */
   publishError: string | null;
+  /**
+   * What the caller ASKED for, so a divergence from `status` is visible in the
+   * response instead of having to be inferred.
+   */
+  desiredStatus: string;
+  /**
+   * The ONLY field a UI may use to tell an operator customers can see this.
+   * Requires a verified ACTIVE status AND a verified sales-channel publication -
+   * never inferred from `status` alone, which is wrong in both directions.
+   */
+  visibleToCustomers: boolean;
+  /**
+   * True when the product EXISTS but did not reach the requested end state. The
+   * product is safe (DRAFT), but the operator has something left to finish.
+   */
+  partialSuccess: boolean;
+  /** Ordered, human-readable account of what did not go to plan. */
+  warnings: string[];
   /** Channels the product is on, when a publish was attempted. */
   publications: { publicationId: string; name: string; isPublished: boolean }[];
   /**
@@ -125,14 +143,38 @@ export async function createProduct(
     );
     const variantError = mapUserErrors(variants.data.productVariantsBulkCreate?.userErrors);
     if (variantError !== null) {
-      // The product exists but variants failed. Surface that honestly rather
-      // than pretending the whole create succeeded - the operator can retry
-      // variants or delete the draft.
-      throw new AppError(
-        variantError.code,
-        `Product ${product.id} was created as ${product.status}, but adding variants failed: ${variantError.message}`,
-        { details: variantError.details },
-      );
+      // The product EXISTS. Throwing here would orphan it: the caller would see a
+      // generic failure, never learn the id, and the draft would sit in Shopify
+      // with nobody tracking it. So this returns a partial success instead.
+      //
+      // It is also deliberately NOT published and NOT activated - its prices are
+      // Shopify's default, not the ones the operator entered, so putting it on
+      // sale would be worse than leaving it as a draft to fix.
+      const defaultId = product.variants?.edges?.[0]?.node.id ?? null;
+      logger.warn('Variant creation failed; leaving an unpublished draft.', {
+        shopifyProductId: product.id,
+        code: variantError.code,
+      });
+      return {
+        shopifyProductId: product.id,
+        title: product.title,
+        status: product.status,
+        desiredStatus: request.publish ? 'ACTIVE' : request.status,
+        variantsCreated: 0,
+        mediaAttached: media.length,
+        published: false,
+        publishError: null,
+        publications: [],
+        variants:
+          defaultId === null
+            ? []
+            : [{ shopifyVariantId: defaultId, sku: null, optionValues: [] }],
+        visibleToCustomers: false,
+        partialSuccess: true,
+        warnings: [
+          `The product was created but its variants could not be added (${variantError.code}: ${variantError.message}). It was left as a DRAFT with Shopify's default variant and was NOT published, because its prices are not the ones you entered. Fix the variants, then publish it.`,
+        ],
+      };
     }
     const created = variants.data.productVariantsBulkCreate?.productVariants ?? [];
     variantsCreated = created.length;
@@ -201,10 +243,30 @@ export async function createProduct(
     }
   }
 
+  // Both halves, verified. A product that is ACTIVE but on no sales channel is
+  // invisible, and one published while DRAFT is invisible too, so neither alone
+  // may be reported as visibility.
+  const visibleToCustomers = status === 'ACTIVE' && published;
+
+  const warnings: string[] = [];
+  if (publishError !== null) {
+    warnings.push(
+      `The product was created but could NOT be published (${publishError}). It has been left as a DRAFT and is not visible to customers. Retry publishing from the product page once the cause is fixed.`,
+    );
+  }
+  const desiredStatus = request.publish ? 'ACTIVE' : request.status;
+  if (publishError === null && status !== desiredStatus) {
+    warnings.push(
+      `The product was created but its status is ${status}, not the requested ${desiredStatus}.`,
+    );
+  }
+
   logger.info('Created Shopify product.', {
     shopifyProductId: product.id,
     status,
+    desiredStatus,
     published,
+    visibleToCustomers,
     publishError,
     variantsCreated,
     mediaAttached: media.length,
@@ -214,11 +276,15 @@ export async function createProduct(
     shopifyProductId: product.id,
     title: product.title,
     status,
+    desiredStatus,
     variantsCreated,
     mediaAttached: media.length,
     published,
     publishError,
     publications,
     variants: createdVariants,
+    visibleToCustomers,
+    partialSuccess: warnings.length > 0,
+    warnings,
   };
 }

@@ -25,9 +25,11 @@ import {
 } from '../shopify/graphql/product.mutations';
 import { shopifyGraphql } from '../shopify/shopify.client';
 import { mapUserErrors } from '../shopify/shopify.errors';
+import { getProduct } from '../shopify/shopify.service';
 import {
   buildProductUpdateInput,
   buildVariantBulkInput,
+  requiresConcurrencyCheck,
   type ProductEditRequest,
 } from './product.write';
 
@@ -45,10 +47,95 @@ export interface ProductEditResult {
 }
 
 /** Applies a validated edit to one product. */
+/**
+ * Refuses the edit if Shopify's current state differs from what the caller saw.
+ *
+ * Reads the product ONCE and checks every expectation together, so a stale form
+ * reports all of its conflicts at once rather than one per round trip.
+ *
+ * Only runs when the request actually supplied an expectation, so callers that do
+ * not want the guarantee are not charged an extra Shopify read for it.
+ */
+async function assertNotStale(
+  productGid: string,
+  request: ProductEditRequest,
+): Promise<void> {
+  if (!requiresConcurrencyCheck(request)) return;
+
+  const product = await getProduct(productGid);
+  const conflicts: {
+    field: string;
+    shopifyVariantId?: string;
+    expected: string;
+    actual: string;
+  }[] = [];
+
+  if (request.expectedStatus !== undefined && product.status !== request.expectedStatus) {
+    conflicts.push({
+      field: 'status',
+      expected: request.expectedStatus,
+      actual: product.status,
+    });
+  }
+
+  for (const variant of request.variants) {
+    if (variant.expectedPrice === undefined) continue;
+    const current = product.variants.find((v) => v.shopifyVariantId === variant.id);
+    if (current === undefined) {
+      // The variant is gone. Writing to it would fail anyway, but reporting it as
+      // a concurrency conflict is more accurate and more actionable than letting
+      // Shopify return a generic not-found.
+      conflicts.push({
+        field: 'price',
+        shopifyVariantId: variant.id,
+        expected: variant.expectedPrice,
+        actual: '(variant no longer exists)',
+      });
+      continue;
+    }
+    // Compared as 2dp strings; the request was normalised the same way, so this
+    // cannot fire on "20" vs "20.00".
+    const actual = current.price === null ? null : current.price.amount.toFixed(2);
+    if (actual !== variant.expectedPrice) {
+      conflicts.push({
+        field: 'price',
+        shopifyVariantId: variant.id,
+        expected: variant.expectedPrice,
+        actual: actual ?? '(no price)',
+      });
+    }
+  }
+
+  if (conflicts.length === 0) return;
+
+  const summary = conflicts
+    .map((conflict) =>
+      conflict.shopifyVariantId === undefined
+        ? `${conflict.field}: you saw ${conflict.expected}, Shopify now has ${conflict.actual}`
+        : `${conflict.field} on ${conflict.shopifyVariantId}: you saw ${conflict.expected}, Shopify now has ${conflict.actual}`,
+    )
+    .join('; ');
+
+  logger.info('Refused a stale product edit.', {
+    shopifyProductId: productGid,
+    conflictCount: conflicts.length,
+  });
+
+  throw new AppError(
+    'PRODUCT_CHANGED',
+    `This product changed in Shopify after you loaded it (${summary}). Nothing has been saved, because saving would overwrite the newer values. Refresh to see the current state, then re-apply your change.`,
+    { details: { shopifyProductId: productGid, conflicts } },
+  );
+}
+
 export async function editProduct(
   productGid: string,
   request: ProductEditRequest,
 ): Promise<ProductEditResult> {
+  // Before ANY write. A partially-applied stale edit is the worst outcome: some
+  // fields overwritten with old values and some not.
+  await assertNotStale(productGid, request);
+
   const applied = { fields: false, tagsAdded: 0, tagsRemoved: 0, variantsUpdated: 0 };
 
   // 1. Scalar fields + status.

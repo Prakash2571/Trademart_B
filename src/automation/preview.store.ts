@@ -25,6 +25,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import { AppError } from '../common/errors';
+import { stableStringify } from '../common/stableStringify';
 import type { AutomationRules } from './rules.types';
 
 /** How long a preview can be applied before it must be regenerated. */
@@ -67,16 +68,6 @@ export function computeRulesHash(rules: AutomationRules): string {
   return createHash('sha256').update(stableStringify(rules)).digest('hex');
 }
 
-function stableStringify(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
-  if (value !== null && typeof value === 'object') {
-    const entries = Object.keys(value as Record<string, unknown>)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`);
-    return `{${entries.join(',')}}`;
-  }
-  return JSON.stringify(value) ?? 'null';
-}
 
 /** Drops expired records so the map cannot grow without bound. */
 function prune(now: number): void {
