@@ -10,6 +10,8 @@
  * it, so "why did my price change?" is answerable after the fact.
  */
 
+import { createHash } from 'node:crypto';
+
 import type { ProductDto } from '../shopify/shopify.types';
 import type { CostSource, ManualCost } from '../suppliers/cost';
 import { decideVariantPrice, lowestCurrentMargin } from './price.rules';
@@ -217,4 +219,64 @@ export function buildAutomationPlan(
       truncated,
     },
   };
+}
+
+
+/**
+ * Deterministic hash of the CONCRETE action plan - the exact from->to changes,
+ * not the rules that produced them.
+ *
+ * This is what binds a preview to what the operator reviewed. Between preview and
+ * apply, the underlying Shopify or cost data can change so that the same rules now
+ * produce different moves (20.00->25.00 becomes 18.00->23.00). Comparing this hash
+ * catches that and refuses to apply a plan the operator never saw.
+ *
+ * Lives HERE, in the pure planning module, rather than in automation.service.ts.
+ * That is not cosmetic: automation.service imports the Shopify client and the Mongo
+ * models, which import the config singleton, and config/index.ts calls
+ * process.exit(1) when the environment is invalid. Hashing a plan is pure logic and
+ * must be testable without a configured Shopify store - otherwise the test process
+ * is killed at import time instead of an assertion failing.
+ *
+ * automation.service.ts re-exports it, so there is still exactly one
+ * implementation. Two copies of a safety hash drifting apart would produce
+ * PREVIEW_STALE rejections that nobody could explain.
+ *
+ * What is INCLUDED is deliberately minimal: only the fields that determine what
+ * gets written to Shopify. Titles, margins and reason strings are presentational -
+ * a retitled product is not a stale plan, and hashing them would produce false
+ * staleness. costSource is excluded for the same reason: at an identical resulting
+ * price the store write is byte-identical, so refusing the apply would be a false
+ * alarm. Provenance is still recorded on the run and in the audit trail.
+ */
+export function hashPlan(plan: AutomationPlan): string {
+  const normalized = plan.actions
+    .map((action) =>
+      action.type === 'price'
+        ? {
+            t: 'price',
+            p: action.shopifyProductId,
+            // The variant matters: repricing the wrong variant of a multi-variant
+            // product is a silent, customer-visible error.
+            v: action.shopifyVariantId,
+            // Formatted to 2dp so float noise (25 vs 25.000000000000004) cannot
+            // produce a different hash for an identical Shopify write.
+            from: action.from.toFixed(2),
+            to: action.to.toFixed(2),
+            c: action.currencyCode,
+          }
+        : {
+            t: 'visibility',
+            p: action.shopifyProductId,
+            v: null,
+            from: action.from,
+            to: action.to,
+            c: null,
+          },
+    )
+    // Sorted so ordering cannot affect the hash: Shopify pagination order is not
+    // guaranteed, so re-preparing the same plan can legitimately reorder actions.
+    // Without this, every apply would risk a spurious PREVIEW_STALE.
+    .sort((a, b) => `${a.t}:${a.p}:${a.v ?? ''}`.localeCompare(`${b.t}:${b.p}:${b.v ?? ''}`));
+  return createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
 }

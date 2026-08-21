@@ -10,8 +10,19 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { AppError } from '../common/errors';
-import { hasUsableCost, resolveCostSource, type CostInputs } from './cost';
+import {
+  COST_SOURCE_ORDER,
+  UNKNOWN_COST_POLICY,
+  hasUsableCost,
+  resolveCostSource,
+  type CostInputs,
+} from './cost';
 import { validateManualCostInput } from './manualCost.validate';
+import {
+  anySupplierCostApiAvailable,
+  describeSupplierCostSupport,
+} from './supplier.registry';
+import { tradelleProvider } from './tradelle/tradelle.provider';
 
 function money(amount: number, currencyCode = 'GBP') {
   return { amount, currencyCode, raw: amount.toFixed(2) };
@@ -253,5 +264,145 @@ describe('decideVariantPrice - cost source integration', () => {
     // price (12) caps a single run at 72 - the clamp guardrail still applies to
     // an override, which is correct.
     assert.equal(decision.kind === 'change' ? decision.to : null, 72);
+  });
+});
+
+
+describe('COST_SOURCE_ORDER', () => {
+  it('matches the documented hierarchy', () => {
+    assert.deepEqual(
+      [...COST_SOURCE_ORDER],
+      ['SUPPLIER_API', 'SHOPIFY_UNIT_COST', 'MANUAL', 'UNKNOWN'],
+    );
+  });
+
+  it('is the order resolveCostSource actually applies', () => {
+    // Walks the hierarchy by removing the winning tier one at a time. This is
+    // what stops /api/automation/status documenting an order the resolver does
+    // not implement - the exact drift that made the old costSource field wrong.
+    const all: CostInputs = {
+      supplierApiCost: money(10),
+      shopifyUnitCost: money(20),
+      manualCost: { amount: 30, currencyCode: 'GBP' },
+    };
+
+    assert.equal(resolveCostSource(all).source, COST_SOURCE_ORDER[0]);
+
+    const { supplierApiCost: _s, ...withoutSupplier } = all;
+    assert.equal(resolveCostSource(withoutSupplier).source, COST_SOURCE_ORDER[1]);
+
+    const { shopifyUnitCost: _u, ...withoutShopify } = withoutSupplier;
+    assert.equal(resolveCostSource(withoutShopify).source, COST_SOURCE_ORDER[2]);
+
+    assert.equal(resolveCostSource({}).source, COST_SOURCE_ORDER[3]);
+  });
+
+  it('lists UNKNOWN last, and it is a real outcome rather than an absence', () => {
+    assert.equal(COST_SOURCE_ORDER[COST_SOURCE_ORDER.length - 1], 'UNKNOWN');
+
+    const resolved = resolveCostSource({});
+    assert.equal(resolved.source, 'UNKNOWN');
+    // The guarantee UNKNOWN_COST_POLICY describes: null, never 0.
+    assert.equal(resolved.amount, null);
+    assert.equal(hasUsableCost(resolved), false);
+  });
+
+  it('states the unknown-cost policy as skipping automatic pricing', () => {
+    assert.equal(UNKNOWN_COST_POLICY, 'SKIP_AUTOMATIC_PRICING');
+  });
+});
+
+describe('describeSupplierCostSupport', () => {
+  it('reports Tradelle as having no supplier cost API', () => {
+    const support = describeSupplierCostSupport();
+    const tradelle = support.find((entry) => entry.providerName === 'TRADELLE');
+
+    if (tradelle === undefined) {
+      throw new Error('TRADELLE must be registered');
+    }
+    // The honesty requirement: the method exists and returns null, so the
+    // capability must NOT be advertised as available.
+    assert.equal(tradelle.supplierCostApi, false);
+    assert.equal(tradelle.shopifyIntegration, true);
+    assert.ok(
+      tradelle.limitation !== null && tradelle.limitation.length > 0,
+      'a false capability must explain itself',
+    );
+  });
+
+  it('does not infer capability from method existence', () => {
+    // tradelleProvider.getSupplierCost IS a function, but returns null.
+    assert.equal(typeof tradelleProvider.getSupplierCost, 'function');
+    assert.equal(tradelleProvider.capabilities.getSupplierCost, false);
+  });
+
+  it('reports no supplier cost API available across the whole registry', () => {
+    // Guards the `available: false` flag on the SUPPLIER_API tier in
+    // /api/automation/status. Flips automatically when a real provider lands.
+    assert.equal(anySupplierCostApiAvailable(), false);
+  });
+
+  it('returns null from the Tradelle cost lookup rather than inventing a number', async () => {
+    assert.equal(await tradelleProvider.getSupplierCost?.('gid://shopify/Product/1'), null);
+  });
+});
+
+
+describe('validateManualCostInput - frontend contract (canonical names)', () => {
+  // The exact body the ManualCostEditor / product-create flow send. These names
+  // (productId, amount, variantId, shippingCost) are the canonical contract;
+  // the validator originally read shopifyProductId/supplierProductCost, so every
+  // real PUT /costs failed with "supplierProductCost must be a number".
+  it('accepts productId + amount as the frontend sends them', () => {
+    const result = validateManualCostInput({
+      productId: '123',
+      amount: 12.5,
+      currencyCode: 'GBP',
+      override: true,
+      note: 'from the editor',
+    });
+    assert.equal(result.shopifyProductId, 'gid://shopify/Product/123');
+    assert.equal(result.supplierProductCost, 12.5);
+    assert.equal(result.override, true);
+    assert.equal(result.note, 'from the editor');
+  });
+
+  it('maps variantId to a variant GID', () => {
+    const result = validateManualCostInput({
+      productId: '123',
+      variantId: '456',
+      amount: 5,
+      currencyCode: 'GBP',
+    });
+    assert.equal(result.shopifyVariantId, 'gid://shopify/ProductVariant/456');
+  });
+
+  it('accepts shippingCost under its canonical name', () => {
+    const result = validateManualCostInput({
+      productId: '123',
+      amount: 5,
+      shippingCost: 2,
+      currencyCode: 'GBP',
+    });
+    assert.equal(result.supplierShippingCost, 2);
+  });
+
+  it('still rejects a zero amount sent by the frontend', () => {
+    assert.throws(
+      () => validateManualCostInput({ productId: '123', amount: 0, currencyCode: 'GBP' }),
+      (e: unknown) => e instanceof AppError && e.code === 'VALIDATION_ERROR',
+    );
+  });
+
+  it('prefers the canonical name when both are present', () => {
+    const result = validateManualCostInput({
+      productId: '123',
+      shopifyProductId: '999',
+      amount: 7,
+      supplierProductCost: 8,
+      currencyCode: 'GBP',
+    });
+    assert.equal(result.shopifyProductId, 'gid://shopify/Product/123');
+    assert.equal(result.supplierProductCost, 7);
   });
 });

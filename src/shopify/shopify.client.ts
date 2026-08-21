@@ -17,6 +17,7 @@ import { logger } from '../common/logger';
 import { config } from '../config';
 import { getTokenProvider } from './token';
 import type { ShopifyTokenProvider, TokenDiagnostics } from './token/token.types';
+import { recordShopifyOutcome } from './shopify.breaker';
 import {
   mapGraphqlErrors,
   mapHttpFailure,
@@ -147,11 +148,40 @@ async function executeOnce<T>(
 /**
  * Runs a GraphQL operation against the Admin API, retrying only failures that
  * can plausibly succeed on a second attempt.
+ *
+ * Reports the FINAL outcome to the circuit breaker. Deliberately final and not
+ * per-attempt: an operation that was throttled once and then succeeded is not a
+ * degraded dependency, it is the retry logic doing its job, and counting the
+ * intermediate failure would trip the breaker during normal throttled operation.
+ * One breaker failure therefore means "an operation failed even after all its
+ * retries", which is the signal worth pausing bulk writes over.
+ *
+ * Reads report outcomes too, even though reads are never blocked. They are the
+ * majority of traffic, so they detect a degraded Shopify soonest, and the breaker
+ * only ever gates bulk writes - so there is no cost to letting them inform it.
  */
 export async function shopifyGraphql<T>(
   query: string,
   variables: Record<string, unknown> = {},
   meta: { operation: string } = { operation: 'anonymous' },
+): Promise<GraphqlResult<T>> {
+  try {
+    const result = await executeWithRetries<T>(query, variables, meta);
+    recordShopifyOutcome({ ok: true });
+    return result;
+  } catch (error) {
+    recordShopifyOutcome({
+      ok: false,
+      code: error instanceof AppError ? error.code : undefined,
+    });
+    throw error;
+  }
+}
+
+async function executeWithRetries<T>(
+  query: string,
+  variables: Record<string, unknown>,
+  meta: { operation: string },
 ): Promise<GraphqlResult<T>> {
   const provider = requireTokenProvider();
   const shopDomain = config.shopify.storeDomain;

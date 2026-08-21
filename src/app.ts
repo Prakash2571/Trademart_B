@@ -31,16 +31,25 @@ import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 
 import { errorHandler, notFoundHandler } from './common/errorHandler';
+import { httpLogger } from './common/httpLogger';
+import { REQUEST_ID_HEADER, requestIdMiddleware } from './common/requestId';
+import { helmetOptions } from './common/securityHeaders';
 import { analyticsRouter } from './analytics/analytics.controller';
 import { automationRouter } from './automation/automation.controller';
 import { oauthRouter } from './auth/oauth.controller';
 import { operatorRouter } from './auth/operator/operator.controller';
 import {
+  requireOperator,
   requireOperatorForReads,
   requireOperatorForWrites,
 } from './auth/operator/operator.middleware';
+import { auditRouter } from './audit/audit.controller';
 import { config } from './config';
 import { customersRouter } from './customers/customers.controller';
+import {
+  diagnosticsRouter,
+  publicDiagnosticsRouter,
+} from './diagnostics/diagnostics.controller';
 import { healthRouter } from './health/health.controller';
 import { inventoryRouter } from './inventory/inventory.controller';
 import { inventoryWriteRouter } from './inventory/inventory.write.controller';
@@ -48,6 +57,10 @@ import { ordersRouter } from './orders/orders.controller';
 import { pricingRouter } from './pricing/pricing.controller';
 import { productsRouter } from './products/products.controller';
 import { productsWriteRouter } from './products/products.write.controller';
+import {
+  publicationsRouter,
+  publicationsWriteRouter,
+} from './shopify/publications/publications.controller';
 import { shopifyRouter } from './shopify/shopify.controller';
 import { themesRouter } from './shopify/themes/themes.controller';
 import { manualCostRouter } from './suppliers/manualCost.controller';
@@ -65,7 +78,17 @@ export function createApp(): Express {
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
 
-  app.use(helmet());
+  // FIRST, before anything that can fail. Every log line, error body and audit
+  // row produced while serving this request needs the correlation id - including
+  // failures raised inside body parsing, CORS and rate limiting below.
+  app.use(requestIdMiddleware());
+  app.use(httpLogger());
+
+  // Restrictive CSP is safe here because this app serves ONLY JSON: nginx routes
+  // `/` and `/_next/static/` to the Next.js container and only `/api/` here, so
+  // these directives can never apply to the UI. The frontend's own CSP is a
+  // separate concern and is NOT set from this process.
+  app.use(helmet(helmetOptions()));
 
   // Only the configured frontend origin may call this API from a browser.
   //
@@ -83,9 +106,22 @@ export function createApp(): Express {
       // /api/automation/rules, which existed but was unreachable from a browser
       // because preflight rejected the method).
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'X-CSRF-Token', 'Authorization'],
+      // Idempotency-Key and X-Request-ID must be listed or the browser preflight
+      // rejects them, which would silently disable both features for every
+      // cross-origin request from the console.
+      allowedHeaders: [
+        'Content-Type',
+        'X-CSRF-Token',
+        'Authorization',
+        'Idempotency-Key',
+        REQUEST_ID_HEADER,
+      ],
       credentials: true,
       maxAge: 86400,
+      // Lets the browser READ the correlation id off the response, so the UI can
+      // show an id the operator can quote. Without this a cross-origin fetch
+      // cannot see the header at all and it would be backend-only.
+      exposedHeaders: [REQUEST_ID_HEADER],
     }),
   );
 
@@ -110,8 +146,13 @@ export function createApp(): Express {
   );
 
   // Health stays public: an uptime probe must not need a credential, and it
-  // reports only booleans and connection state.
+  // reports only booleans and connection state. /health/live is the container
+  // liveness probe; /health/ready is for a load balancer or a deploy gate.
   app.use('/api', healthRouter);
+
+  // Also public: build identity only (version, commit, build time), all of which
+  // is in the repository anyway. A deploy check has to read it before sign-in.
+  app.use('/api', publicDiagnosticsRouter);
 
   // Operator sign-in. NOT behind requireOperator - you cannot authenticate if
   // authenticating requires being authenticated.
@@ -141,6 +182,10 @@ export function createApp(): Express {
   // Product EDIT (PATCH). Separate router behind the write guard so mutations
   // always require an operator, while the read router above can stay open.
   app.use('/api/shopify', requireOperatorForWrites, productsWriteRouter);
+  // Publication (sales-channel) reads stay open like other reads; publish /
+  // unpublish are mutations behind the write guard.
+  app.use('/api/shopify', requireOperatorForReads, publicationsRouter);
+  app.use('/api/shopify', requireOperatorForWrites, publicationsWriteRouter);
   app.use('/api/shopify', requireOperatorForReads, ordersRouter);
   app.use('/api/shopify', requireOperatorForReads, customersRouter);
   app.use('/api/shopify', requireOperatorForReads, inventoryRouter);
@@ -156,6 +201,13 @@ export function createApp(): Express {
   // Manual supplier costs: GET is a read, PUT/DELETE are operator-protected
   // writes. Mounted with the write guard, which leaves GET open by default.
   app.use('/api', requireOperatorForWrites, manualCostRouter);
+  // The audit trail is a read, but a privileged one: it records who changed what.
+  // Always behind the full operator requirement, never the writes-only guard, so
+  // it cannot be read anonymously even with OPERATOR_PROTECT_READS left at false.
+  app.use('/api', requireOperator, auditRouter);
+  // Integrity findings name products and their visibility, so they follow the
+  // normal read guard.
+  app.use('/api', requireOperatorForReads, diagnosticsRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

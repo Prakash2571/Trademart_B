@@ -140,3 +140,48 @@ export const INVENTORY_SET_QUANTITIES_MUTATION = /* GraphQL */ `
     }
   }
 `;
+
+
+/**
+ * Current quantity for one inventory item at one location.
+ *
+ * Read BEFORE any stock write, for two reasons that both need the real current
+ * value rather than a guess:
+ *
+ *   1. the size of the change can be capped (MAX_INVENTORY_DELTA) - which is
+ *      impossible to enforce without knowing what it is changing FROM;
+ *   2. the audit entry can record the previous quantity, so a stock correction is
+ *      reversible.
+ *
+ * `inventoryLevel(locationId:)` returns null when the item is not stocked at that
+ * location, which is itself worth knowing: setting a quantity there would fail,
+ * and saying so up front is better than surfacing a Shopify userError.
+ */
+export const INVENTORY_LEVEL_QUERY = /* GraphQL */ `
+  query TrademartInventoryLevel($inventoryItemId: ID!, $locationId: ID!) {
+    inventoryItem(id: $inventoryItemId) {
+      id
+      sku
+      tracked
+      variant {
+        id
+        title
+        product {
+          id
+          title
+        }
+      }
+      inventoryLevel(locationId: $locationId) {
+        id
+        location {
+          id
+          name
+        }
+        quantities(names: ["available", "on_hand"]) {
+          name
+          quantity
+        }
+      }
+    }
+  }
+`;

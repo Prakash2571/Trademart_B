@@ -110,6 +110,31 @@ in_certbot() {
 # --- 1. build ----------------------------------------------------------------
 if [ "$SKIP_BUILD" -eq 0 ]; then
   step "Building backend and frontend images"
+
+  # Stamp the images with what they were built FROM, so GET /api/version can
+  # answer "is this container running the code I think it is?". Derived here
+  # rather than inside the Dockerfile because the build context carries no .git
+  # directory into the image.
+  #
+  # Exported so Compose interpolates them into the build args. Each falls back to
+  # a placeholder rather than failing: not being in a git checkout is a legitimate
+  # way to deploy, and it must not block a build.
+  # sed, not `node -p`: the deploy host needs Docker, not a Node runtime, and
+  # requiring one here would break the stamp on an otherwise fine host.
+  APP_VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' ../package.json | head -1)"
+  [ -n "$APP_VERSION" ] || APP_VERSION=unknown
+  GIT_SHA="$(git -C .. rev-parse HEAD 2>/dev/null || echo unknown)"
+  BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  export APP_VERSION GIT_SHA BUILD_TIME
+
+  # A dirty tree would otherwise be reported as a clean commit, which is the one
+  # answer worse than "unknown" - it names a commit that is not what is running.
+  if ! git -C .. diff --quiet 2>/dev/null || ! git -C .. diff --cached --quiet 2>/dev/null; then
+    GIT_SHA="${GIT_SHA}-dirty"
+    export GIT_SHA
+  fi
+
+  ok "stamping version ${APP_VERSION}, commit ${GIT_SHA}"
   docker compose build
   ok "images built"
 else

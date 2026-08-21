@@ -30,6 +30,18 @@ export interface VariantPriceUpdate {
   price?: string;
   /** New compare-at price, null to CLEAR it, or undefined to leave unchanged. */
   compareAtPrice?: string | null;
+  /**
+   * The price the caller believes is CURRENTLY set, as a decimal string.
+   *
+   * When supplied, the edit is refused with PRODUCT_CHANGED if Shopify disagrees.
+   * This is the fix for the stale-tab problem: the operator opened the product at
+   * 20.00, somebody changed it to 23.00 in the Shopify admin, and saving 21.00
+   * from the old page would silently discard the 23.00.
+   *
+   * Normalised through the same priceString() as `price`, so comparing "20"
+   * against "20.00" cannot report a difference that does not exist.
+   */
+  expectedPrice?: string;
 }
 
 export interface ProductEditRequest {
@@ -37,6 +49,26 @@ export interface ProductEditRequest {
   addTags: string[];
   removeTags: string[];
   variants: VariantPriceUpdate[];
+  /**
+   * The product status the caller believes is currently set.
+   *
+   * Worth guarding for the same reason as price: status is half of whether
+   * customers can see the product, so overwriting a newer value is expensive.
+   */
+  expectedStatus?: ProductStatus;
+}
+
+/**
+ * True when this edit asks for any stale-data check.
+ *
+ * Used to decide whether the current state needs reading before writing - the
+ * extra Shopify query is only worth paying for when there is something to compare.
+ */
+export function requiresConcurrencyCheck(request: ProductEditRequest): boolean {
+  return (
+    request.expectedStatus !== undefined ||
+    request.variants.some((variant) => variant.expectedPrice !== undefined)
+  );
 }
 
 const MAX_TITLE = 255;
@@ -144,6 +176,12 @@ function validateVariants(raw: unknown): VariantPriceUpdate[] {
           : priceString(v['compareAtPrice'], 'variant compareAtPrice');
     }
 
+    if (v['expectedPrice'] !== undefined && v['expectedPrice'] !== null) {
+      // Normalised the same way as `price` so a comparison of "20" against
+      // "20.00" does not report a spurious conflict.
+      update.expectedPrice = priceString(v['expectedPrice'], 'variant expectedPrice');
+    }
+
     if (update.price === undefined && update.compareAtPrice === undefined) {
       throw new AppError(
         'VALIDATION_ERROR',
@@ -212,6 +250,18 @@ export function validateProductEdit(body: Record<string, unknown>): ProductEditR
   const removeTags = validateTags(body['removeTags'], 'removeTags');
   const variants = validateVariants(body['variants']);
 
+  let expectedStatus: ProductStatus | undefined;
+  if (body['expectedStatus'] !== undefined && body['expectedStatus'] !== null) {
+    const raw = String(body['expectedStatus']).toUpperCase();
+    if (!(STATUSES as readonly string[]).includes(raw)) {
+      throw new AppError(
+        'VALIDATION_ERROR',
+        `expectedStatus must be one of ${STATUSES.join(', ')}.`,
+      );
+    }
+    expectedStatus = raw as ProductStatus;
+  }
+
   const nothingToDo =
     Object.keys(fields).length === 0 &&
     addTags.length === 0 &&
@@ -224,7 +274,9 @@ export function validateProductEdit(body: Record<string, unknown>): ProductEditR
     );
   }
 
-  return { fields, addTags, removeTags, variants };
+  const request: ProductEditRequest = { fields, addTags, removeTags, variants };
+  if (expectedStatus !== undefined) request.expectedStatus = expectedStatus;
+  return request;
 }
 
 /**

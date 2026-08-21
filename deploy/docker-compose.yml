@@ -44,6 +44,17 @@ services:
       context: ..
       dockerfile: Dockerfile
       target: runtime
+      args:
+        # Build identity for GET /api/version, so a running container can be
+        # matched to the commit it was built from. Without these it reports
+        # "unknown", which makes "is this actually my fix?" unanswerable - and a
+        # locally built stack cannot be identified by package version alone.
+        #
+        # start.sh populates these from git; the defaults keep a bare
+        # `docker compose build` working outside a checkout.
+        APP_VERSION: ${APP_VERSION:-unknown}
+        GIT_SHA: ${GIT_SHA:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-}
     image: trademart-backend:${IMAGE_TAG:-latest}
     <<: *defaults
     environment:
@@ -52,7 +63,11 @@ services:
 
       # Sole CORS origin accepted by the API. Must match the public origin
       # exactly, no trailing slash.
-      FRONTEND_URL: ${FRONTEND_URL:?set FRONTEND_URL in deploy/.env}
+      #
+      # Derived from DOMAIN, because nginx serves the browser app at
+      # https://${DOMAIN} in every configuration this stack supports. Set
+      # FRONTEND_URL explicitly only to override that.
+      FRONTEND_URL: ${FRONTEND_URL:-https://${DOMAIN}}
 
       # Required when NODE_ENV=production - the process exits 1 without it.
       # Point this at MongoDB Atlas (mongodb+srv://...) or any external server.
@@ -60,10 +75,18 @@ services:
       MONGODB_URI: ${MONGODB_URI:?set MONGODB_URI in deploy/.env}
 
       # This backend's own PUBLIC origin, as Shopify reaches it. Distinct from
-      # FRONTEND_URL (the browser app). Required for the OAuth redirect flow and
-      # for registering webhooks - Shopify cannot reach an internal service name.
-      # Normally https://<your DOMAIN>; left blank disables both features.
-      APP_URL: ${APP_URL:-}
+      # FRONTEND_URL semantically, though nginx serves both from one origin.
+      # Required for the OAuth redirect flow and for registering webhooks -
+      # Shopify cannot reach an internal service name.
+      #
+      # DERIVED from DOMAIN rather than defaulting to empty. An empty APP_URL is
+      # silently destructive: it disables OAuth and makes
+      # POST /api/webhooks/register fail, with nothing in the logs to say a
+      # variable was missing. Since nginx already proxies /api on
+      # https://${DOMAIN}, that value is correct for every supported layout, so
+      # there is no reason to make the operator restate it and no reason for the
+      # blank case to exist.
+      APP_URL: ${APP_URL:-https://${DOMAIN}}
 
       SHOPIFY_STORE_DOMAIN: ${SHOPIFY_STORE_DOMAIN:?set SHOPIFY_STORE_DOMAIN in deploy/.env}
       SHOPIFY_API_VERSION: ${SHOPIFY_API_VERSION:-2026-07}
@@ -71,6 +94,13 @@ services:
       SHOPIFY_CLIENT_SECRET: ${SHOPIFY_CLIENT_SECRET:-}
       SHOPIFY_ACCESS_TOKEN: ${SHOPIFY_ACCESS_TOKEN:-}
       SHOPIFY_WEBHOOK_SECRET: ${SHOPIFY_WEBHOOK_SECRET:-}
+
+      # Store-safety mode. Advisory: dev/test/seed/smoke TOOLING refuses to
+      # mutate a non-development store unless ALLOW_LIVE_STORE_WRITES=true.
+      # Normal operator actions are unaffected. Shopify's real isDevelopmentStore
+      # overrides this when known.
+      SHOPIFY_STORE_MODE: ${SHOPIFY_STORE_MODE:-}
+      ALLOW_LIVE_STORE_WRITES: ${ALLOW_LIVE_STORE_WRITES:-false}
 
       # Scopes requested by the OAuth redirect flow. Ignored under Shopify-managed
       # installation, where shopify.app.toml is the source of truth.

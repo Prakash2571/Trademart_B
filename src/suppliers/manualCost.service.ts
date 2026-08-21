@@ -27,14 +27,28 @@ function requireDatabase(): void {
   }
 }
 
+/**
+ * The API shape for a stored manual cost.
+ *
+ * Uses `amount`/`shippingCost`/`override` — the names the frontend consumes —
+ * mapped from the model's supplierProductCost/supplierShippingCost/manualOverride.
+ * The previous shape exposed the raw model names with no `amount` or `override`,
+ * so the UI read `undefined` for both and showed no cost and no override state.
+ * Provenance the pricing layer needs travels with every record: source,
+ * provider, currency and updatedAt (the "fetchedAt" for a manual entry).
+ */
 export interface StoredManualCost {
   shopifyProductId: string;
   shopifyVariantId: string | null;
   provider: string;
-  supplierProductCost: number | null;
-  supplierShippingCost: number | null;
+  /** Supplier product cost. Always positive for a MANUAL row. */
+  amount: number;
+  /** Supplier shipping cost, or null when not entered. */
+  shippingCost: number | null;
   currencyCode: string | null;
   costSource: string;
+  /** Whether this hand-entered value overrides Shopify's cost per item. */
+  override: boolean;
   note: string | null;
   updatedAt: string | null;
 }
@@ -51,23 +65,51 @@ export async function listManualCosts(
   if (shopifyProductId !== undefined) filter['shopifyProductId'] = shopifyProductId;
 
   const rows = await SupplierProductModel.find(filter).sort({ updatedAt: -1 }).lean();
-  return rows.map((row) => ({
-    shopifyProductId: row.shopifyProductId,
-    shopifyVariantId: row.shopifyVariantId ?? null,
-    provider: row.provider,
-    supplierProductCost: row.supplierProductCost ?? null,
-    supplierShippingCost: row.supplierShippingCost ?? null,
-    currencyCode: row.currencyCode ?? null,
-    costSource: row.costSource,
-    note: (row as { note?: string | null }).note ?? null,
-    updatedAt:
-      (row as { updatedAt?: Date }).updatedAt instanceof Date
-        ? (row as { updatedAt: Date }).updatedAt.toISOString()
-        : null,
-  }));
+  return (
+    rows
+      // A MANUAL row always has a positive product cost (enforced on write); a
+      // null one is malformed and is skipped rather than surfaced as amount 0.
+      .filter((row) => row.supplierProductCost != null)
+      .map((row) => ({
+        shopifyProductId: row.shopifyProductId,
+        shopifyVariantId: row.shopifyVariantId ?? null,
+        provider: row.provider,
+        amount: row.supplierProductCost as number,
+        shippingCost: row.supplierShippingCost ?? null,
+        currencyCode: row.currencyCode ?? null,
+        costSource: row.costSource,
+        override: (row as { manualOverride?: boolean }).manualOverride === true,
+        note: (row as { note?: string | null }).note ?? null,
+        updatedAt:
+          (row as { updatedAt?: Date }).updatedAt instanceof Date
+            ? (row as { updatedAt: Date }).updatedAt.toISOString()
+            : null,
+      }))
+  );
 }
 
 /** Creates or updates the manual cost for a product/variant. */
+/**
+ * Reads one stored manual cost, or null.
+ *
+ * Exists so a write can record what the value WAS before changing it. A manual
+ * cost is a hand-entered number that exists nowhere else - not in Shopify, not
+ * with the supplier - so without a `before` value an audit entry cannot make the
+ * change reversible.
+ *
+ * Returns null rather than throwing when there is no database: the caller is
+ * about to fail on its own write anyway, and an audit lookup must never be the
+ * thing that reports the problem.
+ */
+export async function findManualCost(
+  shopifyProductId: string,
+  shopifyVariantId: string | null,
+): Promise<StoredManualCost | null> {
+  if (getDatabaseStatus().status !== 'connected') return null;
+  const all = await listManualCosts(shopifyProductId);
+  return all.find((row) => row.shopifyVariantId === shopifyVariantId) ?? null;
+}
+
 export async function upsertManualCost(input: ManualCostInput): Promise<StoredManualCost> {
   requireDatabase();
 
@@ -103,17 +145,21 @@ export async function upsertManualCost(input: ManualCostInput): Promise<StoredMa
     override: input.override,
   });
 
-  const [stored] = await listManualCosts(input.shopifyProductId);
-  // updateOne + re-read keeps one code path for the returned shape.
+  // Re-read so the returned shape comes from one code path. Match on the
+  // specific variant, since a product can have several manual-cost rows.
+  const stored = (await listManualCosts(input.shopifyProductId)).find(
+    (row) => row.shopifyVariantId === input.shopifyVariantId,
+  );
   return (
     stored ?? {
       shopifyProductId: input.shopifyProductId,
       shopifyVariantId: input.shopifyVariantId,
       provider: input.provider,
-      supplierProductCost: input.supplierProductCost,
-      supplierShippingCost: input.supplierShippingCost,
+      amount: input.supplierProductCost,
+      shippingCost: input.supplierShippingCost,
       currencyCode: input.currencyCode,
       costSource: 'MANUAL',
+      override: input.override,
       note: input.note,
       updatedAt: new Date().toISOString(),
     }
@@ -160,10 +206,24 @@ export async function loadManualCostMap(
   const productLevel = new Map<string, ManualCost>();
   const variantLevel = new Map<string, ManualCost>();
   for (const row of rows) {
-    if (row.supplierProductCost === null || row.currencyCode === null) continue;
+    // `== null` (not `=== null`) so both null AND undefined are excluded: a
+    // lean() row types these optional fields as `number | null | undefined`,
+    // and `=== null` alone left `undefined`, which is not assignable to
+    // ManualCost.amount/currencyCode (the real tsc build caught this; the
+    // types-stripped local compile did not).
+    if (row.supplierProductCost == null || row.currencyCode == null) continue;
     const cost: ManualCost = {
       amount: row.supplierProductCost,
       currencyCode: row.currencyCode,
+      // Carried through to the pricing engine. This was previously DROPPED here,
+      // which was a silent margin bug: an operator could record 100 of shipping
+      // against a variant and automation would price the product as though shipping
+      // were free, overstating every margin - including the minimum-margin floor
+      // that is supposed to stop a loss-making price.
+      //
+      // `?? null` and not `?? 0`: no recorded shipping means UNKNOWN, and the
+      // difference is the whole point.
+      shippingCost: row.supplierShippingCost ?? null,
       updatedAt:
         (row as { updatedAt?: Date }).updatedAt instanceof Date
           ? (row as { updatedAt: Date }).updatedAt.toISOString()

@@ -5,6 +5,8 @@
  * is passed through a redactor before printing.
  */
 
+import { getContext } from './requestContext';
+
 const SECRET_PATTERNS: RegExp[] = [
   /shpat_[A-Za-z0-9]+/g, // Admin API access token
   /shpss_[A-Za-z0-9]+/g, // app secret
@@ -13,7 +15,11 @@ const SECRET_PATTERNS: RegExp[] = [
   /mongodb(\+srv)?:\/\/[^\s"']*/g, // connection strings embed credentials
 ];
 
-const SECRET_KEY = /(token|secret|password|authorization|apikey|api_key|credential)/i;
+// Field names whose values are never printed. Matched on the KEY as well as the
+// value shape, so a newly-added field called `clientSecret` or `encryptionKey` is
+// redacted without anyone remembering to update this list.
+const SECRET_KEY =
+  /(token|secret|password|passwordhash|authorization|apikey|api_key|credential|cookie|session|encryptionkey)/i;
 
 export function redact(value: string): string {
   return SECRET_PATTERNS.reduce(
@@ -41,11 +47,21 @@ function redactMeta(meta: Record<string, unknown>): Record<string, unknown> {
 type Level = 'debug' | 'info' | 'warn' | 'error';
 
 function emit(level: Level, message: string, meta?: Record<string, unknown>): void {
+  const context = getContext();
   const line: Record<string, unknown> = {
     level,
+    // Always UTC. A server whose local timezone leaked into timestamps makes
+    // correlating with Shopify's own timestamps needlessly hard.
     time: new Date().toISOString(),
     message: redact(message),
   };
+  // Correlation fields land on every line without any caller passing them, which
+  // is what makes one X-Request-ID span nginx -> backend -> Shopify -> audit.
+  if (context !== undefined) {
+    line['requestId'] = context.requestId;
+    if (context.source !== 'http') line['source'] = context.source;
+    if (context.actor !== null) line['actor'] = context.actor;
+  }
   if (meta && Object.keys(meta).length > 0) {
     Object.assign(line, redactMeta(meta));
   }

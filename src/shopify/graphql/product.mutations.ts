@@ -178,6 +178,10 @@ export const PRODUCT_VARIANTS_BULK_CREATE_MUTATION = /* GraphQL */ `
         id
         price
         sku
+        selectedOptions {
+          name
+          value
+        }
       }
       userErrors {
         field

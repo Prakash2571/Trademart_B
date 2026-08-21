@@ -115,6 +115,30 @@ export interface PriceRules {
   /** Maximum single-run price decrease, as a percentage of the current price. */
   maxDecreasePercentage: number;
   /**
+   * Refuse to price a variant whose supplier SHIPPING cost is unknown.
+   *
+   * Default false, which preserves the existing behaviour: price from the product
+   * cost alone and state clearly that the margin is an upper bound. Most stores
+   * have no per-variant shipping recorded, so defaulting this on would stop
+   * automation pricing anything.
+   *
+   * Turn it on when margins are thin enough that shipping decides whether an order
+   * is profitable - which is most dropshipping. Distinct from requireKnownCost,
+   * which is about the PRODUCT cost.
+   */
+  requireKnownShippingCost: boolean;
+  /**
+   * Absolute minimum contribution per unit, in the store's currency.
+   *
+   * A percentage floor alone is not enough: 15% of a 3.00 item is 45p, which does
+   * not cover a single support email or one return. This is the "do not bother"
+   * threshold, and it is checked in ADDITION to minMarginPercentage - whichever
+   * binds harder wins.
+   *
+   * 0 disables it.
+   */
+  minimumProfitAmount: number;
+  /**
    * Ignore price differences smaller than this, in currency units. Prevents a
    * pointless write (and a pointless audit row) for a half-penny drift.
    */
@@ -159,6 +183,30 @@ export interface AutomationRules {
 }
 
 /**
+ * The tag vocabulary automation reads and writes.
+ *
+ * Declared above DEFAULT_AUTOMATION_RULES so the defaults can reference them
+ * instead of repeating the literals. Two copies of 'trademart:no-automation' is
+ * exactly the sort of thing that gets typo'd into a silently-ineffective opt-out.
+ */
+
+/** Tag automation applies when it hides a product, so it knows what it owns. */
+export const AUTOMATION_HIDDEN_TAG = 'trademart:auto-hidden';
+
+/**
+ * Tag applied to a newly imported product that is being held back for review.
+ * Distinct from AUTOMATION_HIDDEN_TAG so "never shown yet" is not confused with
+ * "was live, then went out of stock".
+ */
+export const AUTOMATION_REVIEW_TAG = 'trademart:needs-review';
+
+/** The permanent opt-out: automation never touches a product carrying this. */
+export const NO_AUTOMATION_TAG = 'trademart:no-automation';
+
+/** A product whose price a human manages by hand. */
+export const MANUAL_PRICING_TAG = 'trademart:manual';
+
+/**
  * Deliberately cautious defaults.
  *
  * Visibility is on (low risk, reversible) while price writing is OFF, so
@@ -188,6 +236,15 @@ export const DEFAULT_AUTOMATION_RULES: AutomationRules = {
     maxDecreasePercentage: 20,
     minChangeAmount: 0.05,
     requireKnownCost: true,
+    // False so this does not change how existing stores behave. Most have no
+    // per-variant shipping recorded, and defaulting it on would stop automation
+    // pricing anything at all. When shipping is unknown the plan says so, loudly,
+    // and states that the margin is an upper bound.
+    requireKnownShippingCost: false,
+    // 0 = disabled, so behaviour is unchanged until an operator sets a figure.
+    // Turning it on by default would need a number, and any number picked here
+    // would be wrong for some store's currency and price points.
+    minimumProfitAmount: 0,
   },
   selection: {
     mode: 'all',
@@ -195,19 +252,9 @@ export const DEFAULT_AUTOMATION_RULES: AutomationRules = {
     includeVendors: [],
     newProductPolicy: 'draft',
   },
-  exemptTags: ['trademart:manual', 'trademart:no-automation'],
+  exemptTags: [MANUAL_PRICING_TAG, NO_AUTOMATION_TAG],
   maxItemsPerRun: 50,
 };
-
-/** Tag automation applies when it hides a product, so it knows what it owns. */
-export const AUTOMATION_HIDDEN_TAG = 'trademart:auto-hidden';
-
-/**
- * Tag applied to a newly imported product that is being held back for review.
- * Distinct from AUTOMATION_HIDDEN_TAG so "never shown yet" is not confused with
- * "was live, then went out of stock".
- */
-export const AUTOMATION_REVIEW_TAG = 'trademart:needs-review';
 
 const PRICING_MODES: readonly PricingMode[] = ['margin', 'multiplier', 'fixed_uplift'];
 const SELECTION_MODES: readonly SelectionMode[] = ['all', 'tagged', 'vendor'];
@@ -289,6 +336,13 @@ export function validateAutomationRules(rules: AutomationRules): string[] {
   if (price.minChangeAmount < 0) {
     problems.push('minChangeAmount must not be negative.');
   }
+  if (!Number.isFinite(price.minimumProfitAmount) || price.minimumProfitAmount < 0) {
+    problems.push('minimumProfitAmount must be zero or a positive amount (0 disables it).');
+  }
+  // NOTE: there is deliberately no target-vs-floor check here. It already exists
+  // above, correctly scoped to `pricingMode === 'margin'` - in multiplier and
+  // fixed_uplift modes targetMarginPercentage is not read at all, so validating it
+  // there would reject a configuration that works perfectly well.
   if (!Number.isInteger(rules.maxItemsPerRun) || rules.maxItemsPerRun < 1) {
     problems.push('maxItemsPerRun must be a positive integer.');
   }

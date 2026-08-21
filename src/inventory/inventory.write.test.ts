@@ -10,7 +10,11 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { AppError } from '../common/errors';
-import { buildInventorySetInput, validateInventorySet } from './inventory.write';
+import {
+  assessInventoryChange,
+  buildInventorySetInput,
+  validateInventorySet,
+} from './inventory.write';
 
 const base = {
   inventoryItemId: 'gid://shopify/InventoryItem/1',
@@ -77,5 +81,88 @@ describe('buildInventorySetInput', () => {
         quantity: 10,
       },
     ]);
+  });
+});
+
+describe('validateInventorySet - stale-write and large-change fields', () => {
+  it('defaults confirmLargeChange to false', () => {
+    // The guardrail must be opt-OUT, not opt-in.
+    assert.equal(validateInventorySet({ ...base }).confirmLargeChange, false);
+  });
+
+  it('accepts expectedQuantity for stale-write detection', () => {
+    assert.equal(validateInventorySet({ ...base, expectedQuantity: 7 }).expectedQuantity, 7);
+  });
+
+  it('rejects a non-integer or negative expectedQuantity', () => {
+    assert.throws(
+      () => validateInventorySet({ ...base, expectedQuantity: 1.5 }),
+      (e: unknown) => e instanceof AppError && e.code === 'VALIDATION_ERROR',
+    );
+    assert.throws(() => validateInventorySet({ ...base, expectedQuantity: -1 }));
+  });
+
+  it('rejects a non-boolean confirmLargeChange rather than treating it as truthy', () => {
+    // 'yes' being read as true would silently disable the cap.
+    assert.throws(
+      () => validateInventorySet({ ...base, confirmLargeChange: 'yes' }),
+      (e: unknown) => e instanceof AppError && e.code === 'VALIDATION_ERROR',
+    );
+  });
+});
+
+describe('assessInventoryChange', () => {
+  const request = (overrides: Record<string, unknown> = {}) =>
+    validateInventorySet({ ...base, ...overrides });
+
+  it('allows a change within the limit', () => {
+    const result = assessInventoryChange(100, request({ quantity: 150 }), 500);
+    assert.equal(result.delta, 50);
+    assert.equal(result.requiresConfirmation, false);
+    assert.equal(result.allowed, true);
+  });
+
+  it('measures the delta absolutely, so a big DECREASE is caught too', () => {
+    // Writing stock down to zero is at least as consequential as writing it up.
+    const result = assessInventoryChange(900, request({ quantity: 0 }), 500);
+    assert.equal(result.delta, 900);
+    assert.equal(result.allowed, false);
+  });
+
+  it('refuses an oversized change without confirmation', () => {
+    const result = assessInventoryChange(0, request({ quantity: 5000 }), 500);
+    assert.equal(result.allowed, false);
+    assert.match(result.reason ?? '', /exceeds the 500-unit limit/);
+  });
+
+  it('allows an oversized change once explicitly confirmed', () => {
+    const result = assessInventoryChange(
+      0,
+      request({ quantity: 5000, confirmLargeChange: true }),
+      500,
+    );
+    assert.equal(result.requiresConfirmation, true);
+    assert.equal(result.allowed, true);
+    assert.equal(result.reason, null);
+  });
+
+  it('requires confirmation when the current quantity is unknown', () => {
+    // An unknown starting point means the delta cannot be computed, so the cap
+    // cannot be enforced. Conservative is the only safe default.
+    const unknown = assessInventoryChange(null, request({ quantity: 10 }), 500);
+    assert.equal(unknown.delta, null);
+    assert.equal(unknown.allowed, false);
+
+    const confirmed = assessInventoryChange(
+      null,
+      request({ quantity: 10, confirmLargeChange: true }),
+      500,
+    );
+    assert.equal(confirmed.allowed, true);
+  });
+
+  it('honours a lowered limit', () => {
+    assert.equal(assessInventoryChange(0, request({ quantity: 11 }), 10).allowed, false);
+    assert.equal(assessInventoryChange(0, request({ quantity: 10 }), 10).allowed, true);
   });
 });

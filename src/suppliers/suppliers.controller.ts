@@ -20,17 +20,15 @@ suppliersRouter.get(
       res,
       providers.map((provider) => ({
         providerName: provider.providerName,
-        capabilities: {
-          identifyProduct: typeof provider.identifyProduct === 'function',
-          getSupplierCost: typeof provider.getSupplierCost === 'function',
-          getShippingCost: typeof provider.getShippingCost === 'function',
-        },
-        // Honest capability reporting: the methods exist but return null.
-        notes:
-          provider.providerName === 'TRADELLE'
-            ? 'Tradelle documents a Shopify integration, not a public API. Cost and shipping lookups return null until Tradelle publishes documented endpoints.'
-            : null,
+        // The provider's DECLARED capabilities. Previously this was inferred
+        // from method presence, which reported getSupplierCost:true for a
+        // method whose entire body is `return null` - so the UI advertised a
+        // supplier cost feed that does not exist.
+        capabilities: provider.capabilities,
+        /** Why each false capability is false. Keyed by capability name. */
+        limitations: provider.limitations ?? {},
       })),
+      { count: providers.length },
     );
   }),
 );

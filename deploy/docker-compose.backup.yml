@@ -1,0 +1,88 @@
+# OPTIONAL overlay: scheduled MongoDB backups with retention.
+#
+# Enable it alongside the others in deploy/.env:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.local-db.yml:docker-compose.backup.yml
+#
+# Works with EITHER a local Mongo (the local-db overlay) or an external one such
+# as Atlas - it only needs MONGODB_URI. For Atlas, prefer Atlas's own managed
+# backups as the primary mechanism and treat this as a portable second copy; see
+# docs/BACKUP_AND_RECOVERY.md.
+#
+# WHAT THIS PROTECTS
+# ------------------
+# The Mongo data is not a cache. Automation history is the audit trail for every
+# price Trademart changed, manual cost overrides are hand-entered numbers that
+# exist nowhere else, and the saved automation rules decide what future runs do.
+# Shopify holds none of it. Losing this volume means losing the answers to "who
+# changed this price and why".
+#
+# WHERE BACKUPS GO - READ THIS
+# ----------------------------
+# BACKUP_HOST_DIR defaults to ./backups purely so the stack works out of the box.
+# That is the SAME DISK as the Mongo volume, which protects you from a bad
+# migration or a dropped collection but NOT from a disk or host failure. Point it
+# at a different physical device, or sync it off-box (see the offsite notes in
+# docs/BACKUP_AND_RECOVERY.md). A backup that dies with its source is not a
+# backup.
+
+services:
+  mongo-backup:
+    # Same major version as the database, so mongodump/mongorestore match the
+    # server's wire protocol and BSON features.
+    image: mongo:7
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    environment:
+      MONGODB_URI: ${MONGODB_URI:?set MONGODB_URI in deploy/.env}
+      # Retention: 7 daily, 4 weekly, 3 monthly.
+      BACKUP_KEEP_DAILY: ${BACKUP_KEEP_DAILY:-7}
+      BACKUP_KEEP_WEEKLY: ${BACKUP_KEEP_WEEKLY:-4}
+      BACKUP_KEEP_MONTHLY: ${BACKUP_KEEP_MONTHLY:-3}
+      # Hour (UTC) at which the daily dump runs.
+      BACKUP_HOUR_UTC: ${BACKUP_HOUR_UTC:-3}
+    volumes:
+      - ${BACKUP_HOST_DIR:-./backups}:/backups
+      - ./scripts/mongo-backup.sh:/usr/local/bin/mongo-backup.sh:ro
+    # Runs one dump immediately (so a fresh deployment is protected within
+    # seconds rather than at 03:00 tomorrow), then once per day.
+    #
+    # A plain sleep loop rather than cron: the container has no cron running, and
+    # this keeps the schedule visible in one place instead of split between a
+    # crontab and compose. Drift of a few seconds per day is irrelevant here.
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -euo pipefail
+        chmod +x /usr/local/bin/mongo-backup.sh || true
+        echo "[backup] first run on startup, then daily at ${BACKUP_HOUR_UTC:-3}:00 UTC"
+        /usr/local/bin/mongo-backup.sh || echo "[backup] initial run FAILED - see above"
+        while :; do
+          now_h=$$(date -u +%H)
+          now_m=$$(date -u +%M)
+          target=$${BACKUP_HOUR_UTC:-3}
+          # Seconds until the next occurrence of the target hour.
+          secs=$$(( ( (10#$$target - 10#$$now_h + 24) % 24 ) * 3600 - 10#$$now_m * 60 ))
+          if [ "$$secs" -le 60 ]; then secs=$$(( secs + 86400 )); fi
+          echo "[backup] sleeping $$secs s until the next run"
+          sleep "$$secs"
+          /usr/local/bin/mongo-backup.sh || echo "[backup] run FAILED - see above"
+        done
+    networks: [trademart]
+    healthcheck:
+      # Unhealthy when no backup has been written in the last 48h, which is the
+      # failure that actually matters: a backup job that has been silently dying
+      # looks identical to one that is working until the day you need it.
+      test:
+        - CMD-SHELL
+        - >-
+          test -n "$$(find /backups/daily -name '*.archive.gz' -mtime -2 2>/dev/null | head -1)"
+      interval: 1h
+      timeout: 10s
+      start_period: 5m
+      retries: 2

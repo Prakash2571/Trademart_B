@@ -27,6 +27,7 @@
  */
 
 import { AppError } from '../common/errors';
+import { percentageOf } from '../common/money';
 import {
   calculatePricing,
   calculateSuggestedPrice,
@@ -110,8 +111,8 @@ export function marginAtPrice(
       sellingPrice,
       supplierProductCost: cost,
       // Percentage fees are absolute amounts here, derived from the price.
-      paymentFee: round2((sellingPrice * rules.paymentFeePercentage) / 100),
-      shopifyFee: round2((sellingPrice * rules.shopifyFeePercentage) / 100),
+      paymentFee: percentageOf(sellingPrice, rules.paymentFeePercentage),
+      shopifyFee: percentageOf(sellingPrice, rules.shopifyFeePercentage),
       advertisingCost: rules.advertisingCost,
       otherCosts: rules.otherCosts,
     });
@@ -119,6 +120,70 @@ export function marginAtPrice(
   } catch {
     return null;
   }
+}
+
+/**
+ * Absolute contribution per unit at `sellingPrice`, or null when it cannot be
+ * computed.
+ *
+ * Exists because a percentage floor alone is not a sufficient guard. 15% of a 3.00
+ * item is 45p - which does not cover one support email, one return, or the payment
+ * processor's fixed component. A margin floor and a cash floor answer different
+ * questions and both are needed.
+ */
+export function profitAtPrice(
+  sellingPrice: number,
+  cost: number,
+  rules: PriceRules,
+): number | null {
+  if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) return null;
+  try {
+    const result = calculatePricing({
+      sellingPrice,
+      supplierProductCost: cost,
+      paymentFee: percentageOf(sellingPrice, rules.paymentFeePercentage),
+      shopifyFee: percentageOf(sellingPrice, rules.shopifyFeePercentage),
+      advertisingCost: rules.advertisingCost,
+      otherCosts: rules.otherCosts,
+    });
+    return result.grossProfit;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when `price` clears BOTH floors: the margin percentage and the absolute
+ * contribution.
+ *
+ * A null figure (cost or price not computable) is treated as clearing the floor,
+ * matching the existing behaviour: an incomputable margin is not evidence of a
+ * loss, and refusing on it would stop pricing for a reason nobody could act on.
+ */
+function clearsFloors(
+  price: number,
+  cost: number,
+  rules: PriceRules,
+): { ok: true } | { ok: false; reason: string } {
+  const margin = marginAtPrice(price, cost, rules);
+  if (margin !== null && margin < rules.minMarginPercentage) {
+    return {
+      ok: false,
+      reason: `yields ${margin.toFixed(2)}% margin, below the ${rules.minMarginPercentage}% floor`,
+    };
+  }
+
+  if (rules.minimumProfitAmount > 0) {
+    const profit = profitAtPrice(price, cost, rules);
+    if (profit !== null && profit < rules.minimumProfitAmount) {
+      return {
+        ok: false,
+        reason: `yields only ${profit.toFixed(2)} contribution per unit, below the ${rules.minimumProfitAmount.toFixed(2)} minimum`,
+      };
+    }
+  }
+
+  return { ok: true };
 }
 
 /**
@@ -173,7 +238,15 @@ export function decideVariantPrice(
   }
 
   const resolved = resolveVariantCost(variant, manualCost);
-  const cost = resolved.amount;
+  // Prices are derived from the LANDED cost - product + supplier shipping - not
+  // from the product cost alone. Pricing on the product cost meant every margin
+  // was overstated by the shipping the supplier charges, including the
+  // minMarginPercentage floor that exists specifically to prevent a loss.
+  //
+  // landedCost equals the product cost when shipping is UNKNOWN. That case is
+  // reported below rather than hidden, because the resulting margin is then an
+  // upper bound, not an estimate.
+  const cost = resolved.landedCost;
   const costSource = resolved.source;
   if (cost === null && rules.requireKnownCost) {
     return {
@@ -217,6 +290,28 @@ export function decideVariantPrice(
 
   const currentMarginPercentage = marginAtPrice(currentPrice, cost, rules);
   const reasons: string[] = [`Cost source: ${describeCostSource(costSource)}.`];
+
+  // Shipping is stated explicitly either way, so a margin is never quoted without
+  // the reader knowing whether shipping was in it.
+  if (resolved.shippingKnown && resolved.shippingCost !== null) {
+    reasons.push(
+      `Landed cost ${cost.toFixed(2)} ${currencyCode} = product ${(resolved.amount ?? 0).toFixed(2)} + supplier shipping ${resolved.shippingCost.toFixed(2)} (${describeCostSource(resolved.shippingSource)}).`,
+    );
+  } else if (rules.requireKnownShippingCost) {
+    return {
+      kind: 'skip',
+      variantId,
+      costSource,
+      reasons: [
+        ...reasons,
+        'Supplier shipping cost is unknown, and requireKnownShippingCost is on. Record a shipping cost for this variant, or turn the requirement off to price from the product cost alone and accept that the margin will be an upper bound.',
+      ],
+    };
+  } else {
+    reasons.push(
+      `Supplier shipping is UNKNOWN, so it is NOT included: the margin below is an upper bound, not an estimate, and the real margin is lower by whatever the supplier charges to ship. Record a shipping cost to price this accurately.`,
+    );
+  }
 
   let target: number;
   if (rules.pricingMode === 'multiplier') {
@@ -266,17 +361,22 @@ export function decideVariantPrice(
     reasons.push(`Rounded to ${candidate.toFixed(2)} (${rules.rounding}).`);
   }
 
-  // Rounding down can push the price under the floor; step up until it clears.
+  // Rounding down can push the price under a floor; step up until it clears BOTH
+  // the margin floor and the absolute contribution floor.
   const floorMargin = rules.minMarginPercentage;
   let floorAdjusted = false;
+  let lastFloorReason = '';
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const margin = marginAtPrice(candidate, cost, rules);
-    if (margin === null || margin >= floorMargin) break;
+    const check = clearsFloors(candidate, cost, rules);
+    if (check.ok) break;
+    lastFloorReason = check.reason;
     candidate = round2(candidate + (rules.rounding === 'integer' ? 1 : 0.5));
     floorAdjusted = true;
   }
   if (floorAdjusted) {
-    reasons.push(`Raised to ${candidate.toFixed(2)} to respect the ${floorMargin}% margin floor.`);
+    reasons.push(
+      `Raised to ${candidate.toFixed(2)}: the rounded price ${lastFloorReason}.`,
+    );
   }
 
   // Bound the movement so a bad cost feed cannot reprice a catalogue wildly.
@@ -297,17 +397,17 @@ export function decideVariantPrice(
     );
   }
 
-  // A clamp must never drag the price below the floor.
+  // A clamp must never drag the price below either floor.
   if (clamped) {
-    const margin = marginAtPrice(candidate, cost, rules);
-    if (margin !== null && margin < floorMargin) {
+    const check = clearsFloors(candidate, cost, rules);
+    if (!check.ok) {
       return {
         kind: 'skip',
         variantId,
         costSource,
         reasons: [
           ...reasons,
-          `Clamped price yields ${margin.toFixed(2)}% margin, below the ${floorMargin}% floor. Skipped rather than sold at a loss - raise maxIncreasePercentage or lower the target.`,
+          `Clamped price ${check.reason}. Skipped rather than sold at a loss - raise maxIncreasePercentage or lower the target.`,
         ],
       };
     }

@@ -13,6 +13,7 @@ import { Router } from 'express';
 import { AppError } from '../../common/errors';
 import { asyncHandler, sendSuccess } from '../../common/http';
 import { parseStringParam } from '../../common/validate';
+import { SHOPIFY_FEATURES } from '../capabilities';
 import { getLiveTheme, listThemes, readThemeFiles } from './themes.service';
 
 export const themesRouter = Router();
@@ -73,20 +74,28 @@ themesRouter.get(
       liveThemeError = error instanceof AppError ? `${error.code}: ${error.message}` : 'unknown';
     }
 
+    // Scope facts come from the central catalogue rather than literals here, so
+    // this endpoint and GET /api/shopify/capabilities can never disagree.
+    const themeRead = SHOPIFY_FEATURES.find((f) => f.key === 'themes.read');
+    const themeWrite = SHOPIFY_FEATURES.find((f) => f.key === 'themes.write');
+
     sendSuccess(res, {
       liveTheme: live,
       liveThemeError,
-      requiredScope: 'read_themes',
+      requiredScope: themeRead?.requiredScopes[0] ?? 'read_themes',
       capabilities: {
-        listThemes: true,
-        readThemeFiles: true,
-        // Deliberately false until a safe draft workflow is built. Reported so
-        // the UI never renders an editing control that does not exist.
+        listThemes: themeRead?.implemented ?? false,
+        readThemeFiles: themeRead?.implemented ?? false,
+        // False because no implementation exists - NOT because a scope is
+        // missing. Reported so the UI never renders an editing control that
+        // does not exist, and so nobody tries to "fix" this by granting
+        // write_themes.
         editLiveTheme: false,
-        editDraftTheme: false,
-        publishTheme: false,
+        editDraftTheme: themeWrite?.implemented ?? false,
+        publishTheme: themeWrite?.implemented ?? false,
       },
-      note: 'Storefront/theme support is read-only. The live theme is never modified directly; safe draft editing and publish are a planned, opt-in workflow. write_themes is not requested yet.',
+      writeStatus: 'NOT_IMPLEMENTED',
+      note: themeWrite?.note ?? 'Storefront/theme support is read-only.',
     });
   }),
 );

@@ -15,9 +15,17 @@
  *   4. Every applied action records its previous value, so a run is reversible.
  */
 
+import { createHash } from 'node:crypto';
+
 import { AppError, toAppError } from '../common/errors';
 import { logger } from '../common/logger';
+import { getContext, getRequestId } from '../common/requestContext';
 import { config, isAutomationEnabled } from '../config';
+import {
+  acquireAutomationLock,
+  releaseAutomationLock,
+} from './automation.lock';
+import { computeRulesHash } from './preview.store';
 import { AutomationRunModel } from '../database/models/AutomationRun';
 import { AutomationSettingsModel } from '../database/models/AutomationSettings';
 import { getDatabaseStatus } from '../database/mongo';
@@ -27,13 +35,29 @@ import {
   TAGS_ADD_MUTATION,
   TAGS_REMOVE_MUTATION,
 } from '../shopify/graphql/product.mutations';
+import {
+  assertShopifyHealthyForBulkWrites,
+  getBreakerState,
+} from '../shopify/shopify.breaker';
 import { shopifyGraphql } from '../shopify/shopify.client';
 import { mapUserErrors } from '../shopify/shopify.errors';
 import { INVENTORY_ITEM_PRODUCT_QUERY } from '../shopify/graphql/inventory.queries';
+import {
+  getProductPublications,
+  publishProduct,
+} from '../shopify/publications/publications.service';
 import { getProduct, listProducts } from '../shopify/shopify.service';
 import type { ProductDto } from '../shopify/shopify.types';
 import { loadManualCostMap } from '../suppliers/manualCost.service';
-import { buildAutomationPlan, type AutomationPlan, type PriceAction } from './plan';
+// hashPlan is imported for local use (persistRun hashes the plan it ran) AND
+// re-exported at the bottom of this file: `export ... from` alone would not bring
+// the binding into this module's scope.
+import {
+  buildAutomationPlan,
+  hashPlan,
+  type AutomationPlan,
+  type PriceAction,
+} from './plan';
 import {
   AUTOMATION_HIDDEN_TAG,
   AUTOMATION_REVIEW_TAG,
@@ -314,24 +338,32 @@ async function applyPrices(productId: string, actions: PriceAction[]): Promise<v
 }
 
 /**
- * Builds and optionally applies an automation plan.
- *
- * Preview (`dryRun: true`) works regardless of the kill switch; applying does not.
+ * A fully-decided automation plan plus the context to execute and audit it,
+ * built WITHOUT any writes. Preview hashes this; apply re-derives it, checks the
+ * hash matches the preview, and executes THIS object - so nothing is re-fetched
+ * or re-planned between verification and execution.
  */
-export async function runAutomation(options: RunOptions): Promise<AutomationReport> {
+export interface PreparedPlan {
+  rules: AutomationRules;
+  plan: AutomationPlan;
+  degraded: string[];
+  notes: string[];
+}
+
+/**
+ * Fetches products, loads costs, and builds the plan. Read-only: this never
+ * writes to Shopify, so it is safe to run for both preview and the
+ * verification step of apply.
+ */
+export async function prepareAutomationPlan(
+  options: Omit<RunOptions, 'dryRun'>,
+): Promise<PreparedPlan> {
   const rules = await resolveEffectiveRules(options.rules);
   const problems = validateAutomationRules(rules);
   if (problems.length > 0) {
     throw new AppError('AUTOMATION_RULES_INVALID', 'Automation rules are invalid.', {
       details: { problems },
     });
-  }
-
-  if (!options.dryRun && !isAutomationEnabled()) {
-    throw new AppError(
-      'AUTOMATION_DISABLED',
-      'Storefront writes are disabled. Set AUTOMATION_ENABLED=true to allow Trademart to change prices and product visibility, or use POST /api/automation/preview to see what it would do.',
-    );
   }
 
   const notes: string[] = [];
@@ -378,10 +410,140 @@ export async function runAutomation(options: RunOptions): Promise<AutomationRepo
   }
 
   const plan = buildAutomationPlan(products, rules, manualCosts);
+  return { rules, plan, degraded, notes };
+}
+
+/**
+ * Re-exported from ./plan, which is where it now lives.
+ *
+ * It moved because it is pure logic over a plan and belongs next to the plan it
+ * hashes - but concretely, because importing it from here dragged in the config
+ * singleton (via the Shopify client and the Mongo models), and config/index.ts
+ * calls process.exit(1) on invalid env. That made a unit test of a pure hash
+ * function impossible to run without a fully configured environment, and it killed
+ * the test process in CI rather than failing an assertion.
+ *
+ * Still ONE implementation. Two copies of a safety hash drifting apart would
+ * produce PREVIEW_STALE rejections nobody could explain.
+ */
+export { hashPlan } from './plan';
+
+/**
+ * Builds and optionally applies an automation plan.
+ *
+ * Thin composition of prepare + execute, kept for callers (e.g. webhook
+ * triggers) that do not need the preview-token round trip.
+ */
+export async function runAutomation(options: RunOptions): Promise<AutomationReport> {
+  if (!options.dryRun && !isAutomationEnabled()) {
+    throw new AppError(
+      'AUTOMATION_DISABLED',
+      'Storefront writes are disabled. Set AUTOMATION_ENABLED=true to allow Trademart to change prices and product visibility, or use POST /api/automation/preview to see what it would do.',
+    );
+  }
+  const prepared = await prepareAutomationPlan(options);
+  return executePreparedPlan(prepared, {
+    dryRun: options.dryRun,
+    trigger: options.trigger,
+  });
+}
+
+/**
+ * Executes (or, for a dry run, just reports) an already-prepared plan.
+ *
+ * A real apply takes the store-level automation lock so two applies cannot race
+ * (operator double-click, or manual vs webhook). Preview never locks.
+ */
+export async function executePreparedPlan(
+  prepared: PreparedPlan,
+  options: {
+    dryRun: boolean;
+    trigger?: RunOptions['trigger'];
+    requestId?: string | null;
+    /**
+     * The preview token that authorised this apply, recorded on the run so the
+     * audit trail can answer "which preview did the operator approve?" instead of
+     * requiring somebody to correlate timestamps.
+     */
+    previewId?: string | null;
+  },
+): Promise<AutomationReport> {
+  if (!options.dryRun && !isAutomationEnabled()) {
+    throw new AppError(
+      'AUTOMATION_DISABLED',
+      'Storefront writes are disabled. Set AUTOMATION_ENABLED=true to allow Trademart to change prices and product visibility, or use POST /api/automation/preview to see what it would do.',
+    );
+  }
+
+  // Refuse up front while Shopify is degraded, BEFORE taking the lock: there is
+  // no point holding the store's apply lock only to fail, and a bulk run against
+  // a throttling Shopify produces hundreds of individual failures and a
+  // half-applied plan instead of one actionable refusal.
+  //
+  // Only bulk applies are gated. A preview is reads-only and stays available, so
+  // an operator can still see what WOULD happen while writes are paused.
+  if (!options.dryRun) {
+    assertShopifyHealthyForBulkWrites();
+  }
+
+  // Serialise real applies. Acquired before any await so a concurrent apply is
+  // rejected immediately rather than interleaving writes.
+  if (!options.dryRun) {
+    acquireAutomationLock({ trigger: options.trigger ?? 'manual', requestId: options.requestId });
+  }
+  try {
+    return await runPreparedPlan(prepared, options);
+  } finally {
+    if (!options.dryRun) releaseAutomationLock();
+  }
+}
+
+/** Inner executor. Assumes the lock (if needed) is already held. */
+async function runPreparedPlan(
+  prepared: PreparedPlan,
+  options: {
+    dryRun: boolean;
+    trigger?: RunOptions['trigger'];
+    previewId?: string | null;
+  },
+): Promise<AutomationReport> {
+  const { rules, plan, degraded, notes } = prepared;
 
   const actions: AppliedAction[] = [];
   let applied = 0;
   let failed = 0;
+
+  /**
+   * Mid-run degradation check.
+   *
+   * The pre-flight check in executePreparedPlan cannot help if Shopify starts
+   * failing at product 10 of 250 - which is the common case, because a bulk run is
+   * often what pushes the store over its rate limit in the first place. Without
+   * this, the run would grind through 240 more products, each burning its full
+   * retry budget with backoff, to produce 240 identical failures.
+   *
+   * Once tripped it stays tripped for the rest of THIS run, rather than
+   * re-checking and possibly resuming halfway: a plan that applied actions 1-10
+   * and 200-250 but not 11-199 is far harder to reason about than one that
+   * stopped at 10.
+   *
+   * Remaining actions are still recorded (as failed, with an explicit "not
+   * attempted" reason) rather than dropped, so the report accounts for every
+   * planned action and the operator can see exactly where the run stopped.
+   */
+  let abortReason: string | null = null;
+  const degradationAbort = (): string | null => {
+    if (abortReason !== null) return abortReason;
+    if (getBreakerState() === 'open') {
+      abortReason =
+        'SHOPIFY_DEGRADED: not attempted. Shopify began failing partway through this run, so the remaining actions were stopped instead of being retried into a wall of failures. Re-run once Shopify recovers; already-applied actions are recorded above.';
+      logger.error('Aborting the automation run: Shopify degraded mid-run.', {
+        appliedSoFar: applied,
+        failedSoFar: failed,
+      });
+    }
+    return abortReason;
+  };
 
   if (options.dryRun) {
     for (const action of plan.actions) {
@@ -403,6 +565,25 @@ export async function runAutomation(options: RunOptions): Promise<AutomationRepo
     // product is already hidden rather than left on sale mid-update.
     for (const action of plan.actions) {
       if (action.type !== 'visibility') continue;
+
+      const aborted = degradationAbort();
+      if (aborted !== null) {
+        failed += 1;
+        actions.push({
+          type: 'visibility',
+          shopifyProductId: action.shopifyProductId,
+          shopifyVariantId: null,
+          title: action.title,
+          fromValue: action.from,
+          toValue: action.to,
+          currencyCode: null,
+          reasons: action.reasons,
+          status: 'failed',
+          error: aborted,
+        });
+        continue;
+      }
+
       try {
         await applyVisibility(action.shopifyProductId, action.to);
         applied += 1;
@@ -452,6 +633,26 @@ export async function runAutomation(options: RunOptions): Promise<AutomationRepo
     }
 
     for (const [productId, priceActions] of byProduct) {
+      const aborted = degradationAbort();
+      if (aborted !== null) {
+        failed += priceActions.length;
+        for (const action of priceActions) {
+          actions.push({
+            type: 'price',
+            shopifyProductId: productId,
+            shopifyVariantId: action.shopifyVariantId,
+            title: action.title,
+            fromValue: action.from.toFixed(2),
+            toValue: action.to.toFixed(2),
+            currencyCode: action.currencyCode,
+            reasons: action.reasons,
+            status: 'failed',
+            error: aborted,
+          });
+        }
+        continue;
+      }
+
       try {
         await applyPrices(productId, priceActions);
         applied += priceActions.length;
@@ -503,6 +704,7 @@ export async function runAutomation(options: RunOptions): Promise<AutomationRepo
     actions,
     plan,
     summary,
+    previewId: options.previewId ?? null,
   });
 
   logger.info(options.dryRun ? 'Automation preview complete.' : 'Automation run complete.', {
@@ -535,6 +737,7 @@ async function persistRun(input: {
   actions: AppliedAction[];
   plan: AutomationPlan;
   summary: AutomationReport['summary'];
+  previewId: string | null;
 }): Promise<string | null> {
   if (getDatabaseStatus().status !== 'connected') {
     if (!input.dryRun) {
@@ -546,6 +749,7 @@ async function persistRun(input: {
   }
 
   try {
+    const context = getContext();
     const run = await AutomationRunModel.create({
       shopDomain: config.shopify.storeDomain,
       startedAt: new Date(),
@@ -556,6 +760,18 @@ async function persistRun(input: {
       actions: input.actions,
       skipped: input.plan.skipped,
       summary: input.summary,
+      // Computed here from the rules and plan that were actually executed, rather
+      // than passed in from the controller. The controller hashes the plan it
+      // VERIFIED; recomputing from what was RUN means the two can be compared as
+      // independent observations, which is the whole point of storing a hash.
+      rulesHash: computeRulesHash(input.rules),
+      planHash: hashPlan(input.plan),
+      previewId: input.previewId,
+      // Read from the ambient request context rather than threaded through every
+      // signature - that is what AsyncLocalStorage is for. Both are null for a
+      // scheduled job, which is accurate: no request and no operator caused it.
+      requestId: getRequestId(),
+      actor: context?.actor ?? null,
     });
     return String(run._id);
   } catch (error) {
@@ -627,10 +843,42 @@ export async function holdProductForReview(shopifyProductId: string): Promise<vo
 }
 
 /**
- * Approves a held product: clears the review and auto-hidden tags and publishes
- * it. This is the deliberate human step that lets a product into the shop.
+ * Structured result of an approval, so the UI can tell activation from
+ * publication. These are two distinct Shopify operations and either can fail
+ * independently: a product can be ACTIVE (draft flag cleared) yet still not
+ * visible because it was never published to a sales channel.
  */
-export async function approveProduct(shopifyProductId: string): Promise<void> {
+export interface ApproveResult {
+  shopifyProductId: string;
+  /** Status set ACTIVE and review/auto-hidden tags removed. */
+  activated: boolean;
+  tagsRemoved: string[];
+  /** Whether publication to a sales channel succeeded and was verified. */
+  published: boolean;
+  /** Channels the product is currently published on (best-effort read-back). */
+  publications: { publicationId: string; name: string; isPublished: boolean }[];
+  /** Set when publication failed; the product was kept DRAFT and in review. */
+  publishError: string | null;
+}
+
+/**
+ * Approves a held product.
+ *
+ * ORDER MATTERS for safety. Publication is attempted and VERIFIED first, while
+ * the product is still DRAFT and still carries the review tag. Only once
+ * publication is confirmed is the product set ACTIVE and the review tag removed:
+ *
+ *   DRAFT + review tag  ->  publish  ->  verify  ->  set ACTIVE  ->  remove tag
+ *
+ * If publication fails (or cannot be verified), the product is left exactly as
+ * it was - DRAFT, review-tagged, and therefore still in /products/review - so a
+ * failed approval can never drop a product out of the queue in an
+ * ACTIVE-but-invisible limbo. No rollback is needed because nothing was changed.
+ *
+ * Publishing a DRAFT product is safe: channel availability and draft/active
+ * status are independent, so it stays invisible until the ACTIVE step.
+ */
+export async function approveProduct(shopifyProductId: string): Promise<ApproveResult> {
   if (!isAutomationEnabled()) {
     throw new AppError(
       'AUTOMATION_DISABLED',
@@ -638,19 +886,77 @@ export async function approveProduct(shopifyProductId: string): Promise<void> {
     );
   }
 
+  // 1. Publish first, then verify at least one channel reports it published.
+  let publications: ApproveResult['publications'] = [];
+  try {
+    const result = await publishProduct(shopifyProductId);
+    publications = result.state.map((entry) => ({
+      publicationId: entry.publicationId,
+      name: entry.name,
+      isPublished: entry.isPublished,
+    }));
+    const verified = publications.some((entry) => entry.isPublished);
+    if (!verified) {
+      logger.warn('Approval kept product in review: publish returned but no channel is published.', {
+        shopifyProductId,
+      });
+      return {
+        shopifyProductId,
+        activated: false,
+        tagsRemoved: [],
+        published: false,
+        publications,
+        publishError:
+          'Publish returned but no sales channel reports the product as published. The product was kept as DRAFT and remains in the review queue.',
+      };
+    }
+  } catch (error) {
+    const publishError =
+      error instanceof AppError ? `${error.code}: ${error.message}` : 'Publication failed.';
+    try {
+      publications = await getProductPublications(shopifyProductId);
+    } catch {
+      publications = [];
+    }
+    logger.warn('Approval kept product in review: publication failed.', {
+      shopifyProductId,
+      publishError,
+    });
+    return {
+      shopifyProductId,
+      activated: false,
+      tagsRemoved: [],
+      published: false,
+      publications,
+      publishError,
+    };
+  }
+
+  // 2. Publication confirmed. Make it visible, then clear the review gate.
+  // applyVisibility also strips the auto-hidden tag; harmless and idempotent.
+  await applyVisibility(shopifyProductId, 'ACTIVE');
+
+  const tagsToRemove = [AUTOMATION_REVIEW_TAG, AUTOMATION_HIDDEN_TAG];
   const removal = await shopifyGraphql<{
     tagsRemove: { userErrors: { field?: string[] | null; message?: string }[] } | null;
   }>(
     TAGS_REMOVE_MUTATION,
-    { id: shopifyProductId, tags: [AUTOMATION_REVIEW_TAG, AUTOMATION_HIDDEN_TAG] },
+    { id: shopifyProductId, tags: tagsToRemove },
     { operation: 'automationApproveTagsRemove' },
   );
   const removalError = mapUserErrors(removal.data.tagsRemove?.userErrors);
   if (removalError !== null) throw removalError;
 
-  // applyVisibility also strips the auto-hidden tag; harmless and idempotent.
-  await applyVisibility(shopifyProductId, 'ACTIVE');
-  logger.info('Approved product for the storefront.', { shopifyProductId });
+  logger.info('Approved and published product for the storefront.', { shopifyProductId });
+
+  return {
+    shopifyProductId,
+    activated: true,
+    tagsRemoved: tagsToRemove,
+    published: true,
+    publications,
+    publishError: null,
+  };
 }
 
 /** Most recent runs, newest first — the "what did automation just do?" view. */

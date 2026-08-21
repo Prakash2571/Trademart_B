@@ -14,6 +14,13 @@
  */
 
 import { AppError } from '../common/errors';
+import {
+  divideMoney,
+  percentageOf,
+  roundMoney,
+  subtractMoney,
+  sumMoney,
+} from '../common/money';
 
 export interface PricingInput {
   sellingPrice: number;
@@ -81,10 +88,20 @@ const COST_FIELDS: { key: keyof PricingInput; label: string }[] = [
   { key: 'otherCosts', label: 'Other costs' },
 ];
 
-/** Rounds to 2 dp without accumulating float noise. */
-export function round2(value: number): number {
-  return Math.round((value + Number.EPSILON) * 100) / 100;
-}
+/**
+ * Rounds to 2 dp.
+ *
+ * Re-exported from common/money so there is ONE rounding implementation. It used to
+ * be `Math.round((value + Number.EPSILON) * 100) / 100` here, which lost a penny on
+ * values like 8.165 and 10.075: Number.EPSILON is the gap between 1.0 and the next
+ * double, so it is far too small to correct representation error at price
+ * magnitudes. See common/money.ts for the full explanation.
+ *
+ * Kept as a named export because price.rules.ts and the tests import it; new code
+ * should use roundMoney, and anything that ADDS several amounts should use sumMoney
+ * rather than rounding each term.
+ */
+export { roundMoney as round2 };
 
 function assertFinite(value: number, field: string): void {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -104,33 +121,39 @@ export function calculatePricing(input: PricingInput): PricingResult {
 
   const breakdown: PricingBreakdownEntry[] = [];
   const missingInputs: string[] = [];
-  let totalCost = 0;
+  const providedAmounts: number[] = [];
 
   for (const field of COST_FIELDS) {
     const raw = input[field.key];
     const provided = raw !== undefined && raw !== null;
     if (provided) {
       assertNonNegative(raw as number, field.key);
+      providedAmounts.push(raw as number);
     }
     const amount = provided ? (raw as number) : 0;
-    totalCost += amount;
     breakdown.push({
       key: field.key,
       label: field.label,
-      amount: round2(amount),
+      amount: roundMoney(amount, field.key),
       provided,
     });
     if (!provided) missingInputs.push(field.key);
   }
 
-  totalCost = round2(totalCost);
-  const sellingPrice = round2(input.sellingPrice);
-  const grossProfit = round2(sellingPrice - totalCost);
+  // Summed in integer minor units in ONE step. Accumulating `totalCost += amount`
+  // over eight doubles and rounding at the end still drifts - each addition can
+  // introduce error that the final round cannot distinguish from a real value.
+  const totalCost = sumMoney(...providedAmounts);
+  const sellingPrice = roundMoney(input.sellingPrice, 'sellingPrice');
+  const grossProfit = subtractMoney(sellingPrice, totalCost);
 
+  // Percentages are ratios, not money, so they are rounded with plain 2dp rounding
+  // rather than being pushed through minor units - 39.24% is a display figure and
+  // nothing downstream adds it to anything.
   const profitMarginPercentage =
-    sellingPrice > 0 ? round2((grossProfit / sellingPrice) * 100) : null;
+    sellingPrice > 0 ? roundMoney((grossProfit / sellingPrice) * 100, 'profitMargin') : null;
   const returnOnCostPercentage =
-    totalCost > 0 ? round2((grossProfit / totalCost) * 100) : null;
+    totalCost > 0 ? roundMoney((grossProfit / totalCost) * 100, 'returnOnCost') : null;
 
   const notes: string[] = [];
   if (missingInputs.length > 0) {
@@ -184,7 +207,7 @@ export function calculateSuggestedPrice(
   ];
 
   const missingInputs: string[] = [];
-  let absoluteCosts = 0;
+  const providedAbsolute: number[] = [];
   for (const field of absoluteFields) {
     const raw = input[field.key] as number | undefined;
     if (raw === undefined || raw === null) {
@@ -192,8 +215,10 @@ export function calculateSuggestedPrice(
       continue;
     }
     assertNonNegative(raw, field.key as string);
-    absoluteCosts += raw;
+    providedAbsolute.push(raw);
   }
+  // Summed in minor units in one step rather than accumulated as doubles.
+  const absoluteCosts = sumMoney(...providedAbsolute);
 
   const paymentFeePercentage = input.paymentFeePercentage ?? 0;
   const shopifyFeePercentage = input.shopifyFeePercentage ?? 0;
@@ -218,7 +243,11 @@ export function calculateSuggestedPrice(
     );
   }
 
-  const suggestedPrice = round2(absoluteCosts / divisor);
+  // divideMoney rather than a raw `/`: it refuses a zero divisor instead of
+  // producing Infinity. The guard above already rejects divisor <= 0, so this is
+  // belt-and-braces - but an Infinity reaching a price is the worst outcome
+  // available, so it gets two chances to be stopped.
+  const suggestedPrice = divideMoney(absoluteCosts, divisor);
 
   const projection = calculatePricing({
     sellingPrice: suggestedPrice,
@@ -227,8 +256,8 @@ export function calculateSuggestedPrice(
     advertisingCost: input.advertisingCost,
     taxes: input.taxes,
     otherCosts: input.otherCosts,
-    paymentFee: round2((suggestedPrice * paymentFeePercentage) / 100),
-    shopifyFee: round2((suggestedPrice * shopifyFeePercentage) / 100),
+    paymentFee: percentageOf(suggestedPrice, paymentFeePercentage),
+    shopifyFee: percentageOf(suggestedPrice, shopifyFeePercentage),
   });
 
   const notes: string[] = [
@@ -242,8 +271,9 @@ export function calculateSuggestedPrice(
 
   return {
     suggestedPrice,
-    absoluteCosts: round2(absoluteCosts),
-    percentageCosts: round2(percentageCosts),
+    absoluteCosts,
+    // A percentage, not money - rounded for display only.
+    percentageCosts: roundMoney(percentageCosts, 'percentageCosts'),
     desiredMarginPercentage: input.desiredMarginPercentage,
     projection,
     isEstimate: true,

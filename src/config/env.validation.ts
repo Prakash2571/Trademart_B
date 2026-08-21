@@ -10,7 +10,15 @@
  *  - Missing-but-optional credentials (Mongo URI, Shopify token, webhook
  *    secret) are warnings in development so the server still boots and can
  *    report its own degraded state. In production they are errors.
+ *
+ * The single import below is the one exception to "import-free", and a
+ * deliberate one: shopify/capabilities.ts is itself pure data with no imports of
+ * its own, so pulling it in keeps this module side-effect free and unit
+ * testable. The alternative was a second, hand-maintained copy of the scope
+ * list here — which is exactly the drift that made the old default list wrong.
  */
+
+import { REQUIRED_SCOPES } from '../shopify/capabilities';
 
 export type NodeEnv = 'development' | 'test' | 'production';
 
@@ -47,6 +55,19 @@ export interface ShopifyConfig {
   webhookSecret: string | null;
   authStrategy: ShopifyAuthStrategy;
   authMode: ShopifyAuthMode;
+  /**
+   * Operator's declared store type. Advisory only - never trusted alone; the
+   * store-safety guard prefers Shopify's real isDevelopmentStore when known.
+   * Null when unset.
+   */
+  storeMode: 'development' | 'production' | null;
+  /**
+   * Whether dev/test TOOLING (smoke/seed/write-test scripts) may mutate the
+   * store when it is NOT a development store. Default false. Never gates normal
+   * operator actions - only automated tooling that could hit production by
+   * accident.
+   */
+  allowLiveStoreWrites: boolean;
   /** Scopes requested by the OAuth redirect flow, in Shopify's comma form. */
   scopes: string[];
   /** Fully-qualified GraphQL Admin API endpoint. */
@@ -93,8 +114,38 @@ export interface AppConfig {
    * merchant may reasonably want the first without the second.
    */
   automationOnWebhook: boolean;
+  /**
+   * Largest absolute inventory change a normal write may make without the caller
+   * setting `confirmLargeChange: true`. Enforced SERVER-side; a frontend
+   * confirmation dialog is not a control, because anything reachable with curl
+   * has to be checked here too.
+   */
+  maxInventoryDelta: number;
+  retention: RetentionConfig;
   operator: OperatorConfig;
   shopify: ShopifyConfig;
+}
+
+/**
+ * How long each class of operational data is kept.
+ *
+ * Expressed here rather than hard-coded in the models so the policy is visible in
+ * one place and reviewable against docs/BACKUP_AND_RECOVERY.md. All are enforced
+ * by MongoDB TTL indexes rather than a cleanup job.
+ */
+export interface RetentionConfig {
+  /**
+   * Webhook delivery records, INCLUDING their payloads. Payloads can contain
+   * customer and order data, so they are deliberately not kept indefinitely.
+   */
+  webhookEventDays: number;
+  /** Idempotency keys. Long enough to cover a client retry storm, no longer. */
+  idempotencyKeyHours: number;
+  /**
+   * Operator audit entries. Longest retention by design: "who changed this
+   * price" must still be answerable months later.
+   */
+  auditLogDays: number;
 }
 
 export interface OperatorConfig {
@@ -139,16 +190,21 @@ export const DEFAULT_SHOPIFY_API_VERSION = '2026-07';
 /**
  * Scopes requested by the OAuth redirect flow when SHOPIFY_SCOPES is unset.
  *
- * Deliberately the minimum Trademart actually reads. `read_customers` is
- * included because the dashboard's customer count uses `customersCount`, which
- * fails outright without it.
+ * DERIVED, not hand-written: the union of what every implemented feature in
+ * shopify/capabilities.ts declares. That file is the single source of truth.
+ *
+ * This list used to be maintained by hand and had gone stale — it still asked
+ * for read-only access (read_products, read_orders, read_customers,
+ * read_inventory) long after product writes, inventory writes, location reads
+ * and theme reads shipped, so a fresh install silently lacked permission for
+ * half the product. Deriving it means adding a feature cannot leave the scope
+ * list behind.
+ *
+ * Scopes for UNIMPLEMENTED features are excluded on purpose (notably
+ * write_themes): requesting permission you cannot exercise adds install
+ * friction and costs merchant trust for no capability.
  */
-export const DEFAULT_SHOPIFY_SCOPES = [
-  'read_products',
-  'read_orders',
-  'read_customers',
-  'read_inventory',
-] as const;
+export const DEFAULT_SHOPIFY_SCOPES: readonly string[] = REQUIRED_SCOPES;
 
 /** Path of the OAuth callback. Kept as a constant so config and docs agree. */
 export const OAUTH_CALLBACK_PATH = '/api/auth/callback';
@@ -169,6 +225,33 @@ function read(env: RawEnv, key: string): string | null {
   if (value === undefined) return null;
   const trimmed = value.trim();
   return trimmed.length === 0 ? null : trimmed;
+}
+
+/**
+ * Bounded integer, with a default.
+ *
+ * Out-of-range is an ERROR rather than a silent clamp: these values are safety
+ * limits and retention periods, and quietly substituting a different number than
+ * the operator wrote is how a guardrail ends up not being the one they think.
+ */
+function readInt(
+  env: RawEnv,
+  key: string,
+  options: { min: number; max: number; fallback: number },
+  errors: string[],
+): number {
+  const raw = read(env, key);
+  if (raw === null) return options.fallback;
+  if (!/^\d+$/.test(raw)) {
+    errors.push(`${key} must be a non-negative integer (received "${raw}").`);
+    return options.fallback;
+  }
+  const parsed = Number(raw);
+  if (parsed < options.min || parsed > options.max) {
+    errors.push(`${key} must be between ${options.min} and ${options.max}.`);
+    return options.fallback;
+  }
+  return parsed;
 }
 
 /**
@@ -566,6 +649,33 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     }
   }
 
+  // ---- Store-safety mode -------------------------------------------------
+  let storeMode: 'development' | 'production' | null = null;
+  const rawStoreMode = read(env, 'SHOPIFY_STORE_MODE');
+  if (rawStoreMode !== null) {
+    const normalised = rawStoreMode.toLowerCase();
+    if (normalised === 'development' || normalised === 'production') {
+      storeMode = normalised;
+    } else {
+      errors.push(
+        `SHOPIFY_STORE_MODE must be "development" or "production" (received "${rawStoreMode}").`,
+      );
+    }
+  }
+
+  let allowLiveStoreWrites = false;
+  const rawAllowLive = read(env, 'ALLOW_LIVE_STORE_WRITES');
+  if (rawAllowLive !== null) {
+    const normalised = rawAllowLive.toLowerCase();
+    if (normalised === 'true') allowLiveStoreWrites = true;
+    else if (normalised === 'false') allowLiveStoreWrites = false;
+    else {
+      errors.push(
+        `ALLOW_LIVE_STORE_WRITES must be "true" or "false" (received "${rawAllowLive}").`,
+      );
+    }
+  }
+
   const rawProtectReads = read(env, 'OPERATOR_PROTECT_READS');
   let protectReads = false;
   if (rawProtectReads !== null) {
@@ -606,6 +716,37 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     );
   }
 
+  // ---- MAX_INVENTORY_DELTA ------------------------------------------------
+  const maxInventoryDelta = readInt(
+    env,
+    'MAX_INVENTORY_DELTA',
+    { min: 1, max: 1_000_000, fallback: 500 },
+    errors,
+  );
+
+  // ---- Retention ----------------------------------------------------------
+  const retention: RetentionConfig = {
+    webhookEventDays: readInt(
+      env,
+      'RETENTION_WEBHOOK_EVENT_DAYS',
+      { min: 1, max: 365, fallback: 45 },
+      errors,
+    ),
+    idempotencyKeyHours: readInt(
+      env,
+      'RETENTION_IDEMPOTENCY_HOURS',
+      { min: 1, max: 720, fallback: 48 },
+      errors,
+    ),
+    auditLogDays: readInt(
+      env,
+      'RETENTION_AUDIT_DAYS',
+      // Floor of 30 days: a shorter audit trail would defeat its purpose.
+      { min: 30, max: 3650, fallback: 730 },
+      errors,
+    ),
+  };
+
   if (errors.length > 0) {
     return { config: null, errors, warnings };
   }
@@ -621,6 +762,8 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
       tokenEncryptionKey,
       automationEnabled,
       automationOnWebhook,
+      maxInventoryDelta,
+      retention,
       operator: {
         username: operatorUsername,
         passwordHash: operatorPasswordHash,
@@ -641,6 +784,8 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
         webhookSecret,
         authStrategy,
         authMode,
+        storeMode,
+        allowLiveStoreWrites,
         scopes,
         graphqlEndpoint: `https://${storeDomain}/admin/api/${apiVersion}/graphql.json`,
         tokenEndpoint: `https://${storeDomain}/admin/oauth/access_token`,

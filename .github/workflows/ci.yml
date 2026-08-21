@@ -1,0 +1,150 @@
+name: CI
+
+# Runs on every push and PR. A PR should not be merged while this is red - see
+# "Branch protection" at the bottom of this file, which cannot be configured
+# from a workflow and has to be switched on in repository settings.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel an in-progress run when the branch is pushed again; the older result is
+# already obsolete and CI minutes are not free.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # `npm ci` ONLY - never `npm install`.
+      #
+      # package-lock.json is committed, so this installs the exact resolved tree
+      # with verified integrity hashes and fails loudly if the lockfile and
+      # package.json disagree.
+      #
+      # There used to be a step here that generated a lockfile when none was
+      # committed. It existed because the registry was unreachable where this repo
+      # was authored, and it has been REMOVED now that a real lockfile exists: a
+      # fallback that quietly resolves fresh versions turns "the lockfile is
+      # missing or wrong" from a build failure into a silent difference between
+      # what CI tested and what production installs. That is exactly the failure a
+      # lockfile is for.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build only - nothing is pushed. This catches a Dockerfile that has
+      # drifted from the source layout, which the Node jobs above cannot see.
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Passed so the build args are exercised in CI rather than only by
+          # start.sh. A typo'd ARG name fails silently at runtime - /api/version
+          # just reports "unknown" - so building with them here is what proves the
+          # wiring works.
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_TIME=${{ github.event.repository.updated_at }}
+
+  compose:
+    name: compose config
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The frontend repo is a sibling in the expected layout, and
+      # docker-compose.yml builds it from ../../Trademart_F. Checked out so
+      # `docker compose config` can resolve the build context.
+      - name: Check out the frontend repo alongside
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: Prakash2571/Trademart_F
+          ref: main
+          path: __frontend
+
+      # Validates that docker-compose.yml parses, every required variable is
+      # provided, and interpolation resolves. It does NOT start anything.
+      - name: Validate compose configuration
+        working-directory: deploy
+        run: |
+          cp .env.example .env
+          # .env.example ships placeholder values; point the frontend build
+          # context at the sibling checkout above.
+          if [ -d "${GITHUB_WORKSPACE}/__frontend" ]; then
+            echo "FRONTEND_CONTEXT=${GITHUB_WORKSPACE}/__frontend" >> .env
+          fi
+          docker compose config > /dev/null
+          echo "compose config OK"
+
+      # Guards the class of bug this stack has actually hit: a variable the code
+      # reads that Compose never passes, arriving as "" and silently disabling a
+      # feature. src/config/deployment.env.test.ts asserts this too; doing it
+      # here as well catches interpolation problems that only appear once
+      # Compose has resolved the file.
+      - name: Assert no required variable resolved empty
+        working-directory: deploy
+        run: |
+          config=$(docker compose config)
+          for key in APP_URL FRONTEND_URL MONGODB_URI SHOPIFY_STORE_DOMAIN; do
+            value=$(printf '%s\n' "$config" | grep -E "^ +${key}:" | head -1 | sed -E 's/^ +[A-Z_]+: *//')
+            if [ -z "$value" ] || [ "$value" = '""' ]; then
+              echo "::error title=Empty variable::${key} resolved to an empty value in docker compose config."
+              exit 1
+            fi
+            echo "${key} = ${value}"
+          done
+
+# ---------------------------------------------------------------------------
+# Branch protection (manual step - a workflow cannot grant itself authority)
+#
+# Settings -> Branches -> add a rule for `main`:
+#   - Require a pull request before merging
+#   - Require status checks to pass:
+#       "typecheck, test, build"
+#       "docker image"
+#       "compose config"
+#   - Require branches to be up to date before merging
+#
+# Without this, a red CI run does not actually block the merge button.
+# ---------------------------------------------------------------------------
