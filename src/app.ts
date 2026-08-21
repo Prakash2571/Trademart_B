@@ -47,6 +47,9 @@ import { auditRouter } from './audit/audit.controller';
 import { config } from './config';
 import { customersRouter } from './customers/customers.controller';
 import { dropshippingRouter } from './dropshipping/dropshipping.controller';
+import { dropshippingWriteRouter } from './dropshipping/dropshipping.write.controller';
+import { intelligenceRouter } from './intelligence/intelligence.controller';
+import { intelligenceWriteRouter } from './intelligence/intelligence.write.controller';
 import {
   diagnosticsRouter,
   publicDiagnosticsRouter,
@@ -213,6 +216,15 @@ export function createApp(): Express {
   // surface, so the read guard is the whole story. Fulfilling, refunding and
   // cancelling deliberately stay in Shopify.
   app.use('/api', requireOperatorForReads, dropshippingRouter);
+  // Dropshipping SETTINGS are a write, on their own router. They change which orders
+  // are flagged and what price Research recommends - never a price in Shopify.
+  app.use('/api', requireOperatorForWrites, dropshippingWriteRouter);
+  // Product research reads: the candidate shortlist, scores and duplicate checks.
+  app.use('/api', requireOperatorForReads, intelligenceRouter);
+  // Research writes, including Push as Draft. That route creates a DRAFT and can never
+  // publish (see intelligence/push.draft.ts); publishing stays in the publications
+  // module, done by an operator who has read the listing.
+  app.use('/api', requireOperatorForWrites, intelligenceWriteRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

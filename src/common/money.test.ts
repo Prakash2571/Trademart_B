@@ -10,6 +10,7 @@ import { describe, it } from 'node:test';
 
 import { AppError } from './errors';
 import {
+  ceilMoney,
   divideMoney,
   formatMoney,
   fromMinorUnits,
@@ -233,5 +234,40 @@ describe('formatMoney', () => {
 
   it('omits the currency when it is unknown rather than inventing one', () => {
     assert.equal(formatMoney(420, null), '420.00');
+  });
+});
+
+
+describe('ceilMoney', () => {
+  it('rounds up to the next penny', () => {
+    assert.equal(ceilMoney(16.401), 16.41);
+    assert.equal(ceilMoney(16.409), 16.41);
+    assert.equal(ceilMoney(0.001), 0.01);
+  });
+
+  it('leaves an exact amount alone', () => {
+    // The tolerance exists for this: 16.40 shifts to 1640.0000000000002 minor units,
+    // and a naive Math.ceil would charge an extra penny for nothing.
+    assert.equal(ceilMoney(16.4), 16.4);
+    assert.equal(ceilMoney(16.41), 16.41);
+    assert.equal(ceilMoney(10.075), 10.08);
+    assert.equal(ceilMoney(8.16), 8.16);
+    assert.equal(ceilMoney(0), 0);
+  });
+
+  it('differs from roundMoney exactly where a floor needs it to', () => {
+    // 16.404 as a floor price must not become 16.40, which would be a penny short of
+    // the margin it was derived from.
+    assert.equal(roundMoney(16.404), 16.4);
+    assert.equal(ceilMoney(16.404), 16.41);
+  });
+
+  it('rejects a non-finite amount rather than returning Infinity', () => {
+    assert.throws(() => ceilMoney(Number.POSITIVE_INFINITY), AppError);
+    assert.throws(() => ceilMoney(Number.NaN), AppError);
+  });
+
+  it('treats an amount below a hundredth of a penny as zero', () => {
+    assert.equal(ceilMoney(1e-9), 0);
   });
 });

@@ -146,6 +146,32 @@ export function roundMoney(value: number, field = 'amount'): number {
 }
 
 /**
+ * Rounds UP to the next whole minor unit (toward +Infinity).
+ *
+ * Distinct from roundMoney, and needed wherever a computed amount is a FLOOR that
+ * must be cleared rather than a value to be reported. A minimum viable price of
+ * 16.404 rounded to 16.40 is a penny short of the margin floor it was derived from,
+ * which defeats the point of computing a floor at all.
+ *
+ * The 1e-9 tolerance stops a value that is already an exact number of minor units
+ * from being pushed up a penny by binary representation error: 16.40 can shift to
+ * 1640.0000000000002 minor units, and Math.ceil of that is 1641. A billionth of a
+ * penny is far below any real price difference and far above the representation
+ * error at price magnitudes.
+ */
+export function ceilMoney(value: number, field = 'amount'): number {
+  const amount = assertMoney(value, field);
+  if (amount === 0) return 0;
+
+  const shifted = shiftDecimal(amount, MONEY_DECIMALS);
+  // Same reasoning as toMinorUnits: only reachable below 1e-6, which is genuinely
+  // zero at money scale.
+  if (shifted === null) return 0;
+
+  return fromMinorUnits(Math.ceil(shifted - 1e-9));
+}
+
+/**
  * Adds amounts exactly, by summing in integer minor units.
  *
  * Rounding each term and then adding doubles still drifts; this cannot. Use it for
@@ -223,4 +249,112 @@ export function formatMoney(value: number, currencyCode: string | null): string 
  */
 export function moneyEquals(a: number, b: number): boolean {
   return toMinorUnits(a) === toMinorUnits(b);
+}
+
+
+/* ===========================================================================
+ * Currency safety
+ *
+ * Adding 100 INR of shipping to 5.00 USD of product cost produces a number that is
+ * not a price in any currency. It is also a very easy mistake to make, because both
+ * values are "just numbers" by the time they reach an arithmetic helper - which is
+ * exactly why the guard lives HERE, at the point of addition, rather than being
+ * remembered at each call site.
+ *
+ * Trademart configures no FX source. Rather than invent a rate, mixed-currency
+ * arithmetic FAILS with CURRENCY_MISMATCH. A wrong profit figure is worse than a
+ * missing one: a missing one prompts a question, a wrong one prompts a purchase.
+ * ======================================================================== */
+
+/** An amount that knows what currency it is in. */
+export interface CurrencyAmount {
+  amount: number | null | undefined;
+  currencyCode: string | null | undefined;
+  /** Names this value in an error message, e.g. "supplier shipping". */
+  label?: string;
+}
+
+/**
+ * The single currency shared by every present entry, or null when nothing is
+ * present.
+ *
+ * Entries with a null/undefined AMOUNT are ignored: an absent value has no currency
+ * to conflict with, and refusing to compute because an unknown shipping cost carries
+ * no currency code would make the guard fire on the wrong problem.
+ *
+ * An entry with an amount but NO currency code is also ignored for the purpose of
+ * detecting a conflict - it cannot contradict anything - but it is reported through
+ * `missingCurrency` so a caller can decide whether that is acceptable.
+ */
+export function resolveSharedCurrency(entries: readonly CurrencyAmount[]): {
+  currencyCode: string | null;
+  conflicts: string[];
+  missingCurrency: string[];
+} {
+  const seen = new Map<string, string[]>();
+  const missingCurrency: string[] = [];
+
+  for (const [index, entry] of entries.entries()) {
+    if (entry.amount === null || entry.amount === undefined) continue;
+    const label = entry.label ?? `value ${index + 1}`;
+    const code = typeof entry.currencyCode === 'string' ? entry.currencyCode.trim() : '';
+    if (code.length === 0) {
+      missingCurrency.push(label);
+      continue;
+    }
+    // Case-insensitive: 'inr' and 'INR' are the same currency, and treating them as
+    // a conflict would be a false alarm from sloppy input rather than a real risk.
+    const key = code.toUpperCase();
+    seen.set(key, [...(seen.get(key) ?? []), label]);
+  }
+
+  const codes = [...seen.keys()];
+  if (codes.length <= 1) {
+    return { currencyCode: codes[0] ?? null, conflicts: [], missingCurrency };
+  }
+
+  return {
+    currencyCode: null,
+    conflicts: codes.map((code) => `${code} (${(seen.get(code) ?? []).join(', ')})`),
+    missingCurrency,
+  };
+}
+
+/**
+ * Throws CURRENCY_MISMATCH when the entries are not all in one currency.
+ *
+ * Call before any arithmetic that combines amounts from different origins - a
+ * supplier cost from one place and a shipping cost from another.
+ */
+export function assertSharedCurrency(
+  entries: readonly CurrencyAmount[],
+  operation: string,
+): string | null {
+  const { currencyCode, conflicts } = resolveSharedCurrency(entries);
+  if (conflicts.length > 0) {
+    throw new AppError(
+      'CURRENCY_MISMATCH',
+      `Cannot ${operation}: the amounts are in different currencies - ${conflicts.join(' vs ')}. No exchange rate is configured, and converting with a guessed rate would produce a confident but wrong profit figure.`,
+      { details: { operation, conflicts } },
+    );
+  }
+  return currencyCode;
+}
+
+/**
+ * Sums amounts that must share a currency.
+ *
+ * Absent amounts are SKIPPED, not treated as zero - the same rule as sumMoney - so
+ * the caller remains responsible for deciding what an unknown value means. What this
+ * adds over sumMoney is the refusal to combine incompatible units at all.
+ */
+export function sumSameCurrency(
+  entries: readonly CurrencyAmount[],
+  operation: string,
+): { amount: number; currencyCode: string | null } {
+  const currencyCode = assertSharedCurrency(entries, operation);
+  return {
+    amount: sumMoney(...entries.map((entry) => entry.amount)),
+    currencyCode,
+  };
 }

@@ -31,8 +31,12 @@ import { percentageOf } from '../common/money';
 import {
   calculatePricing,
   calculateSuggestedPrice,
+  pricingGuardBreaches,
   round2,
 } from '../pricing/pricing.service';
+// Imported as well as re-exported below: `export ... from` does not bring the name
+// into local scope, and decideVariantPrice calls it.
+import { applyRounding, roundingStep } from '../pricing/rounding';
 import type { ProductVariantDto } from '../shopify/shopify.types';
 import {
   describeCostSource,
@@ -68,32 +72,11 @@ export type PriceDecision =
   | { kind: 'skip'; variantId: string; costSource: CostSource; reasons: string[] };
 
 /**
- * Rounds to the nearest .99 at or below the target, then steps up a unit if
- * that would land at a negative or zero price.
- *
- * Rounding DOWN is deliberate: .99 pricing that rounds up would silently push
- * every price above the computed target.
+ * Rounding moved to pricing/rounding.ts so the price RECOMMENDATION engine rounds
+ * identically. Re-exported because the automation tests and callers import it from
+ * here.
  */
-function toCharm99(value: number): number {
-  if (value <= 0.99) return 0.99;
-  const floor = Math.floor(value);
-  // 12.40 -> 11.99, 12.99 -> 12.99, 13.00 -> 12.99
-  const candidate = value >= floor + 0.99 ? floor + 0.99 : floor - 1 + 0.99;
-  return round2(candidate <= 0 ? 0.99 : candidate);
-}
-
-/** Applies the configured rounding strategy. */
-export function applyRounding(value: number, rounding: PriceRounding): number {
-  switch (rounding) {
-    case 'charm99':
-      return toCharm99(value);
-    case 'integer':
-      return round2(Math.max(1, Math.round(value)));
-    case 'none':
-    default:
-      return round2(value);
-  }
-}
+export { applyRounding } from '../pricing/rounding';
 
 /**
  * Margin percentage achieved at `sellingPrice`, or null when it cannot be
@@ -165,25 +148,31 @@ function clearsFloors(
   cost: number,
   rules: PriceRules,
 ): { ok: true } | { ok: false; reason: string } {
-  const margin = marginAtPrice(price, cost, rules);
-  if (margin !== null && margin < rules.minMarginPercentage) {
-    return {
-      ok: false,
-      reason: `yields ${margin.toFixed(2)}% margin, below the ${rules.minMarginPercentage}% floor`,
-    };
+  // Delegates to the shared guard in pricing.service so repricing an existing
+  // variant and recommending a price for a new one apply the SAME floors with the
+  // same wording. They used to be two implementations of the same two checks.
+  let result;
+  try {
+    result = calculatePricing({
+      sellingPrice: price,
+      supplierProductCost: cost,
+      paymentFee: percentageOf(price, rules.paymentFeePercentage),
+      shopifyFee: percentageOf(price, rules.shopifyFeePercentage),
+      advertisingCost: rules.advertisingCost,
+      otherCosts: rules.otherCosts,
+    });
+  } catch {
+    // Preserved behaviour: an incomputable margin is not evidence of a loss, and
+    // refusing on it would stop pricing for a reason nobody could act on.
+    return { ok: true };
   }
 
-  if (rules.minimumProfitAmount > 0) {
-    const profit = profitAtPrice(price, cost, rules);
-    if (profit !== null && profit < rules.minimumProfitAmount) {
-      return {
-        ok: false,
-        reason: `yields only ${profit.toFixed(2)} contribution per unit, below the ${rules.minimumProfitAmount.toFixed(2)} minimum`,
-      };
-    }
-  }
-
-  return { ok: true };
+  const breaches = pricingGuardBreaches(
+    result,
+    rules.minMarginPercentage,
+    rules.minimumProfitAmount,
+  );
+  return breaches.length === 0 ? { ok: true } : { ok: false, reason: breaches[0] as string };
 }
 
 /**
@@ -370,7 +359,7 @@ export function decideVariantPrice(
     const check = clearsFloors(candidate, cost, rules);
     if (check.ok) break;
     lastFloorReason = check.reason;
-    candidate = round2(candidate + (rules.rounding === 'integer' ? 1 : 0.5));
+    candidate = round2(candidate + roundingStep(rules.rounding));
     floorAdjusted = true;
   }
   if (floorAdjusted) {

@@ -219,11 +219,45 @@ describe('SHOPIFY_FEATURES catalogue integrity', () => {
     }
   });
 
-  it('gives every implemented feature at least one operation and route', () => {
+  it('gives every implemented feature a route to reach it by', () => {
+    // A route is the minimum: an implemented capability nobody can call is not
+    // implemented, whatever the flag says.
     for (const feature of SHOPIFY_FEATURES) {
       if (!feature.implemented) continue;
-      assert.ok(feature.operations.length > 0, `${feature.key} declares no operation`);
       assert.ok(feature.routes.length > 0, `${feature.key} declares no route`);
+    }
+  });
+
+  it('names the operation behind every scope it demands', () => {
+    // The real point of the operations list: a required scope must be traceable to the
+    // Admin API call that needs it, or nobody can tell whether the scope is genuinely
+    // required or was copied from a neighbouring entry.
+    //
+    // The converse is NOT required. Features like dropshipping.pricing and
+    // research.candidates are Trademart-native - arithmetic and Mongo, no Admin API call
+    // at all - so they declare no scopes and have no operation to name. Demanding one
+    // would force an invented operation string, which is worse than an empty list.
+    for (const feature of SHOPIFY_FEATURES) {
+      if (!feature.implemented) continue;
+      if (feature.requiredScopes.length === 0) continue;
+      assert.ok(
+        feature.operations.length > 0,
+        `${feature.key} requires ${feature.requiredScopes.join(', ')} but names no operation that needs it`,
+      );
+    }
+  });
+
+  it('declares no scope for a feature that never calls Shopify', () => {
+    // The mirror of the above, and the mistake it prevents is asking a merchant for
+    // permission Trademart does not use - which costs install friction and trust.
+    for (const feature of SHOPIFY_FEATURES) {
+      if (!feature.implemented) continue;
+      if (feature.operations.length > 0) continue;
+      assert.deepEqual(
+        feature.requiredScopes,
+        [],
+        `${feature.key} names no Admin API operation, so it must not require a scope`,
+      );
     }
   });
 

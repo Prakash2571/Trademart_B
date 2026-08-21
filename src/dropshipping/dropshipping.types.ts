@@ -27,26 +27,21 @@ import type {
 /**
  * How much a number can be trusted. Applied per figure, not per order.
  *
- *   KNOWN      observed. Shopify told us, or an operator recorded it.
- *   ESTIMATED  derived from a rule or a configured percentage, not observed.
- *   UNKNOWN    genuinely absent. NEVER rendered as 0, and never silently
- *              excluded from a total without saying so.
+ * Re-exported from common/dataQuality, which is now the single definition.
  *
- * The distinction exists because "supplier cost: 0" and "supplier cost: unknown"
- * lead to opposite decisions, and a dashboard that cannot tell them apart will
- * confidently report a profit on an order whose cost nobody has entered.
+ * They moved there because product research needs exactly the same vocabulary: a
+ * hand-typed supplier cost is no more observed in Research than in the order view.
+ * Two definitions of "estimated" would drift, and a system that disagrees with
+ * itself about whether a number is trustworthy is worse than one that never tracked
+ * trust at all.
+ *
+ * Re-exported rather than replaced so no existing importer of these names changes.
  */
-export type DataConfidence = 'KNOWN' | 'ESTIMATED' | 'UNKNOWN';
+export type { DataConfidence, Figure } from '../common/dataQuality';
 
-/** A monetary figure that always states how much it can be trusted. */
-export interface Figure {
-  /** Null if and only if confidence is UNKNOWN. */
-  amount: number | null;
-  currencyCode: string | null;
-  confidence: DataConfidence;
-  /** Where the number came from, in plain language. Always populated. */
-  source: string;
-}
+// Imported as well as re-exported: `export ... from` does not bring the names into
+// this module's own scope, and OrderEconomics below is built out of them.
+import type { DataConfidence, Figure } from '../common/dataQuality';
 
 /* ===========================================================================
  * Fulfillment progress
