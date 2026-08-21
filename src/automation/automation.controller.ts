@@ -13,11 +13,14 @@
 
 import { Router } from 'express';
 
+import { recordAudit } from '../audit/audit.service';
 import { AppError } from '../common/errors';
 import { asyncHandler, sendSuccess } from '../common/http';
 import { parseIntParam, parseStringParam, toShopifyGid } from '../common/validate';
 import { config, isAutomationEnabled, isAutomationOnWebhookEnabled } from '../config';
+import { getBreakerSnapshot } from '../shopify/shopify.breaker';
 import { COST_SOURCE_ORDER, UNKNOWN_COST_POLICY } from '../suppliers/cost';
+import { currentAutomationRun } from './automation.lock';
 import {
   anySupplierCostApiAvailable,
   describeSupplierCostSupport,
@@ -108,6 +111,21 @@ automationRouter.get(
       /** False means preview works but nothing can be written. */
       writesEnabled: isAutomationEnabled(),
       storeDomain: config.shopify.storeDomain,
+      /**
+       * The apply lock, if held.
+       *
+       * Surfaced because AUTOMATION_ALREADY_RUNNING is otherwise a dead end: the
+       * operator is told to wait with no way to see what they are waiting for, or
+       * whether it is a webhook-triggered run rather than someone else's click.
+       * Null when nothing is running.
+       */
+      activeRun: currentAutomationRun(),
+      /**
+       * Shopify's observed health. When the breaker is open, apply will refuse
+       * with SHOPIFY_DEGRADED, so the console can say so BEFORE the operator
+       * builds a preview and watches it get rejected.
+       */
+      shopify: getBreakerSnapshot(),
       effectiveRules: rules,
       ruleProblems: validateAutomationRules(rules),
       /**
@@ -248,7 +266,38 @@ automationRouter.post(
 
     // Execute the SAME prepared plan that was just verified - no re-fetch or
     // re-plan between verification and execution. Takes the automation lock.
-    const report = await executePreparedPlan(prepared, { dryRun: false, trigger: 'manual' });
+    const report = await executePreparedPlan(prepared, {
+      dryRun: false,
+      trigger: 'manual',
+      previewId: record.previewId,
+    });
+
+    // Audited AFTER the run so the recorded counts are what actually happened,
+    // not what was intended. A bulk apply is the single most consequential thing
+    // this API does, so it is never left implicit in the logs.
+    //
+    // `result` distinguishes a fully applied run from a partial one: an operator
+    // reading the trail needs to see that 3 of 40 changes did not land, and
+    // 'SUCCESS' for a run with failures would hide exactly that.
+    await recordAudit({
+      action: 'AUTOMATION_APPLY',
+      resourceType: 'AUTOMATION',
+      resourceId: report.auditRunId,
+      after: {
+        applied: report.summary.applied,
+        failed: report.summary.failed,
+        previewId: record.previewId,
+      },
+      result: report.summary.failed > 0 ? 'PARTIAL' : 'SUCCESS',
+      metadata: {
+        trigger: 'manual',
+        planHash: hashPlan(prepared.plan),
+        rulesHash: computeRulesHash(prepared.rules),
+        // Recorded because a degraded read changes what the plan could even see.
+        degraded: report.degraded,
+      },
+    });
+
     sendSuccess(res, report, { dryRun: false, previewId: record.previewId });
   }),
 );
@@ -282,7 +331,28 @@ automationRouter.put(
         'A rules object is required, e.g. { "rules": { "price": { "enabled": true } } }.',
       );
     }
+    // `before` is captured BEFORE the write, because "what changed" is the whole
+    // value of auditing a settings edit - and after saveRules the previous value
+    // is gone. A rules change is the highest-leverage edit in the product: it
+    // silently governs every future automatic run, including webhook-triggered
+    // ones with no operator watching.
+    const previous = await getStoredRules();
     const effective = await saveRules(overrides);
+
+    await recordAudit({
+      action: 'AUTOMATION_RULE_UPDATE',
+      resourceType: 'AUTOMATION',
+      resourceId: config.shopify.storeDomain,
+      before: previous,
+      after: overrides,
+      metadata: {
+        // The hash of what runs from now on, so a later apply's rulesHash can be
+        // traced back to the edit that produced it.
+        effectiveRulesHash: computeRulesHash(effective),
+        priceWritesEnabled: effective.price.enabled,
+      },
+    });
+
     sendSuccess(res, { stored: overrides, effective });
   }),
 );
@@ -303,6 +373,33 @@ automationRouter.post(
     // an ACTIVE-but-not-published outcome is visible rather than hidden behind a
     // blanket "approved: true".
     const result = await approveProduct(productId);
+
+    // Approving is the moment a product becomes visible to customers, so it is
+    // the single most important thing to have in the trail.
+    //
+    // result mirrors the structured outcome instead of collapsing it: approve
+    // deliberately keeps a product DRAFT and in review when publication cannot be
+    // verified, and recording that as SUCCESS would assert the product went live
+    // when it did not. PARTIAL is used rather than FAILURE because the operator's
+    // decision WAS recorded and some steps did happen - it is not a no-op.
+    const fullyLive = result.published && result.activated;
+    await recordAudit({
+      action: 'PRODUCT_APPROVE',
+      resourceType: 'PRODUCT',
+      resourceId: productId,
+      after: {
+        activated: result.activated,
+        published: result.published,
+        tagsRemoved: result.tagsRemoved,
+        visibleToCustomers: fullyLive,
+      },
+      result: fullyLive ? 'SUCCESS' : 'PARTIAL',
+      metadata: {
+        publications: result.publications,
+        publishError: result.publishError,
+      },
+    });
+
     sendSuccess(res, result);
   }),
 );

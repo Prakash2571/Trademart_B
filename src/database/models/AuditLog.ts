@@ -43,10 +43,19 @@ const auditLogSchema = new Schema(
     after: { type: Schema.Types.Mixed, default: null },
     /** Correlation id - ties this entry to the log lines for the same request. */
     requestId: { type: String, default: null },
+    /**
+     * PARTIAL exists because bulk operations are real.
+     *
+     * An automation apply that changed 37 of 40 products is neither a success nor
+     * a failure. Recording it as SUCCESS hides the three that did not land -
+     * exactly the thing an operator reading the trail needs to see - and recording
+     * it as FAILURE implies nothing changed, which would send them looking for a
+     * rollback that is not needed.
+     */
     result: {
       type: String,
       required: true,
-      enum: ['SUCCESS', 'FAILURE'],
+      enum: ['SUCCESS', 'PARTIAL', 'FAILURE'],
       default: 'SUCCESS',
     },
     /** Taxonomy code when result is FAILURE. */

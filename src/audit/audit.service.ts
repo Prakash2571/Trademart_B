@@ -71,7 +71,11 @@ export interface AuditEntryInput {
   before?: unknown;
   after?: unknown;
   metadata?: Record<string, unknown> | null;
-  result?: 'SUCCESS' | 'FAILURE';
+  /**
+   * PARTIAL is for bulk work: an apply that changed 37 of 40 products is neither
+   * a success nor a failure, and calling it either one misleads the reader.
+   */
+  result?: 'SUCCESS' | 'PARTIAL' | 'FAILURE';
   error?: unknown;
   /**
    * Overrides the actor from the request context. Used by the login handler,
@@ -234,7 +238,7 @@ export interface AuditQuery {
   resourceType?: string | undefined;
   resourceId?: string | undefined;
   actor?: string | undefined;
-  result?: 'SUCCESS' | 'FAILURE' | undefined;
+  result?: 'SUCCESS' | 'PARTIAL' | 'FAILURE' | undefined;
   requestId?: string | undefined;
   since?: Date | undefined;
   until?: Date | undefined;

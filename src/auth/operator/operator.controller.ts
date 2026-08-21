@@ -13,6 +13,7 @@
 import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 
+import { recordAudit } from '../../audit/audit.service';
 import { AppError } from '../../common/errors';
 import { asyncHandler, sendSuccess } from '../../common/http';
 import { logger } from '../../common/logger';
@@ -121,6 +122,29 @@ operatorRouter.post(
     if (!usernameOk || !passwordOk) {
       // One generic message for both cases - never "no such user".
       logger.warn('Failed operator sign-in attempt.', { ip: req.ip });
+
+      // Audited BEFORE throwing, and awaited, because a failed sign-in is the
+      // signal that matters most for detecting an attack: a run of these is a
+      // password-guessing attempt, and it is invisible if only successes are
+      // recorded.
+      //
+      // `actor` is the ATTEMPTED username, passed explicitly because
+      // authentication has not run so there is nothing in the request context
+      // yet. The password never reaches recordAudit - it is not in `after`, and
+      // the redactor would strip it even if a future edit put it there.
+      await recordAudit({
+        action: 'LOGIN_FAILED',
+        resourceType: 'SESSION',
+        actor: username,
+        authMethod: 'SESSION',
+        result: 'FAILURE',
+        error: new AppError('LOGIN_FAILED', 'Invalid username or password.'),
+        // Which half was wrong is recorded for the operator reading their own
+        // trail, and is deliberately NOT in the HTTP response, which stays
+        // generic so it cannot be used to enumerate usernames.
+        metadata: { usernameMatched: usernameOk, ip: req.ip ?? null },
+      });
+
       throw new AppError('LOGIN_FAILED', 'Invalid username or password.');
     }
 
@@ -129,6 +153,17 @@ operatorRouter.post(
     }
 
     logger.info('Operator signed in.', { username: expectedUser });
+
+    // Explicit actor again: the session cookie has only just been issued, so this
+    // request never went through the operator middleware that populates context.
+    await recordAudit({
+      action: 'LOGIN',
+      resourceType: 'SESSION',
+      actor: expectedUser,
+      authMethod: 'SESSION',
+      metadata: { ip: req.ip ?? null },
+    });
+
     sendSuccess(res, {
       username: expectedUser,
       method: 'SESSION',
@@ -151,6 +186,16 @@ operatorRouter.post(
 
     if (operator !== null) {
       logger.info('Operator signed out.', { username: operator.username });
+      // Only audited when somebody was actually signed in. This route succeeds
+      // unconditionally (a logout that errors leaves a client holding a cookie it
+      // cannot clear), so auditing every call would fill the trail with anonymous
+      // LOGOUT rows that record nothing.
+      await recordAudit({
+        action: 'LOGOUT',
+        resourceType: 'SESSION',
+        actor: operator.username,
+        authMethod: operator.method,
+      });
     }
     sendSuccess(res, { signedOut: true });
   }),

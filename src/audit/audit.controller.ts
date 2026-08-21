@@ -16,7 +16,7 @@ import { listAuditActions, listAuditEntries } from './audit.service';
 
 export const auditRouter = Router();
 
-const RESULTS = ['SUCCESS', 'FAILURE'] as const;
+const RESULTS = ['SUCCESS', 'PARTIAL', 'FAILURE'] as const;
 
 /** Parses an ISO date filter, rejecting nonsense rather than ignoring it. */
 function parseDate(raw: unknown, field: string): Date | undefined {
@@ -50,7 +50,7 @@ auditRouter.get(
       }),
       resourceId: parseStringParam(req.query['resourceId'], 'resourceId', { maxLength: 255 }),
       actor: parseStringParam(req.query['actor'], 'actor', { maxLength: 128 }),
-      result: rawResult as 'SUCCESS' | 'FAILURE' | undefined,
+      result: rawResult as 'SUCCESS' | 'PARTIAL' | 'FAILURE' | undefined,
       // Filtering by requestId is how "this one operation failed" becomes a
       // complete picture: every entry written during that request, in order.
       requestId: parseStringParam(req.query['requestId'], 'requestId', { maxLength: 128 }),

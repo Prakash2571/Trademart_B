@@ -14,7 +14,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsc -p tsconfig.test.json && node --test \"dist-test/**/*.test.js\"",
     "shopify:ping": "tsx src/scripts/shopifyPing.ts",
-    "operator:hash": "tsx src/scripts/hashOperatorPassword.ts"
+    "operator:hash": "tsx src/scripts/hashOperatorPassword.ts",
+    "guard:dev-store": "tsx src/scripts/guardDevStore.ts",
+    "smoke": "./scripts/smoke-test.sh"
   },
   "dependencies": {
     "cors": "^2.8.5",

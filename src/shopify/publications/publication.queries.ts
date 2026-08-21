@@ -36,6 +36,10 @@ export const PRODUCT_PUBLICATIONS_QUERY = /* GraphQL */ `
   query TrademartProductPublications($id: ID!) {
     product(id: $id) {
       id
+      # Fetched alongside the publications because visibility needs BOTH: an
+      # unpublished ACTIVE product is invisible, and so is a published DRAFT one.
+      # Answering "can customers see this?" from either half alone is wrong.
+      status
       resourcePublicationsV2(first: 50) {
         nodes {
           isPublished

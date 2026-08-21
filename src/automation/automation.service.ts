@@ -19,11 +19,13 @@ import { createHash } from 'node:crypto';
 
 import { AppError, toAppError } from '../common/errors';
 import { logger } from '../common/logger';
+import { getContext, getRequestId } from '../common/requestContext';
 import { config, isAutomationEnabled } from '../config';
 import {
   acquireAutomationLock,
   releaseAutomationLock,
 } from './automation.lock';
+import { computeRulesHash } from './preview.store';
 import { AutomationRunModel } from '../database/models/AutomationRun';
 import { AutomationSettingsModel } from '../database/models/AutomationSettings';
 import { getDatabaseStatus } from '../database/mongo';
@@ -466,7 +468,17 @@ export async function runAutomation(options: RunOptions): Promise<AutomationRepo
  */
 export async function executePreparedPlan(
   prepared: PreparedPlan,
-  options: { dryRun: boolean; trigger?: RunOptions['trigger']; requestId?: string | null },
+  options: {
+    dryRun: boolean;
+    trigger?: RunOptions['trigger'];
+    requestId?: string | null;
+    /**
+     * The preview token that authorised this apply, recorded on the run so the
+     * audit trail can answer "which preview did the operator approve?" instead of
+     * requiring somebody to correlate timestamps.
+     */
+    previewId?: string | null;
+  },
 ): Promise<AutomationReport> {
   if (!options.dryRun && !isAutomationEnabled()) {
     throw new AppError(
@@ -501,7 +513,11 @@ export async function executePreparedPlan(
 /** Inner executor. Assumes the lock (if needed) is already held. */
 async function runPreparedPlan(
   prepared: PreparedPlan,
-  options: { dryRun: boolean; trigger?: RunOptions['trigger'] },
+  options: {
+    dryRun: boolean;
+    trigger?: RunOptions['trigger'];
+    previewId?: string | null;
+  },
 ): Promise<AutomationReport> {
   const { rules, plan, degraded, notes } = prepared;
 
@@ -700,6 +716,7 @@ async function runPreparedPlan(
     actions,
     plan,
     summary,
+    previewId: options.previewId ?? null,
   });
 
   logger.info(options.dryRun ? 'Automation preview complete.' : 'Automation run complete.', {
@@ -732,6 +749,7 @@ async function persistRun(input: {
   actions: AppliedAction[];
   plan: AutomationPlan;
   summary: AutomationReport['summary'];
+  previewId: string | null;
 }): Promise<string | null> {
   if (getDatabaseStatus().status !== 'connected') {
     if (!input.dryRun) {
@@ -743,6 +761,7 @@ async function persistRun(input: {
   }
 
   try {
+    const context = getContext();
     const run = await AutomationRunModel.create({
       shopDomain: config.shopify.storeDomain,
       startedAt: new Date(),
@@ -753,6 +772,18 @@ async function persistRun(input: {
       actions: input.actions,
       skipped: input.plan.skipped,
       summary: input.summary,
+      // Computed here from the rules and plan that were actually executed, rather
+      // than passed in from the controller. The controller hashes the plan it
+      // VERIFIED; recomputing from what was RUN means the two can be compared as
+      // independent observations, which is the whole point of storing a hash.
+      rulesHash: computeRulesHash(input.rules),
+      planHash: hashPlan(input.plan),
+      previewId: input.previewId,
+      // Read from the ambient request context rather than threaded through every
+      // signature - that is what AsyncLocalStorage is for. Both are null for a
+      // scheduled job, which is accurate: no request and no operator caused it.
+      requestId: getRequestId(),
+      actor: context?.actor ?? null,
     });
     return String(run._id);
   } catch (error) {

@@ -14,11 +14,12 @@
 
 import { Router } from 'express';
 
+import { recordAudit } from '../../audit/audit.service';
 import { AppError } from '../../common/errors';
 import { asyncHandler, sendSuccess } from '../../common/http';
 import { toShopifyGid } from '../../common/validate';
 import {
-  getProductPublications,
+  getProductVisibility,
   listPublications,
   publishProduct,
   unpublishProduct,
@@ -50,8 +51,16 @@ publicationsRouter.get(
   '/shopify/products/:id/publications',
   asyncHandler(async (req, res) => {
     const gid = toShopifyGid(req.params.id ?? '', 'Product');
-    const state = await getProductPublications(gid);
-    sendSuccess(res, { publications: state }, { count: state.length });
+
+    // Returns visibleToCustomers alongside the raw channel list so no caller has
+    // to combine status and publication itself. Every place that re-derives it is
+    // a place the two halves can disagree, and the failure mode is telling an
+    // operator a product is on sale when customers cannot see it.
+    //
+    // `publications` keeps its original shape and key, so existing readers are
+    // unaffected; the visibility fields are additive.
+    const visibility = await getProductVisibility(gid);
+    sendSuccess(res, visibility, { count: visibility.publications.length });
   }),
 );
 
@@ -61,6 +70,22 @@ publicationsWriteRouter.post(
     const gid = toShopifyGid(req.params.id ?? '', 'Product');
     const publicationIds = readPublicationIds((req.body ?? {}) as Record<string, unknown>);
     const result = await publishProduct(gid, publicationIds);
+
+    // Publishing is what makes a product visible to customers - the change most
+    // likely to be asked about after the fact ("who put this on sale?"). The
+    // verified read-back state is recorded, not the request, so the trail says
+    // what Shopify ended up believing rather than what was asked for.
+    await recordAudit({
+      action: 'PRODUCT_PUBLISH',
+      resourceType: 'PRODUCT',
+      resourceId: gid,
+      after: {
+        publishedTo: result.published.map((entry) => entry.name),
+        visibleToCustomers: result.state.some((entry) => entry.isPublished),
+      },
+      metadata: { state: result.state, requestedPublicationIds: publicationIds ?? null },
+    });
+
     sendSuccess(res, result);
   }),
 );
@@ -71,6 +96,22 @@ publicationsWriteRouter.post(
     const gid = toShopifyGid(req.params.id ?? '', 'Product');
     const publicationIds = readPublicationIds((req.body ?? {}) as Record<string, unknown>);
     const result = await unpublishProduct(gid, publicationIds);
+
+    // Removing a product from sale is equally consequential and equally likely to
+    // need explaining later.
+    await recordAudit({
+      action: 'PRODUCT_UNPUBLISH',
+      resourceType: 'PRODUCT',
+      resourceId: gid,
+      after: {
+        // `published` names the publications the call acted on; after an
+        // unpublish those are the ones it was REMOVED from.
+        removedFrom: result.published.map((entry) => entry.name),
+        visibleToCustomers: result.state.some((entry) => entry.isPublished),
+      },
+      metadata: { state: result.state, requestedPublicationIds: publicationIds ?? null },
+    });
+
     sendSuccess(res, result);
   }),
 );
