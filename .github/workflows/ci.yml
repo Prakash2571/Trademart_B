@@ -25,30 +25,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # setup-node's `cache: npm` hashes a lockfile to build the cache key and
-      # FAILS the whole job if none exists. A lockfile could not be generated
-      # where this repo was authored (the npm registry was unreachable), so if
-      # one is not committed we generate it here FIRST, using the runner's
-      # preinstalled node, which does have registry access. This runs before
-      # setup-node so the cache step finds the file, and lets the job use
-      # `npm ci` either way.
-      #
-      # Commit package-lock.json (npm install --package-lock-only) to make the
-      # install fully reproducible; this step then no-ops.
-      - name: Ensure a lockfile exists
-        run: |
-          if [ -f package-lock.json ]; then
-            echo "Committed lockfile present."
-          else
-            echo "::warning title=No committed lockfile::Generating package-lock.json for this run only. Commit it (npm install --package-lock-only) for reproducible installs."
-            npm install --package-lock-only --no-audit --no-fund
-          fi
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
 
+      # `npm ci` ONLY - never `npm install`.
+      #
+      # package-lock.json is committed, so this installs the exact resolved tree
+      # with verified integrity hashes and fails loudly if the lockfile and
+      # package.json disagree.
+      #
+      # There used to be a step here that generated a lockfile when none was
+      # committed. It existed because the registry was unreachable where this repo
+      # was authored, and it has been REMOVED now that a real lockfile exists: a
+      # fallback that quietly resolves fresh versions turns "the lockfile is
+      # missing or wrong" from a build failure into a silent difference between
+      # what CI tested and what production installs. That is exactly the failure a
+      # lockfile is for.
       - name: Install dependencies
         run: npm ci
 
@@ -82,6 +76,13 @@ jobs:
           load: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Passed so the build args are exercised in CI rather than only by
+          # start.sh. A typo'd ARG name fails silently at runtime - /api/version
+          # just reports "unknown" - so building with them here is what proves the
+          # wiring works.
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_TIME=${{ github.event.repository.updated_at }}
 
   compose:
     name: compose config

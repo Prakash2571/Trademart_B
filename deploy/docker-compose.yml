@@ -44,6 +44,17 @@ services:
       context: ..
       dockerfile: Dockerfile
       target: runtime
+      args:
+        # Build identity for GET /api/version, so a running container can be
+        # matched to the commit it was built from. Without these it reports
+        # "unknown", which makes "is this actually my fix?" unanswerable - and a
+        # locally built stack cannot be identified by package version alone.
+        #
+        # start.sh populates these from git; the defaults keep a bare
+        # `docker compose build` working outside a checkout.
+        APP_VERSION: ${APP_VERSION:-unknown}
+        GIT_SHA: ${GIT_SHA:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-}
     image: trademart-backend:${IMAGE_TAG:-latest}
     <<: *defaults
     environment:
