@@ -339,16 +339,123 @@ export const SHOPIFY_FEATURES: readonly FeatureDefinition[] = Object.freeze([
     key: 'dropshipping.pricing',
     group: 'dropshipping',
     action: 'pricing',
-    title: 'Dropshipping pricing rules',
+    title: 'Dropshipping pricing settings and price recommendation',
+    // No scope: this is arithmetic over costs Trademart already holds. It writes nothing
+    // to Shopify, so there is no permission to grant.
     requiredScopes: [],
-    // NOT implemented: target-margin and markup pricing rules with category and
-    // per-product overrides do not exist yet. Reported as NOT_IMPLEMENTED so the
-    // operator is not sent looking for a scope that would change nothing.
+    implemented: true,
+    operations: [],
+    routes: [
+      'GET /api/dropshipping/settings',
+      'PUT /api/dropshipping/settings',
+      'POST /api/intelligence/candidates/:id/analyze',
+    ],
+    note: 'Target-margin, markup and fixed-uplift strategies with Conservative/Balanced/Premium scenarios and per-candidate overrides. Enforces a minimum margin and a minimum contribution: a breaching scenario is shown as computed and marked not viable, alongside the price that would clear both floors, rather than being silently raised. Recommends only - it never changes a price in Shopify.',
+  },
+  {
+    key: 'dropshipping.settings.write',
+    group: 'dropshipping',
+    action: 'settings.write',
+    title: 'Edit dropshipping cost, SLA and pricing settings',
+    requiredScopes: [],
+    implemented: true,
+    operations: [],
+    routes: ['PUT /api/dropshipping/settings'],
+    note: 'Persisted per shop in MongoDB, so a fee rate change does not need a redeploy. Requires a database: without one the settings would appear to save and vanish on the next request. Changes which orders are flagged and what price is recommended, never a price in Shopify.',
+  },
+  // ---- Product research / merchandising ----------------------------------
+  //
+  // The honest summary of this group: Trademart can measure what THIS STORE has done,
+  // and it cannot measure the market. Store performance and fulfillment history come
+  // from Shopify orders and are real. Demand, trend, competition and seasonality come
+  // only from figures an operator reads elsewhere and types in, because Tradelle
+  // publishes no API and the keyword integrations are not built.
+  //
+  // The two unbuilt entries are declared here rather than omitted, so
+  // GET /api/shopify/capabilities reports them as NOT_IMPLEMENTED. An absent entry would
+  // leave the UI free to imply a capability that does not exist.
+  {
+    key: 'research.candidates',
+    group: 'research',
+    action: 'candidates',
+    title: 'Record and score product candidates',
+    // Persistence is Trademart's own; nothing about a candidate touches Shopify until it
+    // is pushed.
+    requiredScopes: [],
+    implemented: true,
+    operations: [],
+    routes: [
+      'GET /api/intelligence/candidates',
+      'POST /api/intelligence/candidates',
+      'POST /api/intelligence/candidates/:id/analyze',
+    ],
+    note: 'Deterministic scoring over eight factors with published band tables - no model and no learned weights, so any score can be reproduced by hand. Requires MongoDB: a candidate does not exist in Shopify, so this is the one collection Trademart is the system of record for.',
+  },
+  {
+    key: 'research.storeFit',
+    group: 'research',
+    action: 'storeFit',
+    title: 'Judge a candidate against this store\u2019s own trading history',
+    // read_orders for what sold and how it delivered; read_products to map a sale to its
+    // category, since an order line carries no productType.
+    requiredScopes: ['read_orders', 'read_products'],
+    implemented: true,
+    operations: ['query TrademartOrders', 'query TrademartProducts'],
+    routes: ['POST /api/intelligence/candidates/:id/analyze'],
+    note: 'The only MEASURED research signal, and what makes this more than a generic product-research tool. Measured delivery performance on comparable products LOWERS store fit, closing the loop from fulfillment back into research. Without these scopes store fit is reported as unscored - never as zero.',
+  },
+  {
+    key: 'research.pushDraft',
+    group: 'research',
+    action: 'pushDraft',
+    title: 'Create a Shopify DRAFT product from a candidate',
+    requiredScopes: ['write_products'],
+    implemented: true,
+    operations: [
+      'mutation TrademartProductCreate',
+      'mutation TrademartVariantsBulkCreate',
+    ],
+    routes: ['POST /api/intelligence/candidates/:id/push'],
+    note: 'Always a DRAFT. There is no publish parameter and no auto-publish: status DRAFT and publish false are hard-coded and asserted, and the created product is re-checked afterwards. Publishing remains a separate deliberate action through products.publish. Reuses the existing product create path rather than a second implementation, and records the candidate\u2019s supplier cost against the new variant so the margin is not entered twice.',
+  },
+  {
+    key: 'research.duplicateDetection',
+    group: 'research',
+    action: 'duplicateDetection',
+    title: 'Detect duplicates before pushing',
+    requiredScopes: ['read_products'],
+    implemented: true,
+    operations: ['query TrademartProducts'],
+    routes: ['GET /api/intelligence/candidates/:id/duplicates'],
+    note: 'Exact identifiers, then exact normalised titles, then title-word overlap. Deliberately no stemming or fuzzy matching: a false positive blocks a legitimate push, and an operator who learns to click through a block stops reading it. Only exact matches block, and an archived product never does.',
+  },
+  {
+    key: 'research.marketDemand',
+    group: 'research',
+    action: 'marketDemand',
+    title: 'Measured search volume, trend and competition',
+    // Would need the Google Ads keyword planning API. Declared with no scopes because a
+    // SHOPIFY scope is not what is missing - this is a different vendor entirely.
+    requiredScopes: [],
+    // The important false. Demand IS scored today, but only from a figure an operator
+    // typed in. Claiming this capability would imply Trademart measures the market.
     implemented: false,
     operations: [],
     routes: [],
-    note: 'Not implemented. Alerting thresholds (minimum margin, minimum profit) exist and are reported by GET /api/dropshipping/settings, but rule-driven price RECOMMENDATION is not built. Granting a scope would not enable it.',
+    note: 'NOT IMPLEMENTED as a measurement. Demand, trend, competition and seasonality are scored only from figures an operator records by hand, and the score reports that as ESTIMATED confidence with the operator named as the source. Google Ads keyword planning would provide real volumes and is not built; Google Trends has no official public API at all. No Shopify scope affects this.',
   },
+  {
+    key: 'merchandising.recommendations',
+    group: 'merchandising',
+    action: 'recommendations',
+    title: 'Automatic collection and merchandising recommendations',
+    requiredScopes: [],
+    implemented: false,
+    operations: [],
+    routes: [],
+    note: 'Not implemented. Research recommends whether to STOCK a product; it does not recommend how to merchandise the existing catalogue (collection membership, bundling, cross-sells). Granting a scope would not enable it.',
+  },
+
   {
     key: 'dropshipping.deposit',
     group: 'dropshipping',

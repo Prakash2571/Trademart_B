@@ -25,6 +25,7 @@ import { getOrder, listOrders, type Paginated } from '../shopify/shopify.service
 import type { OrderDto } from '../shopify/shopify.types';
 import type { ManualCost } from '../suppliers/cost';
 import { loadManualCostMap } from '../suppliers/manualCost.service';
+import { loadSettings } from './dropshipping.settings.service';
 import {
   DEFAULT_DROPSHIP_COST_CONFIG,
   DEFAULT_SHIPPING_SLA,
@@ -41,11 +42,12 @@ export type {
 } from './dropshipping.view';
 
 /**
- * Effective settings.
+ * Effective settings from CONFIGURATION only - no database read.
  *
- * One function so the service, the analytics and the controller cannot disagree
- * about what the thresholds are. Falls back to the documented defaults, so an
- * unconfigured deployment behaves predictably rather than with zeroes.
+ * Kept because the synchronous fallback is genuinely useful: it is a coherent
+ * configuration that needs no await and no Mongo. Callers that can await should prefer
+ * loadSettings(), which layers the operator's stored settings on top - otherwise a fee
+ * rate changed through the settings screen would not affect the figures.
  */
 export function resolveSettings(): DropshipSettings {
   const overrides = (config as { dropshipping?: Partial<DropshipSettings> }).dropshipping;
@@ -54,6 +56,16 @@ export function resolveSettings(): DropshipSettings {
     sla: { ...DEFAULT_SHIPPING_SLA, ...(overrides?.sla ?? {}) },
   };
 }
+
+// Re-exported so callers have one import for the dropshipping surface. loadSettings is
+// what the controllers and Research use; resolveSettings is the config-only fallback it
+// builds on.
+export {
+  configuredSettings,
+  loadSettings,
+  saveSettings,
+} from './dropshipping.settings.service';
+export type { EffectiveSettings } from './dropshipping.settings.service';
 
 /**
  * Loads recorded supplier costs for every variant across a batch of orders.
@@ -105,7 +117,9 @@ export async function listDropshipOrders(
   params: ListDropshipParams = {},
   now: Date = new Date(),
 ): Promise<Paginated<DropshipOrder>> {
-  const settings = resolveSettings();
+  // loadSettings, not resolveSettings: an operator who lowers the minimum margin on the
+  // settings screen must see it reflected in the order list, not only after a redeploy.
+  const settings = await loadSettings();
   const page = await listOrders({
     first: params.first ?? 25,
     ...(params.after === undefined ? {} : { after: params.after }),
@@ -124,7 +138,7 @@ export async function getDropshipOrder(
   gid: string,
   now: Date = new Date(),
 ): Promise<DropshipOrder> {
-  const settings = resolveSettings();
+  const settings = await loadSettings();
   const order = await getOrder(gid);
   const costs = await loadCostsFor([order]);
   return buildDropshipOrder(order, costs, settings, now);
