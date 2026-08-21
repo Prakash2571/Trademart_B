@@ -157,6 +157,94 @@ export interface DropshipShipment {
 }
 
 /* ===========================================================================
+ * Order economics
+ * ======================================================================== */
+
+/**
+ * What to fold into the commercial cost, and at what rate.
+ *
+ * Every inclusion is a switch because these are commercial modelling choices, not
+ * facts. A store that funds ads from a separate budget should not have an
+ * advertising allowance deducted from per-order contribution, and a store on a
+ * flat-fee gateway should not have a percentage payment fee assumed.
+ *
+ * Excluding a component is NOT the same as it being unknown: an excluded component
+ * contributes a KNOWN zero by policy, whereas an unknown one makes the total
+ * unknown. Conflating those is how a dashboard reports profit on an order whose
+ * supplier cost nobody entered.
+ */
+export interface DropshipCostConfig {
+  includeSupplierShipping: boolean;
+  includePaymentFees: boolean;
+  includeShopifyFees: boolean;
+  includeAdvertisingAllowance: boolean;
+  /** Percentage of customer revenue. */
+  paymentFeePercentage: number;
+  shopifyFeePercentage: number;
+  /**
+   * Percentage of revenue set aside for acquisition. An ALLOWANCE, not a measured
+   * spend - so any figure derived from it is ESTIMATED, never KNOWN.
+   */
+  advertisingAllowancePercentage: number;
+  /** Flat per-order commercial cost (packaging, support, subscriptions). */
+  otherCommercialCostPerOrder: number;
+}
+
+export const DEFAULT_DROPSHIP_COST_CONFIG: Readonly<DropshipCostConfig> = Object.freeze({
+  includeSupplierShipping: true,
+  includePaymentFees: true,
+  includeShopifyFees: true,
+  // Off by default: an advertising allowance is a real cost for most dropshipping
+  // stores, but assuming one silently reduces every reported margin. The operator
+  // opts in once they know their number.
+  includeAdvertisingAllowance: false,
+  // A common card-processing rate. Deliberately not presented as measured.
+  paymentFeePercentage: 2.9,
+  shopifyFeePercentage: 0,
+  advertisingAllowancePercentage: 15,
+  otherCommercialCostPerOrder: 0,
+});
+
+/**
+ * One order's money, with every figure carrying its own confidence.
+ *
+ * THE TWO COST TOTALS ARE DELIBERATELY SEPARATE (C6):
+ *
+ *   landedCost      what it costs to get the goods to the customer -
+ *                   supplier product + supplier shipping + fulfillment surcharge.
+ *                   This is the money OWED TO THE SUPPLIER, and therefore the
+ *                   basis of capital exposure.
+ *   commercialCost  landed cost + payment fees + platform fees + advertising
+ *                   allowance + other configured costs. The basis of CONTRIBUTION.
+ *
+ * Calling both "supplier cost" is how a margin ends up looking healthy while the
+ * order loses money, and how supplier exposure ends up overstated by fees the
+ * supplier never charges.
+ */
+export interface OrderEconomics {
+  currencyCode: string | null;
+  /** What the customer actually paid, per Shopify. */
+  customerRevenue: Figure;
+  supplierProductCost: Figure;
+  supplierShippingCost: Figure;
+  supplierFulfillmentCost: Figure;
+  paymentFees: Figure;
+  shopifyFees: Figure;
+  advertisingAllowance: Figure;
+  otherCommercialCosts: Figure;
+  landedCost: Figure;
+  commercialCost: Figure;
+  estimatedProfit: Figure;
+  /** Percentage of revenue. Null when it cannot be computed. */
+  estimatedMargin: { value: number | null; confidence: DataConfidence };
+  /** Worst confidence among the figures a decision would rest on. */
+  confidence: DataConfidence;
+  /** Which inputs are missing, so "unknown" is explainable rather than bare. */
+  missingInputs: string[];
+  warnings: string[];
+}
+
+/* ===========================================================================
  * Shipping SLA (C13)
  * ======================================================================== */
 
