@@ -200,6 +200,148 @@ describe('mapOrder', () => {
     assert.equal(mapOrder(raw).supplier, 'TRADELLE');
   });
 
+  it('maps the shipment fields the dropshipping view depends on', () => {
+    const shipped: RawOrder = {
+      ...raw,
+      fulfillments: [
+        {
+          id: 'gid://shopify/Fulfillment/1',
+          status: 'SUCCESS',
+          displayStatus: 'IN_TRANSIT',
+          createdAt: '2026-02-02T09:00:00Z',
+          estimatedDeliveryAt: '2026-02-08T00:00:00Z',
+          inTransitAt: '2026-02-03T07:00:00Z',
+          deliveredAt: null,
+          trackingInfo: [{ company: 'Royal Mail', number: 'AB123', url: 'https://track' }],
+          events: {
+            edges: [
+              {
+                node: {
+                  id: 'e2',
+                  status: 'IN_TRANSIT',
+                  happenedAt: '2026-02-03T07:00:00Z',
+                  message: 'Departed origin',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    };
+
+    const fulfillment = mapOrder(shipped).fulfillments[0];
+    // displayStatus is the field that says WHERE the parcel is; `status: SUCCESS`
+    // only says the fulfillment record is fine.
+    assert.equal(fulfillment?.displayStatus, 'IN_TRANSIT');
+    assert.equal(fulfillment?.estimatedDeliveryAt, '2026-02-08T00:00:00Z');
+    assert.equal(fulfillment?.inTransitAt, '2026-02-03T07:00:00Z');
+    assert.equal(fulfillment?.deliveredAt, null);
+    assert.equal(fulfillment?.events.length, 1);
+    assert.equal(fulfillment?.events[0]?.status, 'IN_TRANSIT');
+  });
+
+  it('keeps EVERY parcel of a split shipment, not just the first', () => {
+    // Reporting only the first would tell a customer their second parcel does not
+    // exist. The flat trackingNumber field stays as the first entry so existing
+    // readers are unaffected.
+    const split: RawOrder = {
+      ...raw,
+      fulfillments: [
+        {
+          id: 'gid://shopify/Fulfillment/1',
+          status: 'SUCCESS',
+          trackingInfo: [
+            { company: 'Royal Mail', number: 'AB123', url: 'https://track/1' },
+            { company: 'Royal Mail', number: 'CD456', url: 'https://track/2' },
+          ],
+        },
+      ],
+    };
+
+    const fulfillment = mapOrder(split).fulfillments[0];
+    assert.equal(fulfillment?.tracking.length, 2);
+    assert.equal(fulfillment?.tracking[1]?.number, 'CD456');
+    assert.equal(fulfillment?.trackingNumber, 'AB123');
+  });
+
+  it('drops a tracking entry that tracks nothing', () => {
+    // Shopify can return a trackingInfo row with only a company name. A row with
+    // no number and no URL is noise, not a parcel.
+    const empty: RawOrder = {
+      ...raw,
+      fulfillments: [
+        {
+          id: 'gid://shopify/Fulfillment/1',
+          status: 'OPEN',
+          trackingInfo: [{ company: 'Royal Mail', number: null, url: null }],
+        },
+      ],
+    };
+
+    const fulfillment = mapOrder(empty).fulfillments[0];
+    assert.deepEqual(fulfillment?.tracking, []);
+    assert.equal(fulfillment?.trackingNumber, null);
+  });
+
+  it('carries the variant unit cost, and keeps an absent one NULL not zero', () => {
+    // This is the only per-order supplier cost signal Shopify gives us. Zero would
+    // claim the product was free.
+    const withCost: RawOrder = {
+      ...raw,
+      lineItems: {
+        edges: [
+          {
+            node: {
+              id: 'gid://shopify/LineItem/1',
+              title: 'Widget',
+              quantity: 2,
+              sku: 'W-1',
+              variant: {
+                id: 'gid://shopify/ProductVariant/200',
+                inventoryItem: { unitCost: { amount: '7.50', currencyCode: 'GBP' } },
+              },
+              originalUnitPriceSet: { shopMoney: { amount: '20.00', currencyCode: 'GBP' } },
+            },
+          },
+        ],
+      },
+    };
+
+    assert.equal(mapOrder(withCost).lineItems[0]?.unitCost?.amount, 7.5);
+    // The base fixture supplies no unitCost at all.
+    assert.equal(mapOrder(raw).lineItems[0]?.unitCost, null);
+  });
+
+  it('uses the fulfillment service as supplier evidence', () => {
+    // Stronger than vendor or tags, which a merchant edits by hand.
+    const routed: RawOrder = {
+      ...raw,
+      lineItems: {
+        edges: [
+          {
+            node: {
+              id: 'gid://shopify/LineItem/1',
+              title: 'Widget',
+              quantity: 1,
+              vendor: 'Acme',
+              fulfillmentService: { handle: 'tradelle-fulfillment', serviceName: 'Tradelle' },
+              product: { id: 'gid://shopify/Product/100', vendor: 'Acme' },
+              originalUnitPriceSet: { shopMoney: { amount: '20.00', currencyCode: 'GBP' } },
+            },
+          },
+        ],
+      },
+    };
+
+    const line = mapOrder(routed).lineItems[0];
+    assert.equal(line?.supplier, 'TRADELLE');
+    assert.equal(line?.fulfillmentService, 'tradelle-fulfillment');
+    assert.ok(
+      line?.supplierEvidence.some((entry) => entry.includes('fulfillmentService')),
+      `expected fulfillmentService evidence, got ${JSON.stringify(line?.supplierEvidence)}`,
+    );
+  });
+
   it('marks mixed-supplier orders as OTHER rather than overstating', () => {
     const mixed: RawOrder = {
       ...raw,

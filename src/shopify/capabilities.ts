@@ -280,6 +280,90 @@ export const SHOPIFY_FEATURES: readonly FeatureDefinition[] = Object.freeze([
     routes: ['POST /api/webhooks/register', 'GET /api/webhooks/subscriptions'],
     note: 'write_webhooks does not exist as a Shopify scope. Each subscribed topic instead requires the read scope covering its payload.',
   },
+
+  // ---- Dropshipping operations -------------------------------------------
+  //
+  // These are Trademart features built ON Shopify reads, so they appear here for
+  // the same reason the others do: the operator needs to know whether a screen
+  // will work, and why not when it will not. Their required scopes are the scopes
+  // of the Shopify data they normalise - there is no separate "dropshipping"
+  // permission to grant.
+  {
+    key: 'dropshipping.orders.read',
+    group: 'dropshipping',
+    action: 'orders.read',
+    title: 'Dropshipping order book',
+    requiredScopes: ['read_orders'],
+    implemented: true,
+    operations: ['query TrademartOrders', 'query TrademartOrder'],
+    routes: ['GET /api/dropshipping/orders', 'GET /api/dropshipping/orders/:id'],
+    note: 'A normalised VIEW of Shopify orders. Nothing is duplicated into Trademart, and there is no write surface - fulfilling and refunding stay in Shopify.',
+  },
+  {
+    key: 'dropshipping.fulfillment.read',
+    group: 'dropshipping',
+    action: 'fulfillment.read',
+    title: 'Normalised fulfillment state',
+    requiredScopes: ['read_orders'],
+    implemented: true,
+    operations: ['query TrademartOrders (fulfillments.displayStatus)'],
+    routes: ['GET /api/dropshipping/orders', 'GET /api/dropshipping/dashboard'],
+    note: "Collapses Shopify's three overlapping fulfillment fields into one progress state, always retaining the raw values.",
+  },
+  {
+    key: 'dropshipping.tracking.read',
+    group: 'dropshipping',
+    action: 'tracking.read',
+    title: 'Carrier tracking and delivery estimates',
+    requiredScopes: ['read_orders'],
+    implemented: true,
+    operations: ['query TrademartOrders (fulfillments.trackingInfo, events)'],
+    routes: ['GET /api/dropshipping/orders/:id'],
+    note: 'Every parcel of a split shipment, plus carrier scan history and Shopify\u2019s own delivery estimate. Trademart never contacts a carrier directly.',
+  },
+  {
+    key: 'dropshipping.analytics',
+    group: 'dropshipping',
+    action: 'analytics',
+    title: 'Order economics, profit and supplier capital exposure',
+    // read_inventory is what exposes inventoryItem.unitCost - Shopify's "cost per
+    // item" - which is the only per-order supplier cost signal available. Without
+    // it, every order's cost is honestly reported as UNKNOWN rather than guessed.
+    requiredScopes: ['read_orders', 'read_inventory'],
+    implemented: true,
+    operations: ['query TrademartOrders (variant.inventoryItem.unitCost)'],
+    routes: ['GET /api/dropshipping/dashboard'],
+    note: 'Landed cost (owed to the supplier) is kept separate from commercial cost (landed + fees + allowances). Without read_inventory the screen still loads and reports costs as UNKNOWN - never as zero.',
+  },
+  {
+    key: 'dropshipping.pricing',
+    group: 'dropshipping',
+    action: 'pricing',
+    title: 'Dropshipping pricing rules',
+    requiredScopes: [],
+    // NOT implemented: target-margin and markup pricing rules with category and
+    // per-product overrides do not exist yet. Reported as NOT_IMPLEMENTED so the
+    // operator is not sent looking for a scope that would change nothing.
+    implemented: false,
+    operations: [],
+    routes: [],
+    note: 'Not implemented. Alerting thresholds (minimum margin, minimum profit) exist and are reported by GET /api/dropshipping/settings, but rule-driven price RECOMMENDATION is not built. Granting a scope would not enable it.',
+  },
+  {
+    key: 'dropshipping.deposit',
+    group: 'dropshipping',
+    action: 'deposit',
+    title: 'Partial payment / deposit orders',
+    requiredScopes: [],
+    // Deliberately false. Deposits need Shopify payment terms or checkout payment
+    // customisation, which are plan- and API-gated. The brief is explicit that this
+    // must be capability-driven and must NOT be simulated by changing a product
+    // price - so it is declared unavailable rather than faked.
+    implemented: false,
+    operations: [],
+    routes: [],
+    note: 'Not implemented, and gated by the Shopify plan even once it is. Deposits will never be simulated by altering a product price; until real payment-terms support exists this reports as unavailable.',
+  },
 ]);
 
 /**
