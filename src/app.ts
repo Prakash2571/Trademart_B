@@ -46,6 +46,7 @@ import {
 import { auditRouter } from './audit/audit.controller';
 import { config } from './config';
 import { customersRouter } from './customers/customers.controller';
+import { dropshippingRouter } from './dropshipping/dropshipping.controller';
 import {
   diagnosticsRouter,
   publicDiagnosticsRouter,
@@ -208,6 +209,10 @@ export function createApp(): Express {
   // Integrity findings name products and their visibility, so they follow the
   // normal read guard.
   app.use('/api', requireOperatorForReads, diagnosticsRouter);
+  // Dropshipping is a READ-ONLY view over Shopify orders - there is no write
+  // surface, so the read guard is the whole story. Fulfilling, refunding and
+  // cancelling deliberately stay in Shopify.
+  app.use('/api', requireOperatorForReads, dropshippingRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);
