@@ -28,6 +28,7 @@
  * Pure: no Shopify, no database, no config singleton, no clock.
  */
 
+import { worstConfidence } from '../common/dataQuality';
 import {
   percentageOf,
   roundMoney,
@@ -67,20 +68,11 @@ function excluded(currencyCode: string | null, label: string): Figure {
   };
 }
 
-const CONFIDENCE_ORDER: Record<DataConfidence, number> = {
-  KNOWN: 0,
-  ESTIMATED: 1,
-  UNKNOWN: 2,
-};
-
-/** The weakest confidence wins: a total is only as trustworthy as its worst input. */
-export function worstConfidence(...values: DataConfidence[]): DataConfidence {
-  let worst: DataConfidence = 'KNOWN';
-  for (const value of values) {
-    if (CONFIDENCE_ORDER[value] > CONFIDENCE_ORDER[worst]) worst = value;
-  }
-  return worst;
-}
+// Re-exported so existing importers of worstConfidence from this module keep
+// working, while the implementation lives in common/dataQuality alongside the
+// DataConfidence type it operates on. Research needs the same rule, and two copies
+// of "which confidence wins" would eventually disagree.
+export { worstConfidence } from '../common/dataQuality';
 
 /**
  * Adds figures, propagating ignorance.
