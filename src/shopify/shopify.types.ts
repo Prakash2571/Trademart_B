@@ -248,6 +248,14 @@ export interface RawOrder {
   } | null;
   fulfillments?: RawFulfillment[] | null;
   lineItems?: RawConnection<RawLineItem> | null;
+  cancelledAt?: string | null;
+  shippingAddress?: {
+    countryCode?: string | null;
+    country?: string | null;
+    provinceCode?: string | null;
+    province?: string | null;
+    city?: string | null;
+  } | null;
 }
 
 export interface RawCustomer {
@@ -429,6 +437,19 @@ export interface OrderDto {
   lineItems: OrderLineItemDto[];
   fulfillments: FulfillmentDto[];
   supplier: SupplierClassification;
+  /** Set when Shopify reports the order cancelled. Null otherwise. */
+  cancelledAt: string | null;
+  /**
+   * Where it is going. Null when protected customer data access is not approved -
+   * which is a WITHHELD field, not an order with no destination.
+   */
+  destination: {
+    countryCode: string | null;
+    country: string | null;
+    provinceCode: string | null;
+    province: string | null;
+    city: string | null;
+  } | null;
 }
 
 export interface CustomerDto {

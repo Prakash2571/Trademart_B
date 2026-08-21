@@ -34,6 +34,8 @@ function order(overrides: Partial<OrderDto> = {}): OrderDto {
     shippingLine: null,
     lineItems: [],
     fulfillments: [],
+    cancelledAt: null,
+    destination: null,
     supplier: 'UNKNOWN',
     ...overrides,
   };

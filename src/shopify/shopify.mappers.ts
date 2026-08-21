@@ -262,6 +262,20 @@ export function mapOrder(raw: RawOrder): OrderDto {
     lineItems,
     fulfillments: mapFulfillments(raw),
     supplier,
+    cancelledAt: raw.cancelledAt ?? null,
+    // Null when the BASIC (no protected-customer-data) query was used. That is a
+    // WITHHELD field, not an order without a destination, and callers must not read
+    // it as "unknown region because the customer did not give one".
+    destination:
+      raw.shippingAddress === null || raw.shippingAddress === undefined
+        ? null
+        : {
+            countryCode: raw.shippingAddress.countryCode ?? null,
+            country: raw.shippingAddress.country ?? null,
+            provinceCode: raw.shippingAddress.provinceCode ?? null,
+            province: raw.shippingAddress.province ?? null,
+            city: raw.shippingAddress.city ?? null,
+          },
   };
 }
 

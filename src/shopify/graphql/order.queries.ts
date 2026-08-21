@@ -22,6 +22,7 @@ const ORDER_CORE_FIELDS = /* GraphQL */ `
   id
   name
   createdAt
+  cancelledAt
   processedAt
   updatedAt
   displayFinancialStatus
@@ -139,6 +140,17 @@ const CUSTOMER_FIELDS = /* GraphQL */ `
     displayName
     email
     numberOfOrders
+  }
+  # Destination, for regional fulfillment analytics ("which regions are slow?").
+  # Lives in the FULL document only: a shipping address is protected customer data,
+  # so a deployment without that approval must still be able to load order
+  # financials. It degrades to null rather than failing the query.
+  shippingAddress {
+    countryCode
+    country
+    provinceCode
+    province
+    city
   }
 `;
 
