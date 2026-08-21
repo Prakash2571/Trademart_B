@@ -188,6 +188,19 @@ export interface DropshipCostConfig {
   advertisingAllowancePercentage: number;
   /** Flat per-order commercial cost (packaging, support, subscriptions). */
   otherCommercialCostPerOrder: number;
+
+  /**
+   * Alerting floors. An order below either is surfaced under Needs Attention.
+   *
+   * Both are needed because they catch different problems: a percentage floor misses
+   * a thin absolute contribution on a cheap item, and an absolute floor misses a
+   * poor percentage on an expensive one.
+   *
+   * These are ALERTING thresholds only - nothing here changes a price. The
+   * target-margin and markup pricing rules are a separate, later concern.
+   */
+  minimumMarginPercentage: number;
+  minimumProfitAmount: number;
 }
 
 export const DEFAULT_DROPSHIP_COST_CONFIG: Readonly<DropshipCostConfig> = Object.freeze({
@@ -203,6 +216,12 @@ export const DEFAULT_DROPSHIP_COST_CONFIG: Readonly<DropshipCostConfig> = Object
   shopifyFeePercentage: 0,
   advertisingAllowancePercentage: 15,
   otherCommercialCostPerOrder: 0,
+  // A commonly-cited dropshipping floor. Deliberately not zero: an order at 2%
+  // contribution is technically profitable and commercially not worth fulfilling.
+  minimumMarginPercentage: 15,
+  // 0 disables the absolute floor, because any default would be wrong for some
+  // store's currency and price points.
+  minimumProfitAmount: 0,
 });
 
 /**
