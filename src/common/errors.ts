@@ -21,12 +21,25 @@ export type ErrorCode =
   | 'SHOPIFY_HTTP_ERROR'
   | 'SHOPIFY_NETWORK_ERROR'
   | 'SHOPIFY_NOT_FOUND'
+  /** We gave up waiting on Shopify. Distinct from being unable to reach it. */
+  | 'SHOPIFY_TIMEOUT'
+  /**
+   * Shopify has failed repeatedly (429/5xx/timeouts) and the circuit breaker is
+   * open, so bulk writes are refused rather than emitting hundreds of individual
+   * failures and leaving a half-applied plan.
+   */
+  | 'SHOPIFY_DEGRADED'
   // Platform
   | 'VALIDATION_ERROR'
   | 'NOT_FOUND'
   | 'DATABASE_UNAVAILABLE'
   | 'RATE_LIMITED'
   | 'INTERNAL_ERROR'
+  /** Authenticated, but not permitted to do this. */
+  | 'FORBIDDEN'
+  // Idempotency-Key handling on mutating endpoints
+  | 'IDEMPOTENCY_CONFLICT'
+  | 'IDEMPOTENCY_IN_PROGRESS'
   // Webhooks
   | 'WEBHOOK_NOT_CONFIGURED'
   | 'WEBHOOK_INVALID_SIGNATURE'
@@ -49,6 +62,19 @@ export type ErrorCode =
   | 'PREVIEW_EXPIRED'
   | 'PREVIEW_ALREADY_APPLIED'
   | 'PREVIEW_STALE'
+  // Cost / money correctness. Pricing refuses rather than guessing.
+  | 'COST_UNKNOWN'
+  | 'CURRENCY_MISMATCH'
+  | 'SUPPLIER_UNAVAILABLE'
+  /**
+   * The product exists but could not be published to the Online Store. The
+   * product is deliberately left DRAFT when this happens.
+   */
+  | 'PUBLICATION_FAILED'
+  /** The resource changed in Shopify since the caller read it (stale write). */
+  | 'PRODUCT_CHANGED'
+  /** An inventory change exceeded MAX_INVENTORY_DELTA without confirmation. */
+  | 'INVENTORY_DELTA_TOO_LARGE'
   // Operator authentication (protects everything that can change the store)
   | 'UNAUTHORIZED'
   | 'CSRF_INVALID'
@@ -59,11 +85,28 @@ export type ErrorCode =
   // Dev/test tooling attempted to write to a non-development store
   | 'LIVE_STORE_WRITE_BLOCKED';
 
+/**
+ * The wire format for a failure.
+ *
+ * Two shapes are emitted at once, deliberately. The flat
+ * `success/code/message/details` keys are what every existing client already
+ * reads and must not break; the nested `error` object carries the same values
+ * plus `requestId` and is the standardised taxonomy shape. Both are built from
+ * the same source values, so they cannot disagree about what went wrong.
+ */
 export interface ErrorBody {
   success: false;
   code: ErrorCode;
   message: string;
   details?: unknown;
+  /** Correlation id for this request. Present whenever the middleware ran. */
+  requestId?: string;
+  error: {
+    code: ErrorCode;
+    message: string;
+    requestId?: string;
+    details?: unknown;
+  };
 }
 
 /**
@@ -91,13 +134,23 @@ export class AppError extends Error {
     Error.captureStackTrace?.(this, AppError);
   }
 
-  toBody(): ErrorBody {
+  /**
+   * `requestId` is passed in rather than read from a global, so this class stays
+   * import-free and unit testable in isolation.
+   */
+  toBody(requestId?: string | null): ErrorBody {
+    const nested: ErrorBody['error'] = { code: this.code, message: this.message };
+    if (requestId !== undefined && requestId !== null) nested.requestId = requestId;
+    if (this.details !== undefined) nested.details = this.details;
+
     const body: ErrorBody = {
       success: false,
       code: this.code,
       message: this.message,
+      error: nested,
     };
     if (this.details !== undefined) body.details = this.details;
+    if (requestId !== undefined && requestId !== null) body.requestId = requestId;
     return body;
   }
 }
@@ -138,6 +191,7 @@ export function defaultStatusForCode(code: ErrorCode): number {
     // A dev/test tool refused to mutate a live store. 403: not a bad request,
     // a deliberate safety refusal.
     case 'LIVE_STORE_WRITE_BLOCKED':
+    case 'FORBIDDEN':
       return 403;
     // Apply was attempted without a valid, current, unused preview. 409: the
     // request conflicts with the required preview-then-apply workflow rather
@@ -150,6 +204,16 @@ export function defaultStatusForCode(code: ErrorCode): number {
       return 409;
     // A second automation apply arrived while one was already running.
     case 'AUTOMATION_ALREADY_RUNNING':
+    // Every "the world moved under you" refusal is a conflict: the request was
+    // fine, the state was not.
+    case 'PRODUCT_CHANGED':
+    case 'IDEMPOTENCY_CONFLICT':
+    case 'IDEMPOTENCY_IN_PROGRESS':
+    case 'INVENTORY_DELTA_TOO_LARGE':
+    // Refusing to price is a state conflict, not a bad request: the caller asked
+    // for something reasonable and the data is not good enough to do it safely.
+    case 'COST_UNKNOWN':
+    case 'CURRENCY_MISMATCH':
       return 409;
     // A failed HMAC or state check is an authentication failure, not a 400:
     // the request was well-formed but could not be proven to come from Shopify.
@@ -171,13 +235,23 @@ export function defaultStatusForCode(code: ErrorCode): number {
     case 'OPERATOR_NOT_CONFIGURED':
       return 503;
     case 'DATABASE_UNAVAILABLE':
+    // The dependency is unhealthy; come back later. Honest 503 semantics.
+    case 'SHOPIFY_DEGRADED':
+    case 'SUPPLIER_UNAVAILABLE':
       return 503;
+    // 504: we gave up waiting on an upstream, which is not the same as it
+    // refusing us or being unreachable.
+    case 'SHOPIFY_TIMEOUT':
+      return 504;
     case 'SHOPIFY_NETWORK_ERROR':
       return 502;
     case 'SHOPIFY_HTTP_ERROR':
     case 'SHOPIFY_GRAPHQL_ERROR':
     case 'SHOPIFY_USER_ERROR':
     case 'WEBHOOK_REGISTRATION_FAILED':
+    // Created but not published. Upstream-caused, and the product is left DRAFT
+    // so the resulting state is safe.
+    case 'PUBLICATION_FAILED':
       return 502;
     case 'INTERNAL_ERROR':
     default:
@@ -197,6 +271,11 @@ export function defaultRetryableForCode(code: ErrorCode): boolean {
   switch (code) {
     case 'SHOPIFY_THROTTLED':
     case 'SHOPIFY_NETWORK_ERROR':
+    case 'SHOPIFY_TIMEOUT':
+    case 'SHOPIFY_DEGRADED':
+    // Publication is an ordinary Shopify write, so a transient failure can
+    // genuinely succeed on a later, operator-initiated attempt.
+    case 'PUBLICATION_FAILED':
       return true;
     case 'OAUTH_NOT_CONFIGURED':
     case 'OAUTH_INVALID_REQUEST':

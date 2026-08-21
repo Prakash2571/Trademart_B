@@ -31,6 +31,9 @@ import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 
 import { errorHandler, notFoundHandler } from './common/errorHandler';
+import { httpLogger } from './common/httpLogger';
+import { REQUEST_ID_HEADER, requestIdMiddleware } from './common/requestId';
+import { helmetOptions } from './common/securityHeaders';
 import { analyticsRouter } from './analytics/analytics.controller';
 import { automationRouter } from './automation/automation.controller';
 import { oauthRouter } from './auth/oauth.controller';
@@ -69,7 +72,17 @@ export function createApp(): Express {
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
 
-  app.use(helmet());
+  // FIRST, before anything that can fail. Every log line, error body and audit
+  // row produced while serving this request needs the correlation id - including
+  // failures raised inside body parsing, CORS and rate limiting below.
+  app.use(requestIdMiddleware());
+  app.use(httpLogger());
+
+  // Restrictive CSP is safe here because this app serves ONLY JSON: nginx routes
+  // `/` and `/_next/static/` to the Next.js container and only `/api/` here, so
+  // these directives can never apply to the UI. The frontend's own CSP is a
+  // separate concern and is NOT set from this process.
+  app.use(helmet(helmetOptions()));
 
   // Only the configured frontend origin may call this API from a browser.
   //
@@ -87,9 +100,22 @@ export function createApp(): Express {
       // /api/automation/rules, which existed but was unreachable from a browser
       // because preflight rejected the method).
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'X-CSRF-Token', 'Authorization'],
+      // Idempotency-Key and X-Request-ID must be listed or the browser preflight
+      // rejects them, which would silently disable both features for every
+      // cross-origin request from the console.
+      allowedHeaders: [
+        'Content-Type',
+        'X-CSRF-Token',
+        'Authorization',
+        'Idempotency-Key',
+        REQUEST_ID_HEADER,
+      ],
       credentials: true,
       maxAge: 86400,
+      // Lets the browser READ the correlation id off the response, so the UI can
+      // show an id the operator can quote. Without this a cross-origin fetch
+      // cannot see the header at all and it would be backend-only.
+      exposedHeaders: [REQUEST_ID_HEADER],
     }),
   );
 
