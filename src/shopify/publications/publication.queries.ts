@@ -50,6 +50,38 @@ export const PRODUCT_PUBLICATIONS_QUERY = /* GraphQL */ `
   }
 `;
 
+/**
+ * Bulk status-vs-publication audit, for the integrity report.
+ *
+ * Uses `publishedOnPublication(publicationId:)` rather than resourcePublicationsV2
+ * because this runs over hundreds of products: the boolean is one field per
+ * product, whereas a nested connection per product would multiply the query cost
+ * and get the sweep throttled.
+ */
+export const PRODUCTS_PUBLICATION_AUDIT_QUERY = /* GraphQL */ `
+  query TrademartProductsPublicationAudit(
+    $first: Int!
+    $after: String
+    $publicationId: ID!
+  ) {
+    products(first: $first, after: $after) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      edges {
+        node {
+          id
+          title
+          status
+          tags
+          publishedOnPublication(publicationId: $publicationId)
+        }
+      }
+    }
+  }
+`;
+
 /** Publishes a resource (product) to one or more publications. */
 export const PUBLISHABLE_PUBLISH_MUTATION = /* GraphQL */ `
   mutation TrademartPublishablePublish($id: ID!, $input: [PublicationInput!]!) {

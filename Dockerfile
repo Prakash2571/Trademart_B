@@ -68,12 +68,18 @@ COPY --chown=node:node package.json ./
 USER node
 EXPOSE 4000
 
-# /api/health always answers 200 while the process is alive (it reports a
-# degraded database in the body rather than failing), so this is a liveness
-# probe, not a readiness probe. That is deliberate: the API is designed to keep
-# serving Shopify reads and pricing when Mongo is unreachable.
+# LIVENESS, not readiness - and now says so explicitly by probing /api/health/live
+# rather than relying on /api/health happening to always return 200.
+#
+# A failing Docker healthcheck gets the container restarted, and a restart cannot
+# fix a dependency that lives in another container. Probing readiness here would
+# turn a temporary Mongo blip into a crash loop. /api/health/live checks nothing
+# but this process, so it fails only when a restart is actually the right answer.
+#
+# Use /api/health/ready from a load balancer or a deploy gate, where "stop sending
+# traffic" is the correct response instead of "restart".
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||4000)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||4000)+'/api/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 ENTRYPOINT ["dumb-init", "--"]
 CMD ["node", "dist/server.js"]

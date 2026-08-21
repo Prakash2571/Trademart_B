@@ -39,11 +39,17 @@ import { automationRouter } from './automation/automation.controller';
 import { oauthRouter } from './auth/oauth.controller';
 import { operatorRouter } from './auth/operator/operator.controller';
 import {
+  requireOperator,
   requireOperatorForReads,
   requireOperatorForWrites,
 } from './auth/operator/operator.middleware';
+import { auditRouter } from './audit/audit.controller';
 import { config } from './config';
 import { customersRouter } from './customers/customers.controller';
+import {
+  diagnosticsRouter,
+  publicDiagnosticsRouter,
+} from './diagnostics/diagnostics.controller';
 import { healthRouter } from './health/health.controller';
 import { inventoryRouter } from './inventory/inventory.controller';
 import { inventoryWriteRouter } from './inventory/inventory.write.controller';
@@ -140,8 +146,13 @@ export function createApp(): Express {
   );
 
   // Health stays public: an uptime probe must not need a credential, and it
-  // reports only booleans and connection state.
+  // reports only booleans and connection state. /health/live is the container
+  // liveness probe; /health/ready is for a load balancer or a deploy gate.
   app.use('/api', healthRouter);
+
+  // Also public: build identity only (version, commit, build time), all of which
+  // is in the repository anyway. A deploy check has to read it before sign-in.
+  app.use('/api', publicDiagnosticsRouter);
 
   // Operator sign-in. NOT behind requireOperator - you cannot authenticate if
   // authenticating requires being authenticated.
@@ -190,6 +201,13 @@ export function createApp(): Express {
   // Manual supplier costs: GET is a read, PUT/DELETE are operator-protected
   // writes. Mounted with the write guard, which leaves GET open by default.
   app.use('/api', requireOperatorForWrites, manualCostRouter);
+  // The audit trail is a read, but a privileged one: it records who changed what.
+  // Always behind the full operator requirement, never the writes-only guard, so
+  // it cannot be read anonymously even with OPERATOR_PROTECT_READS left at false.
+  app.use('/api', requireOperator, auditRouter);
+  // Integrity findings name products and their visibility, so they follow the
+  // normal read guard.
+  app.use('/api', requireOperatorForReads, diagnosticsRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

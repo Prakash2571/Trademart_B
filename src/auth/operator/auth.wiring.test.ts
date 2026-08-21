@@ -48,7 +48,43 @@ describe('write routers are guarded', () => {
   }
 });
 
+describe('the audit trail is privileged, not merely a read', () => {
+  it('auditRouter requires an operator even when reads are otherwise open', () => {
+    // The audit trail records WHO changed WHAT. Behind requireOperatorForWrites it
+    // would be world-readable whenever OPERATOR_PROTECT_READS is false, which
+    // leaks operator identities and the store's change history to anyone. It must
+    // use the unconditional requireOperator.
+    const line = mountLine('auditRouter') ?? '';
+    assert.notEqual(line, '', 'auditRouter is not mounted in app.ts');
+    assert.ok(
+      /requireOperator\b(?!For)/.test(line),
+      `auditRouter must be mounted with requireOperator (not the writes-only or reads-only guard), got: ${line.trim()}`,
+    );
+  });
+});
+
 describe('public routers are intentionally public', () => {
+  it('publicDiagnosticsRouter is mounted with no guard, and is version-only', () => {
+    // It is public because a deploy check must read it before anyone signs in.
+    // That is only acceptable while it exposes build identity and nothing else,
+    // so this asserts the mount stays unguarded AND that the store-data
+    // diagnostics live on the separate guarded router.
+    const line = mountLine('publicDiagnosticsRouter') ?? '';
+    assert.notEqual(line, '', 'publicDiagnosticsRouter is not mounted in app.ts');
+    assert.ok(
+      !line.includes('requireOperator'),
+      'publicDiagnosticsRouter is deliberately public; guarding it would break pre-login deploy checks',
+    );
+
+    // ', diagnosticsRouter' and not 'diagnosticsRouter', because the latter is a
+    // substring of publicDiagnosticsRouter and would match the public mount.
+    const guarded = mountLine(', diagnosticsRouter') ?? '';
+    assert.ok(
+      guarded.includes('requireOperatorForReads'),
+      'diagnosticsRouter (integrity findings name products) must be behind requireOperatorForReads',
+    );
+  });
+
   it('the webhook RECEIVER is mounted before the JSON body parser', () => {
     // Raw body is required for HMAC verification; a global JSON parser ahead of
     // it would consume the body and break every signature check.

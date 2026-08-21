@@ -159,6 +159,30 @@ export interface AutomationRules {
 }
 
 /**
+ * The tag vocabulary automation reads and writes.
+ *
+ * Declared above DEFAULT_AUTOMATION_RULES so the defaults can reference them
+ * instead of repeating the literals. Two copies of 'trademart:no-automation' is
+ * exactly the sort of thing that gets typo'd into a silently-ineffective opt-out.
+ */
+
+/** Tag automation applies when it hides a product, so it knows what it owns. */
+export const AUTOMATION_HIDDEN_TAG = 'trademart:auto-hidden';
+
+/**
+ * Tag applied to a newly imported product that is being held back for review.
+ * Distinct from AUTOMATION_HIDDEN_TAG so "never shown yet" is not confused with
+ * "was live, then went out of stock".
+ */
+export const AUTOMATION_REVIEW_TAG = 'trademart:needs-review';
+
+/** The permanent opt-out: automation never touches a product carrying this. */
+export const NO_AUTOMATION_TAG = 'trademart:no-automation';
+
+/** A product whose price a human manages by hand. */
+export const MANUAL_PRICING_TAG = 'trademart:manual';
+
+/**
  * Deliberately cautious defaults.
  *
  * Visibility is on (low risk, reversible) while price writing is OFF, so
@@ -195,19 +219,9 @@ export const DEFAULT_AUTOMATION_RULES: AutomationRules = {
     includeVendors: [],
     newProductPolicy: 'draft',
   },
-  exemptTags: ['trademart:manual', 'trademart:no-automation'],
+  exemptTags: [MANUAL_PRICING_TAG, NO_AUTOMATION_TAG],
   maxItemsPerRun: 50,
 };
-
-/** Tag automation applies when it hides a product, so it knows what it owns. */
-export const AUTOMATION_HIDDEN_TAG = 'trademart:auto-hidden';
-
-/**
- * Tag applied to a newly imported product that is being held back for review.
- * Distinct from AUTOMATION_HIDDEN_TAG so "never shown yet" is not confused with
- * "was live, then went out of stock".
- */
-export const AUTOMATION_REVIEW_TAG = 'trademart:needs-review';
 
 const PRICING_MODES: readonly PricingMode[] = ['margin', 'multiplier', 'fixed_uplift'];
 const SELECTION_MODES: readonly SelectionMode[] = ['all', 'tagged', 'vendor'];
