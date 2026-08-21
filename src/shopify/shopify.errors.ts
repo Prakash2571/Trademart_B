@@ -312,13 +312,23 @@ export function mapTokenFailure(
   );
 }
 
-/** Maps fetch/DNS/timeout failures. */
+/**
+ * Maps fetch/DNS/timeout failures.
+ *
+ * A timeout gets its own code rather than sharing SHOPIFY_NETWORK_ERROR, because
+ * the two mean different things operationally and lead to different fixes. A
+ * network error is usually DNS or egress - the request never landed, so nothing
+ * happened on Shopify's side. A TIMEOUT is genuinely ambiguous: the request may
+ * well have been applied and we simply stopped waiting for the answer. That
+ * distinction matters for a write: after a timeout the safe move is to re-read
+ * the resource, not to blindly resend the mutation.
+ */
 export function mapNetworkFailure(error: unknown): AppError {
   const reason = error instanceof Error ? error.message : 'Unknown network error.';
-  if (/abort/i.test(reason)) {
+  if (/abort|timeout|timed out/i.test(reason)) {
     return new AppError(
-      'SHOPIFY_NETWORK_ERROR',
-      'The request to Shopify timed out.',
+      'SHOPIFY_TIMEOUT',
+      'The request to Shopify timed out. If this was a write it may still have been applied, so the resource is re-read rather than the write being repeated.',
       { retryable: true, details: { reason } },
     );
   }

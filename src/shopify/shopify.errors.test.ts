@@ -168,9 +168,24 @@ describe('mapNetworkFailure', () => {
     assert.equal(error.retryable, true);
   });
 
-  it('recognises aborts as timeouts', () => {
+  it('recognises aborts as timeouts, with their own code', () => {
+    // A distinct code because the two need different handling: a network error
+    // means the request never landed, whereas a timeout is ambiguous and the
+    // write may already have been applied.
     const error = mapNetworkFailure(new Error('This operation was aborted'));
+    assert.equal(error.code, 'SHOPIFY_TIMEOUT');
     assert.match(error.message, /timed out/);
     assert.equal(error.retryable, true);
+  });
+
+  it('treats an explicit timeout message as a timeout too', () => {
+    // Undici does not always phrase this as an abort.
+    const error = mapNetworkFailure(new Error('Request timed out after 20000ms'));
+    assert.equal(error.code, 'SHOPIFY_TIMEOUT');
+  });
+
+  it('keeps a DNS failure as a network error, not a timeout', () => {
+    const error = mapNetworkFailure(new Error('getaddrinfo ENOTFOUND shop.myshopify.com'));
+    assert.equal(error.code, 'SHOPIFY_NETWORK_ERROR');
   });
 });

@@ -33,6 +33,10 @@ import {
   TAGS_ADD_MUTATION,
   TAGS_REMOVE_MUTATION,
 } from '../shopify/graphql/product.mutations';
+import {
+  assertShopifyHealthyForBulkWrites,
+  getBreakerState,
+} from '../shopify/shopify.breaker';
 import { shopifyGraphql } from '../shopify/shopify.client';
 import { mapUserErrors } from '../shopify/shopify.errors';
 import { INVENTORY_ITEM_PRODUCT_QUERY } from '../shopify/graphql/inventory.queries';
@@ -471,6 +475,17 @@ export async function executePreparedPlan(
     );
   }
 
+  // Refuse up front while Shopify is degraded, BEFORE taking the lock: there is
+  // no point holding the store's apply lock only to fail, and a bulk run against
+  // a throttling Shopify produces hundreds of individual failures and a
+  // half-applied plan instead of one actionable refusal.
+  //
+  // Only bulk applies are gated. A preview is reads-only and stays available, so
+  // an operator can still see what WOULD happen while writes are paused.
+  if (!options.dryRun) {
+    assertShopifyHealthyForBulkWrites();
+  }
+
   // Serialise real applies. Acquired before any await so a concurrent apply is
   // rejected immediately rather than interleaving writes.
   if (!options.dryRun) {
@@ -494,6 +509,38 @@ async function runPreparedPlan(
   let applied = 0;
   let failed = 0;
 
+  /**
+   * Mid-run degradation check.
+   *
+   * The pre-flight check in executePreparedPlan cannot help if Shopify starts
+   * failing at product 10 of 250 - which is the common case, because a bulk run is
+   * often what pushes the store over its rate limit in the first place. Without
+   * this, the run would grind through 240 more products, each burning its full
+   * retry budget with backoff, to produce 240 identical failures.
+   *
+   * Once tripped it stays tripped for the rest of THIS run, rather than
+   * re-checking and possibly resuming halfway: a plan that applied actions 1-10
+   * and 200-250 but not 11-199 is far harder to reason about than one that
+   * stopped at 10.
+   *
+   * Remaining actions are still recorded (as failed, with an explicit "not
+   * attempted" reason) rather than dropped, so the report accounts for every
+   * planned action and the operator can see exactly where the run stopped.
+   */
+  let abortReason: string | null = null;
+  const degradationAbort = (): string | null => {
+    if (abortReason !== null) return abortReason;
+    if (getBreakerState() === 'open') {
+      abortReason =
+        'SHOPIFY_DEGRADED: not attempted. Shopify began failing partway through this run, so the remaining actions were stopped instead of being retried into a wall of failures. Re-run once Shopify recovers; already-applied actions are recorded above.';
+      logger.error('Aborting the automation run: Shopify degraded mid-run.', {
+        appliedSoFar: applied,
+        failedSoFar: failed,
+      });
+    }
+    return abortReason;
+  };
+
   if (options.dryRun) {
     for (const action of plan.actions) {
       actions.push({
@@ -514,6 +561,25 @@ async function runPreparedPlan(
     // product is already hidden rather than left on sale mid-update.
     for (const action of plan.actions) {
       if (action.type !== 'visibility') continue;
+
+      const aborted = degradationAbort();
+      if (aborted !== null) {
+        failed += 1;
+        actions.push({
+          type: 'visibility',
+          shopifyProductId: action.shopifyProductId,
+          shopifyVariantId: null,
+          title: action.title,
+          fromValue: action.from,
+          toValue: action.to,
+          currencyCode: null,
+          reasons: action.reasons,
+          status: 'failed',
+          error: aborted,
+        });
+        continue;
+      }
+
       try {
         await applyVisibility(action.shopifyProductId, action.to);
         applied += 1;
@@ -563,6 +629,26 @@ async function runPreparedPlan(
     }
 
     for (const [productId, priceActions] of byProduct) {
+      const aborted = degradationAbort();
+      if (aborted !== null) {
+        failed += priceActions.length;
+        for (const action of priceActions) {
+          actions.push({
+            type: 'price',
+            shopifyProductId: productId,
+            shopifyVariantId: action.shopifyVariantId,
+            title: action.title,
+            fromValue: action.from.toFixed(2),
+            toValue: action.to.toFixed(2),
+            currencyCode: action.currencyCode,
+            reasons: action.reasons,
+            status: 'failed',
+            error: aborted,
+          });
+        }
+        continue;
+      }
+
       try {
         await applyPrices(productId, priceActions);
         applied += priceActions.length;
