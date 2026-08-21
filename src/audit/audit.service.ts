@@ -53,7 +53,24 @@ export type AuditAction =
   | 'AUTOMATION_APPLY'
   // Webhooks
   | 'WEBHOOK_RETRY'
-  | 'WEBHOOK_REGISTER';
+  | 'WEBHOOK_REGISTER'
+  // Research / product intelligence
+  | 'RESEARCH_CANDIDATE_CREATE'
+  | 'RESEARCH_CANDIDATE_UPDATE'
+  | 'RESEARCH_ANALYZE'
+  | 'RESEARCH_WATCH'
+  | 'RESEARCH_REJECT'
+  /**
+   * A DRAFT product was created in Shopify from a candidate.
+   *
+   * Named PUSH_DRAFT rather than PUSH so the trail cannot be misread as a publication.
+   * Nothing in the research module publishes, and PRODUCT_PUBLISH remains the only
+   * action that means customers can see something.
+   */
+  | 'RESEARCH_PUSH_DRAFT'
+  // Settings
+  | 'DROPSHIPPING_SETTINGS_UPDATE'
+  | 'PRICING_RULE_UPDATE';
 
 export type AuditResourceType =
   | 'PRODUCT'
@@ -62,7 +79,11 @@ export type AuditResourceType =
   | 'COST'
   | 'AUTOMATION'
   | 'SESSION'
-  | 'WEBHOOK';
+  | 'WEBHOOK'
+  /** A research candidate, identified by its Trademart candidateId. */
+  | 'RESEARCH_CANDIDATE'
+  /** Store-wide configuration. resourceId is null. */
+  | 'SETTINGS';
 
 export interface AuditEntryInput {
   action: AuditAction;

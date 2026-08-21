@@ -89,7 +89,17 @@ export type Recommendation =
   | 'REJECT';
 
 export type CandidateStatus =
+  /** Created, never scored. */
   | 'NEW'
+  /**
+   * Scored, but no decision taken yet.
+   *
+   * Distinct from NEW because a score exists to read, and distinct from SELECTED
+   * because nobody has decided anything. Re-running an analysis moves NEW here and
+   * leaves every later status alone - an operator's decision is not undone by a
+   * recalculation.
+   */
+  | 'ANALYZED'
   | 'WATCHING'
   | 'SELECTED'
   /** A Shopify DRAFT exists. NOT published - that stays a human action. */
@@ -387,6 +397,9 @@ export interface ProductCandidate {
 /** Statuses from which a candidate may still be pushed to Shopify. */
 export const PUSHABLE_STATUSES: readonly CandidateStatus[] = Object.freeze([
   'NEW',
+  // The normal path: analyse, read the score, push. Omitting this would refuse the one
+  // sequence the module is designed around.
+  'ANALYZED',
   'WATCHING',
   'SELECTED',
 ]);
