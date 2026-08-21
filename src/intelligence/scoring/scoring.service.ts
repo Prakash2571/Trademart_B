@@ -288,7 +288,7 @@ function weightedOverall(factors: FactorScore[], weights: ScoreWeights): Overall
       // Reported rather than internal, because "demand was 24% of this score, not the
       // 20% you configured, because trend had no data" is something the operator has
       // to be able to see to trust the number.
-      effective: included ? round2((configured / totalWeight) * 100) : 0,
+      effective: included ? roundPercentage((configured / totalWeight) * 100) : 0,
       included,
     };
   });
@@ -434,6 +434,13 @@ function dedupe(values: string[]): string[] {
   return out;
 }
 
-function round2(value: number): number {
+/**
+ * 2dp rounding for a PERCENTAGE.
+ *
+ * Deliberately not common/money's roundMoney, and named so nobody mistakes it for it:
+ * an effective weight is a ratio, not an amount, and pushing it through monetary
+ * minor units would imply it takes part in money arithmetic.
+ */
+function roundPercentage(value: number): number {
   return Math.round(value * 100) / 100;
 }

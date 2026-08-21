@@ -146,6 +146,32 @@ export function roundMoney(value: number, field = 'amount'): number {
 }
 
 /**
+ * Rounds UP to the next whole minor unit (toward +Infinity).
+ *
+ * Distinct from roundMoney, and needed wherever a computed amount is a FLOOR that
+ * must be cleared rather than a value to be reported. A minimum viable price of
+ * 16.404 rounded to 16.40 is a penny short of the margin floor it was derived from,
+ * which defeats the point of computing a floor at all.
+ *
+ * The 1e-9 tolerance stops a value that is already an exact number of minor units
+ * from being pushed up a penny by binary representation error: 16.40 can shift to
+ * 1640.0000000000002 minor units, and Math.ceil of that is 1641. A billionth of a
+ * penny is far below any real price difference and far above the representation
+ * error at price magnitudes.
+ */
+export function ceilMoney(value: number, field = 'amount'): number {
+  const amount = assertMoney(value, field);
+  if (amount === 0) return 0;
+
+  const shifted = shiftDecimal(amount, MONEY_DECIMALS);
+  // Same reasoning as toMinorUnits: only reachable below 1e-6, which is genuinely
+  // zero at money scale.
+  if (shifted === null) return 0;
+
+  return fromMinorUnits(Math.ceil(shifted - 1e-9));
+}
+
+/**
  * Adds amounts exactly, by summing in integer minor units.
  *
  * Rounding each term and then adding doubles still drifts; this cannot. Use it for
