@@ -215,6 +215,15 @@ export async function loadManualCostMap(
     const cost: ManualCost = {
       amount: row.supplierProductCost,
       currencyCode: row.currencyCode,
+      // Carried through to the pricing engine. This was previously DROPPED here,
+      // which was a silent margin bug: an operator could record 100 of shipping
+      // against a variant and automation would price the product as though shipping
+      // were free, overstating every margin - including the minimum-margin floor
+      // that is supposed to stop a loss-making price.
+      //
+      // `?? null` and not `?? 0`: no recorded shipping means UNKNOWN, and the
+      // difference is the whole point.
+      shippingCost: row.supplierShippingCost ?? null,
       updatedAt:
         (row as { updatedAt?: Date }).updatedAt instanceof Date
           ? (row as { updatedAt: Date }).updatedAt.toISOString()
