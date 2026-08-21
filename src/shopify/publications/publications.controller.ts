@@ -40,7 +40,7 @@ function readPublicationIds(body: Record<string, unknown>): string[] | undefined
 }
 
 publicationsRouter.get(
-  '/shopify/publications',
+  '/publications',
   asyncHandler(async (_req, res) => {
     const publications = await listPublications();
     sendSuccess(res, { publications }, { count: publications.length });
@@ -48,7 +48,7 @@ publicationsRouter.get(
 );
 
 publicationsRouter.get(
-  '/shopify/products/:id/publications',
+  '/products/:id/publications',
   asyncHandler(async (req, res) => {
     const gid = toShopifyGid(req.params.id ?? '', 'Product');
 
@@ -65,7 +65,7 @@ publicationsRouter.get(
 );
 
 publicationsWriteRouter.post(
-  '/shopify/products/:id/publish',
+  '/products/:id/publish',
   asyncHandler(async (req, res) => {
     const gid = toShopifyGid(req.params.id ?? '', 'Product');
     const publicationIds = readPublicationIds((req.body ?? {}) as Record<string, unknown>);
@@ -91,7 +91,7 @@ publicationsWriteRouter.post(
 );
 
 publicationsWriteRouter.post(
-  '/shopify/products/:id/unpublish',
+  '/products/:id/unpublish',
   asyncHandler(async (req, res) => {
     const gid = toShopifyGid(req.params.id ?? '', 'Product');
     const publicationIds = readPublicationIds((req.body ?? {}) as Record<string, unknown>);

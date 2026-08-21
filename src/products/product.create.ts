@@ -387,9 +387,10 @@ export function validateProductCreate(body: Record<string, unknown>): ProductCre
   const options = validateOptions(body['options']);
   const variants = validateNewVariants(body['variants'], options);
 
-  // A variant per unique option-value combination is not enforced (Shopify
-  // allows a subset), but at least one priced variant is required so the product
-  // is purchasable and priceable.
+  // The FULL option grid is not required - Shopify allows a subset of
+  // combinations - but validateNewVariants does reject DUPLICATE combinations,
+  // and at least one priced variant is required here so the product is
+  // purchasable and priceable.
   if (variants.length === 0) {
     throw new AppError(
       'VALIDATION_ERROR',
