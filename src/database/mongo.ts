@@ -13,6 +13,7 @@ import { logger } from '../common/logger';
 import { config } from '../config';
 import { AuditLogModel } from './models/AuditLog';
 import { IdempotencyKeyModel } from './models/IdempotencyKey';
+import { ProductCandidateModel } from './models/ProductCandidate';
 import { WebhookEventModel } from './models/WebhookEvent';
 
 export type DatabaseStatus = 'disabled' | 'connecting' | 'connected' | 'error';
@@ -83,6 +84,11 @@ const INDEXED_MODELS = [
   { name: 'AuditLog', model: AuditLogModel },
   { name: 'IdempotencyKey', model: IdempotencyKeyModel },
   { name: 'WebhookEvent', model: WebhookEventModel },
+  // Research candidates: the unique { shopDomain, candidateId } index is what stops a
+  // retried create producing two rows for one candidate, which would then be pushed to
+  // Shopify as two draft products. Lazy autoIndex does not enforce that until it has
+  // finished building, so it is created deliberately like the others here.
+  { name: 'ProductCandidate', model: ProductCandidateModel },
 ];
 
 /**

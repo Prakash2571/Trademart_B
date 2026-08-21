@@ -36,13 +36,15 @@ import type { ScoreFactor, SeasonState, TargetMarket } from '../candidate.types'
 /**
  * What a signal's numbers actually describe.
  *
- * countryCode null means global; region null means country-wide. This is what makes
- * region isolation checkable rather than assumed.
+ * Moved to candidate.types.ts, which is the module a manually entered figure's
+ * geography belongs to and which this file already imports from. Re-exported so every
+ * existing importer of SignalGeography from here keeps working.
  */
-export interface SignalGeography {
-  countryCode: string | null;
-  region: string | null;
-}
+export type { SignalGeography } from '../candidate.types';
+
+// Imported as well as re-exported: `export ... from` does not bring the name into
+// local scope, and the signal interfaces below are built out of it.
+import type { SignalGeography } from '../candidate.types';
 
 export type GeographyMatch =
   /** The signal covers exactly the requested region. */

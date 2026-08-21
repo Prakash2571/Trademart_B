@@ -32,6 +32,20 @@ import type {
  * ======================================================================== */
 
 /**
+ * What a figure's numbers actually describe geographically.
+ *
+ * countryCode null means global or unstated; region null means country-wide. Lives
+ * here rather than in scoring/scoring.types.ts because a manually entered figure
+ * carries a geography before any scoring happens, and scoring.types.ts already
+ * imports from this module - defining it there and importing it back would be a
+ * cycle. scoring.types.ts re-exports it, so existing importers are unaffected.
+ */
+export interface SignalGeography {
+  countryCode: string | null;
+  region: string | null;
+}
+
+/**
  * Where a candidate came from.
  *
  * TRADELLE is listed because the operator researches there, NOT because Trademart
@@ -220,6 +234,93 @@ export interface CandidateCommercials {
 }
 
 /* ===========================================================================
+ * Manually observed market data
+ * ======================================================================== */
+
+/**
+ * Market figures an operator READ somewhere and typed in.
+ *
+ * WHY THIS EXISTS AT ALL
+ * ---------------------
+ * Tradelle publishes no API. Google Trends publishes no supported API. Google Ads
+ * keyword planning has one, but it is not configured here. So for the foreseeable
+ * future the only route from a Tradelle product page into Trademart is an operator
+ * reading the page and typing the numbers in.
+ *
+ * Modelling that explicitly is the honest option. The alternatives are worse: leaving
+ * demand permanently unscored makes the whole module useless, and inventing a
+ * scraper or a fictional API client would produce numbers nobody can stand behind.
+ *
+ * WHAT MAKES IT SAFE
+ * ------------------
+ *   - `observedAt` is REQUIRED to be meaningful: it is when the operator read the
+ *     figure, not when they typed it. Freshness ages from it, so a number copied from
+ *     a screenshot taken in March is three months old today.
+ *   - `geography` is recorded per entry, because a Tradelle page usually reports US
+ *     figures and the store may sell in India. The scorers discard mismatched
+ *     geography outright rather than letting a US number stand in.
+ *   - every field is nullable and null means "the operator did not have this",
+ *     never zero.
+ *   - these values are never presented as observed by Trademart. The provider that
+ *     reads them names its source as operator entry, so the confidence and the
+ *     evidence trail say so.
+ */
+export interface ManualResearchEntry {
+  /** Average monthly searches, as read from a keyword tool or Tradelle. */
+  averageMonthlySearches: number | null;
+  /** Percentage change over the market's horizon. Negative means declining. */
+  momentumPercentage: number | null;
+  /** 0-100, where 100 is most competitive. */
+  competitionIndex: number | null;
+  competitorCount: number | null;
+  seasonState: SeasonState;
+  /** Months 1-12 the product typically peaks in. */
+  peakMonths: number[] | null;
+  /**
+   * What the figures above actually describe.
+   *
+   * Null country means the operator did not say, which is treated as unknown rather
+   * than assumed to be the target market - assuming would defeat region isolation.
+   */
+  geography: SignalGeography;
+  /** When the operator READ these figures. Null when they did not record it. */
+  observedAt: string | null;
+  /** Where they read them, in their own words. */
+  sourceNote: string | null;
+}
+
+/** An entry with nothing filled in. */
+export const EMPTY_MANUAL_RESEARCH: Readonly<ManualResearchEntry> = Object.freeze({
+  averageMonthlySearches: null,
+  momentumPercentage: null,
+  competitionIndex: null,
+  competitorCount: null,
+  seasonState: 'UNKNOWN',
+  peakMonths: null,
+  geography: Object.freeze({ countryCode: null, region: null }),
+  observedAt: null,
+  sourceNote: null,
+});
+
+/**
+ * True when the operator supplied at least one usable market figure.
+ *
+ * Used to decide whether the manual provider has anything to contribute at all, so
+ * an empty entry produces no signals rather than a set of null-valued ones that would
+ * look like a provider that answered.
+ */
+export function hasManualResearch(entry: ManualResearchEntry): boolean {
+  return (
+    entry.averageMonthlySearches !== null ||
+    entry.momentumPercentage !== null ||
+    entry.competitionIndex !== null ||
+    entry.competitorCount !== null ||
+    (entry.seasonState !== 'UNKNOWN' && entry.seasonState !== undefined) ||
+    (entry.peakMonths !== null && entry.peakMonths.length > 0)
+  );
+}
+
+/* ===========================================================================
  * The candidate
  * ======================================================================== */
 
@@ -247,6 +348,14 @@ export interface ProductCandidate {
 
   market: TargetMarket;
   commercials: CandidateCommercials;
+  /**
+   * Market figures the operator typed in, because no API supplies them.
+   *
+   * Kept separate from `factors` so the raw input remains visible next to the score
+   * it produced. An operator who disagrees with a score needs to see the number that
+   * drove it, not just the verdict.
+   */
+  manualResearch: ManualResearchEntry;
 
   /** Per-factor detail. Absent factors are genuinely absent, not zero. */
   factors: FactorScore[];
