@@ -150,7 +150,13 @@ export interface RawLineItem {
   quantity: number;
   sku?: string | null;
   vendor?: string | null;
-  variant?: { id: string; title?: string | null; sku?: string | null } | null;
+  fulfillmentService?: { handle?: string | null; serviceName?: string | null } | null;
+  variant?: {
+    id: string;
+    title?: string | null;
+    sku?: string | null;
+    inventoryItem?: { unitCost?: RawMoney | null } | null;
+  } | null;
   product?: {
     id: string;
     title?: string | null;
@@ -162,15 +168,54 @@ export interface RawLineItem {
   discountedTotalSet?: RawMoneyBag | null;
 }
 
+/**
+ * Shopify's fulfillment display status.
+ *
+ * Distinct from `FulfillmentStatus` (OPEN/SUCCESS/CANCELLED/ERROR), which only
+ * says whether the fulfillment RECORD is in order. This says where the parcel
+ * actually is, and is what the dropshipping shipment view normalises from.
+ */
+export type FulfillmentDisplayStatus = Open<
+  | 'ATTEMPTED_DELIVERY'
+  | 'CANCELED'
+  | 'CONFIRMED'
+  | 'DELIVERED'
+  | 'FAILURE'
+  | 'FULFILLED'
+  | 'IN_TRANSIT'
+  | 'LABEL_PRINTED'
+  | 'LABEL_PURCHASED'
+  | 'LABEL_VOIDED'
+  | 'MARKED_AS_FULFILLED'
+  | 'NOT_DELIVERED'
+  | 'OUT_FOR_DELIVERY'
+  | 'PICKED_UP'
+  | 'READY_FOR_PICKUP'
+  | 'SUBMITTED'
+>;
+
+export interface RawFulfillmentEvent {
+  id: string;
+  status?: string | null;
+  happenedAt?: string | null;
+  message?: string | null;
+}
+
 export interface RawFulfillment {
   id: string;
   status?: FulfillmentStatus | null;
+  displayStatus?: FulfillmentDisplayStatus | null;
   createdAt?: string | null;
+  updatedAt?: string | null;
+  estimatedDeliveryAt?: string | null;
+  inTransitAt?: string | null;
+  deliveredAt?: string | null;
   trackingInfo?: {
     company?: string | null;
     number?: string | null;
     url?: string | null;
   }[] | null;
+  events?: RawConnection<RawFulfillmentEvent> | null;
 }
 
 export interface RawOrder {
@@ -314,16 +359,48 @@ export interface OrderLineItemDto {
   shopifyProductId: string | null;
   unitPrice: Money | null;
   discountedTotal: Money | null;
+  /**
+   * Shopify's "cost per item" for the variant sold. Null when never filled in -
+   * NOT zero. This is the only per-order supplier cost signal Shopify provides.
+   */
+  unitCost: Money | null;
+  /** The service Shopify routes this line to, e.g. a Tradelle handle. */
+  fulfillmentService: string | null;
   supplier: SupplierClassification;
+  /** Why the line was classified that way. Empty when UNKNOWN. */
+  supplierEvidence: string[];
+}
+
+export interface FulfillmentEventDto {
+  id: string;
+  status: string | null;
+  happenedAt: string | null;
+  message: string | null;
 }
 
 export interface FulfillmentDto {
   id: string;
   status: FulfillmentStatus | null;
+  /** Where the parcel is, per Shopify. Null when Shopify did not report it. */
+  displayStatus: FulfillmentDisplayStatus | null;
   createdAt: string | null;
+  updatedAt: string | null;
+  /** Shopify's delivery estimate. Null means UNKNOWN, never "no estimate needed". */
+  estimatedDeliveryAt: string | null;
+  inTransitAt: string | null;
+  deliveredAt: string | null;
+  /** First tracking entry, kept for backwards compatibility with existing readers. */
   trackingCompany: string | null;
   trackingNumber: string | null;
   trackingUrl: string | null;
+  /**
+   * EVERY parcel on this fulfillment. A split shipment has more than one, and
+   * showing only the first would tell a customer their second parcel does not
+   * exist.
+   */
+  tracking: { company: string | null; number: string | null; url: string | null }[];
+  /** Carrier scan history, newest first. Empty when the carrier reports none. */
+  events: FulfillmentEventDto[];
 }
 
 export interface OrderDto {

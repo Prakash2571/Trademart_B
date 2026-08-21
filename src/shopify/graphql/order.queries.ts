@@ -54,11 +54,35 @@ const ORDER_CORE_FIELDS = /* GraphQL */ `
   fulfillments(first: 10) {
     id
     status
+    # displayStatus is the field that actually says WHERE the parcel is
+    # (IN_TRANSIT, OUT_FOR_DELIVERY, DELIVERED, ATTEMPTED_DELIVERY...). The plain
+    # status field only distinguishes OPEN / SUCCESS / CANCELLED / ERROR, which
+    # cannot answer "has it shipped, and where is it?".
+    displayStatus
     createdAt
+    updatedAt
+    # Shopify's own delivery estimate and observed transitions. Used to detect a
+    # delay against ETA rather than guessing from elapsed time alone.
+    estimatedDeliveryAt
+    inTransitAt
+    deliveredAt
+    # trackingInfo can hold several parcels for one fulfillment (split shipment).
     trackingInfo {
       company
       number
       url
+    }
+    # The carrier's own scan history, newest first. This is what a customer-facing
+    # "where is my order" timeline is built from.
+    events(first: 20, sortKey: HAPPENED_AT, reverse: true) {
+      edges {
+        node {
+          id
+          status
+          happenedAt
+          message
+        }
+      }
     }
   }
   lineItems(first: 50) {
@@ -69,10 +93,26 @@ const ORDER_CORE_FIELDS = /* GraphQL */ `
         quantity
         sku
         vendor
+        # Which service fulfils this line. A Tradelle-managed line names its
+        # fulfillment service here, which is stronger evidence of the supplier
+        # than vendor or tags (both of which a merchant can edit by hand).
+        fulfillmentService {
+          handle
+          serviceName
+        }
         variant {
           id
           title
           sku
+          # Shopify's "cost per item" for the variant sold. This is the supplier
+          # cost AS AT the order, and it is the only per-order cost signal Shopify
+          # provides - without it, order economics have no supplier cost at all.
+          inventoryItem {
+            unitCost {
+              amount
+              currencyCode
+            }
+          }
         }
         product {
           id

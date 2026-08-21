@@ -148,14 +148,38 @@ export function mapProduct(raw: RawProduct, currencyCode: string): ProductDto {
 
 function mapFulfillments(raw: RawOrder): FulfillmentDto[] {
   return (raw.fulfillments ?? []).map((fulfillment) => {
-    const tracking = fulfillment.trackingInfo?.[0] ?? null;
+    // Every parcel, not just the first: a split shipment has several, and showing
+    // one would tell a customer their other parcel does not exist. Entries with no
+    // number at all are dropped - a tracking row with nothing to track is noise.
+    const tracking = (fulfillment.trackingInfo ?? [])
+      .map((entry) => ({
+        company: entry.company ?? null,
+        number: entry.number ?? null,
+        url: entry.url ?? null,
+      }))
+      .filter((entry) => entry.number !== null || entry.url !== null);
+    const first = tracking[0] ?? null;
+
     return {
       id: fulfillment.id,
       status: fulfillment.status ?? null,
+      displayStatus: fulfillment.displayStatus ?? null,
       createdAt: fulfillment.createdAt ?? null,
-      trackingCompany: tracking?.company ?? null,
-      trackingNumber: tracking?.number ?? null,
-      trackingUrl: tracking?.url ?? null,
+      updatedAt: fulfillment.updatedAt ?? null,
+      estimatedDeliveryAt: fulfillment.estimatedDeliveryAt ?? null,
+      inTransitAt: fulfillment.inTransitAt ?? null,
+      deliveredAt: fulfillment.deliveredAt ?? null,
+      // Retained so existing readers of the flat fields keep working unchanged.
+      trackingCompany: first?.company ?? null,
+      trackingNumber: first?.number ?? null,
+      trackingUrl: first?.url ?? null,
+      tracking,
+      events: nodes(fulfillment.events).map((event) => ({
+        id: event.id,
+        status: event.status ?? null,
+        happenedAt: event.happenedAt ?? null,
+        message: event.message ?? null,
+      })),
     };
   });
 }
@@ -167,6 +191,12 @@ export function mapOrder(raw: RawOrder): OrderDto {
       tags: item.product?.tags ?? null,
       productType: item.product?.productType ?? null,
       skus: [item.sku ?? item.variant?.sku ?? null],
+      // Stronger evidence than vendor or tags, both of which a merchant edits by
+      // hand: the fulfillment service is what Shopify itself routes the line to.
+      fulfillmentServices: [
+        item.fulfillmentService?.handle,
+        item.fulfillmentService?.serviceName,
+      ],
     });
     return {
       shopifyLineItemId: item.id,
@@ -178,7 +208,14 @@ export function mapOrder(raw: RawOrder): OrderDto {
       shopifyProductId: item.product?.id ?? null,
       unitPrice: toMoneyFromBag(item.originalUnitPriceSet),
       discountedTotal: toMoneyFromBag(item.discountedTotalSet),
+      // Shopify's cost per item for the variant sold. Null (never 0) when it was
+      // never filled in - the difference between "free" and "unknown" is the whole
+      // basis of honest order economics.
+      unitCost: toMoney(item.variant?.inventoryItem?.unitCost ?? null),
+      fulfillmentService:
+        item.fulfillmentService?.handle ?? item.fulfillmentService?.serviceName ?? null,
       supplier: classification.supplier,
+      supplierEvidence: classification.evidence,
     };
   });
 
