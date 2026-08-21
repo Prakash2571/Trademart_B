@@ -24,6 +24,24 @@ const STATUSES: readonly ProductStatus[] = ['ACTIVE', 'ARCHIVED', 'DRAFT'];
 const MAX_OPTIONS = 3; // Shopify allows at most 3 options per product.
 const MAX_VALUES_PER_OPTION = 100;
 
+/**
+ * Shopify's per-product variant ceiling on a standard plan.
+ *
+ * Checked here rather than left to Shopify because of WHEN the failure would
+ * otherwise happen. The create flow makes the product first and adds variants
+ * second, so a rejection at the variant step leaves an orphaned DRAFT product
+ * behind and returns a partial success. Every check that can run BEFORE the first
+ * write is one that cannot produce that outcome.
+ */
+const MAX_VARIANTS = 100;
+
+/**
+ * Media items per create. Shopify accepts more, but each one is an EPS fetch that
+ * can fail independently, and a request carrying hundreds of URLs is far more
+ * likely to be a mistake than an intent.
+ */
+const MAX_MEDIA = 20;
+
 export interface ProductOptionInput {
   name: string;
   values: string[];
@@ -107,7 +125,10 @@ function validateOptions(raw: unknown): ProductOptionInput[] {
     throw new AppError('VALIDATION_ERROR', 'options must be an array.');
   }
   if (raw.length > MAX_OPTIONS) {
-    throw new AppError('VALIDATION_ERROR', `A product may have at most ${MAX_OPTIONS} options.`);
+    throw new AppError(
+      'VALIDATION_ERROR',
+      `A product may have at most ${MAX_OPTIONS} options, and this request has ${raw.length}.`,
+    );
   }
   const seenNames = new Set<string>();
   return raw.map((entry) => {
@@ -152,8 +173,21 @@ function validateNewVariants(
   if (!Array.isArray(raw)) {
     throw new AppError('VALIDATION_ERROR', 'variants must be an array.');
   }
+  if (raw.length > MAX_VARIANTS) {
+    throw new AppError(
+      'VALIDATION_ERROR',
+      `A product may have at most ${MAX_VARIANTS} variants, and this request has ${raw.length}. Rejected before the product is created, so there is no half-built product to clean up.`,
+    );
+  }
 
-  return raw.map((entry, index) => {
+  // Cross-variant uniqueness. Shopify would reject these itself, but only at the
+  // variant step - AFTER the product exists - which turns a fixable request error
+  // into an orphaned DRAFT product and a partial success. Caught here instead.
+  const seenSkus = new Map<string, number>();
+  const seenBarcodes = new Map<string, number>();
+  const seenCombinations = new Map<string, number>();
+
+  const variants = raw.map((entry, index) => {
     if (typeof entry !== 'object' || entry === null) {
       throw new AppError('VALIDATION_ERROR', `Variant ${index + 1} must be an object.`);
     }
@@ -175,9 +209,36 @@ function validateNewVariants(
       }
     }
     const sku = optionalString(v['sku'], `variant ${index + 1} sku`, 255);
-    if (sku !== undefined) variant.sku = sku;
+    if (sku !== undefined) {
+      variant.sku = sku;
+      // Compared case-insensitively: Shopify treats SKUs as distinct strings, but
+      // "ABC-1" and "abc-1" in one product is a data-entry mistake every time, and
+      // it makes the created-variant mapping ambiguous for the frontend, which
+      // matches returned variants back by SKU.
+      const key = sku.trim().toLowerCase();
+      const first = seenSkus.get(key);
+      if (first !== undefined) {
+        throw new AppError(
+          'VALIDATION_ERROR',
+          `Variants ${first} and ${index + 1} share the SKU "${sku}". SKUs must be unique within a product, otherwise the created variants cannot be told apart.`,
+        );
+      }
+      seenSkus.set(key, index + 1);
+    }
+
     const barcode = optionalString(v['barcode'], `variant ${index + 1} barcode`, 255);
-    if (barcode !== undefined) variant.barcode = barcode;
+    if (barcode !== undefined) {
+      variant.barcode = barcode;
+      const key = barcode.trim().toLowerCase();
+      const first = seenBarcodes.get(key);
+      if (first !== undefined) {
+        throw new AppError(
+          'VALIDATION_ERROR',
+          `Variants ${first} and ${index + 1} share the barcode "${barcode}". A barcode identifies a physical item, so two variants cannot have the same one.`,
+        );
+      }
+      seenBarcodes.set(key, index + 1);
+    }
 
     // Cross-check option values: when options are declared, each variant must
     // supply exactly one value per option, and each must be a declared value.
@@ -211,9 +272,38 @@ function validateNewVariants(
         }
         variant.optionValues.push({ optionName: option.name, name });
       }
+
+      // Two variants cannot occupy the same point in the option grid - there would
+      // be no way for a customer to choose between them, and Shopify rejects it.
+      // Sorted by option name so the key does not depend on the order the caller
+      // happened to list the values in.
+      const combination = [...variant.optionValues]
+        .sort((a, b) => a.optionName.localeCompare(b.optionName))
+        .map((pair) => `${pair.optionName.toLowerCase()}=${pair.name.toLowerCase()}`)
+        .join(' / ');
+      const first = seenCombinations.get(combination);
+      if (first !== undefined) {
+        throw new AppError(
+          'VALIDATION_ERROR',
+          `Variants ${first} and ${index + 1} have the same option combination (${combination}). Each combination must be unique, otherwise a customer could not choose between them.`,
+        );
+      }
+      seenCombinations.set(combination, index + 1);
     }
     return variant;
   });
+
+  // A product with declared options and no variants would be created with only
+  // Shopify's implicit default variant, silently ignoring the options - so the
+  // request did not mean what it said.
+  if (options.length > 0 && variants.length === 0) {
+    throw new AppError(
+      'VALIDATION_ERROR',
+      `${options.length} option(s) were declared but no variants were supplied, so the options would be ignored. Supply one variant per option combination.`,
+    );
+  }
+
+  return variants;
 }
 
 function validateMediaUrls(raw: unknown): string[] {
@@ -221,15 +311,55 @@ function validateMediaUrls(raw: unknown): string[] {
   if (!Array.isArray(raw)) {
     throw new AppError('VALIDATION_ERROR', 'mediaUrls must be an array of URLs.');
   }
-  return raw.map((entry) => {
+  if (raw.length > MAX_MEDIA) {
+    throw new AppError(
+      'VALIDATION_ERROR',
+      `At most ${MAX_MEDIA} media URLs may be supplied, and this request has ${raw.length}.`,
+    );
+  }
+
+  const seen = new Map<string, number>();
+  return raw.map((entry, index) => {
     if (typeof entry !== 'string') {
       throw new AppError('VALIDATION_ERROR', 'Each media URL must be a string.');
     }
+    const url = entry.trim();
+
     // Must be an absolute https URL: Shopify fetches it from EPS.
-    if (!/^https:\/\/.+/i.test(entry.trim())) {
+    if (!/^https:\/\/.+/i.test(url)) {
       throw new AppError('VALIDATION_ERROR', `Media URL must be an https URL ("${entry}").`);
     }
-    return entry.trim();
+
+    // Parsed, not just pattern-matched. "https://" passes the regex above with an
+    // empty host, and Shopify's EPS fetch would fail asynchronously AFTER the
+    // product exists - producing an image-less product with no obvious cause.
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new AppError('VALIDATION_ERROR', `Media URL is not a valid URL ("${entry}").`);
+    }
+    if (parsed.hostname.length === 0) {
+      throw new AppError('VALIDATION_ERROR', `Media URL has no host ("${entry}").`);
+    }
+    // Shopify's image fetcher has to be able to reach it from the internet.
+    if (parsed.hostname === 'localhost' || parsed.hostname.startsWith('127.')) {
+      throw new AppError(
+        'VALIDATION_ERROR',
+        `Media URL "${entry}" points at localhost, which Shopify cannot reach. Use a publicly accessible https URL.`,
+      );
+    }
+
+    const first = seen.get(url.toLowerCase());
+    if (first !== undefined) {
+      throw new AppError(
+        'VALIDATION_ERROR',
+        `Media URL ${first} and ${index + 1} are the same ("${entry}"), which would upload the image twice.`,
+      );
+    }
+    seen.set(url.toLowerCase(), index + 1);
+
+    return url;
   });
 }
 
