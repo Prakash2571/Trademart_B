@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { decideVisibility } from './publications.service';
+import { resolveCustomerVisibility } from './visibility';
 
 const PRODUCT = 'gid://shopify/Product/1';
 
@@ -24,7 +24,7 @@ function channel(name: string, isPublished: boolean) {
 }
 
 function decide(status: string | null, publications: ReturnType<typeof channel>[]) {
-  return decideVisibility({ shopifyProductId: PRODUCT, status, publications });
+  return resolveCustomerVisibility({ shopifyProductId: PRODUCT, status, publications });
 }
 
 describe('visibility requires BOTH ACTIVE and Online Store publication', () => {

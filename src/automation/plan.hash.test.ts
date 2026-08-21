@@ -24,7 +24,13 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { hashPlan } from './automation.service';
+// Imported from ./plan, NOT from ./automation.service. The service pulls in the
+// Shopify client and the Mongo models, which pull in the config singleton, and
+// config/index.ts calls process.exit(1) on invalid env - so importing it here would
+// kill the test process in any environment without a configured Shopify store
+// rather than failing an assertion. Hashing a plan is pure logic; it is tested as
+// such.
+import { hashPlan } from './plan';
 import type {
   AutomationAction,
   AutomationPlan,

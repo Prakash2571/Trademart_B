@@ -49,7 +49,15 @@ import {
 import { getProduct, listProducts } from '../shopify/shopify.service';
 import type { ProductDto } from '../shopify/shopify.types';
 import { loadManualCostMap } from '../suppliers/manualCost.service';
-import { buildAutomationPlan, type AutomationPlan, type PriceAction } from './plan';
+// hashPlan is imported for local use (persistRun hashes the plan it ran) AND
+// re-exported at the bottom of this file: `export ... from` alone would not bring
+// the binding into this module's scope.
+import {
+  buildAutomationPlan,
+  hashPlan,
+  type AutomationPlan,
+  type PriceAction,
+} from './plan';
 import {
   AUTOMATION_HIDDEN_TAG,
   AUTOMATION_REVIEW_TAG,
@@ -406,39 +414,19 @@ export async function prepareAutomationPlan(
 }
 
 /**
- * Deterministic hash of the CONCRETE action plan - the exact from->to changes,
- * not the rules that produced them.
+ * Re-exported from ./plan, which is where it now lives.
  *
- * This is what binds a preview to what the operator reviewed. Between preview
- * and apply the underlying Shopify or cost data can change so that the same
- * rules now produce different price/visibility moves (£20->£25 becomes
- * £18->£23). Comparing this hash catches that and refuses to apply a plan the
- * operator never saw. Sorted by a stable key so plan ordering cannot affect it.
+ * It moved because it is pure logic over a plan and belongs next to the plan it
+ * hashes - but concretely, because importing it from here dragged in the config
+ * singleton (via the Shopify client and the Mongo models), and config/index.ts
+ * calls process.exit(1) on invalid env. That made a unit test of a pure hash
+ * function impossible to run without a fully configured environment, and it killed
+ * the test process in CI rather than failing an assertion.
+ *
+ * Still ONE implementation. Two copies of a safety hash drifting apart would
+ * produce PREVIEW_STALE rejections nobody could explain.
  */
-export function hashPlan(plan: AutomationPlan): string {
-  const normalized = plan.actions
-    .map((action) =>
-      action.type === 'price'
-        ? {
-            t: 'price',
-            p: action.shopifyProductId,
-            v: action.shopifyVariantId,
-            from: action.from.toFixed(2),
-            to: action.to.toFixed(2),
-            c: action.currencyCode,
-          }
-        : {
-            t: 'visibility',
-            p: action.shopifyProductId,
-            v: null,
-            from: action.from,
-            to: action.to,
-            c: null,
-          },
-    )
-    .sort((a, b) => `${a.t}:${a.p}:${a.v ?? ''}`.localeCompare(`${b.t}:${b.p}:${b.v ?? ''}`));
-  return createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
-}
+export { hashPlan } from './plan';
 
 /**
  * Builds and optionally applies an automation plan.
