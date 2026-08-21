@@ -24,13 +24,55 @@ const minimal = {
 };
 
 describe('validateProductCreate', () => {
-  it('defaults status to DRAFT - never auto-visible', () => {
+  it('defaults desiredStatus to DRAFT and does not publish - never auto-visible', () => {
     // The central safety rule for new products.
-    assert.equal(validateProductCreate(minimal).status, 'DRAFT');
+    const req = validateProductCreate(minimal);
+    assert.equal(req.desiredStatus, 'DRAFT');
+    assert.equal(req.publishToOnlineStore, false);
   });
 
-  it('allows an explicit ACTIVE', () => {
-    assert.equal(validateProductCreate({ ...minimal, status: 'active' }).status, 'ACTIVE');
+  it('allows an explicit ACTIVE as the DESIRED end status', () => {
+    assert.equal(
+      validateProductCreate({ ...minimal, status: 'active' }).desiredStatus,
+      'ACTIVE',
+    );
+  });
+
+  it('treats status ACTIVE as an intent to publish, absent an explicit flag', () => {
+    // Preserves what a caller sending status:ACTIVE has always meant, but as a
+    // named field rather than an assumption hidden inside `status`.
+    assert.equal(
+      validateProductCreate({ ...minimal, status: 'ACTIVE' }).publishToOnlineStore,
+      true,
+    );
+  });
+
+  it('lets publish:false override an ACTIVE status', () => {
+    // "Set it live but keep it off the storefront" is a legitimate request, and
+    // the two concepts have to be independently expressible for it to work.
+    const req = validateProductCreate({ ...minimal, status: 'ACTIVE', publish: false });
+    assert.equal(req.desiredStatus, 'ACTIVE');
+    assert.equal(req.publishToOnlineStore, false);
+  });
+
+  it('lets publish:true be requested for a DRAFT', () => {
+    const req = validateProductCreate({ ...minimal, status: 'DRAFT', publish: true });
+    assert.equal(req.desiredStatus, 'DRAFT');
+    assert.equal(req.publishToOnlineStore, true);
+  });
+
+  it('rejects a non-boolean publish', () => {
+    assert.throws(
+      () => validateProductCreate({ ...minimal, publish: 'yes' }),
+      (e: unknown) => e instanceof AppError && e.code === 'VALIDATION_ERROR',
+    );
+  });
+
+  it('refuses to publish an ARCHIVED product', () => {
+    assert.throws(
+      () => validateProductCreate({ ...minimal, status: 'ARCHIVED', publish: true }),
+      (e: unknown) => e instanceof AppError && e.code === 'VALIDATION_ERROR',
+    );
   });
 
   it('requires a title', () => {
@@ -123,13 +165,104 @@ describe('validateProductCreate', () => {
     assert.equal(req.mediaUrls.length, 1);
   });
 
-  it('drops tags containing commas', () => {
-    const req = validateProductCreate({ ...minimal, tags: ['good', 'a,b'] });
-    assert.deepEqual(req.tags, ['good']);
+  it('rejects a tag containing a comma', () => {
+    // Shopify splits tags on commas, so accepting one silently creates two tags
+    // the operator never asked for.
+    assert.throws(
+      () => validateProductCreate({ ...minimal, tags: ['good', 'a,b'] }),
+      (e: unknown) => e instanceof AppError && e.code === 'VALIDATION_ERROR',
+    );
+  });
+
+  it('keeps valid tags and de-duplicates case-insensitively', () => {
+    const req = validateProductCreate({ ...minimal, tags: ['Sale', 'sale', ' new '] });
+    assert.deepEqual(req.tags, ['Sale', 'new']);
+  });
+
+  it('rejects duplicate SKUs across variants', () => {
+    // Two variants sharing a SKU misattributes cost and supplier lookups, and
+    // the symptom appears later as mispriced stock rather than as an error.
+    assert.throws(
+      () =>
+        validateProductCreate({
+          title: 'Tee',
+          options: [{ name: 'Size', values: ['S', 'M'] }],
+          variants: [
+            { price: '10', sku: 'DUP', optionValues: [{ optionName: 'Size', name: 'S' }] },
+            { price: '12', sku: 'dup', optionValues: [{ optionName: 'Size', name: 'M' }] },
+          ],
+        }),
+      (e: unknown) => e instanceof AppError && e.code === 'VALIDATION_ERROR',
+    );
+  });
+
+  it('rejects duplicate option combinations', () => {
+    assert.throws(
+      () =>
+        validateProductCreate({
+          title: 'Tee',
+          options: [{ name: 'Size', values: ['S'] }],
+          variants: [
+            { price: '10', optionValues: [{ optionName: 'Size', name: 'S' }] },
+            { price: '12', optionValues: [{ optionName: 'Size', name: 'S' }] },
+          ],
+        }),
+      (e: unknown) => e instanceof AppError && e.code === 'VALIDATION_ERROR',
+    );
+  });
+
+  it('rejects several variants when no options are declared', () => {
+    // Shopify collapses these to one variant, silently discarding entered prices.
+    assert.throws(
+      () =>
+        validateProductCreate({
+          title: 'x',
+          variants: [{ price: '10' }, { price: '12' }],
+        }),
+      (e: unknown) => e instanceof AppError && e.code === 'VALIDATION_ERROR',
+    );
+  });
+
+  it('rejects an implausible barcode', () => {
+    assert.throws(
+      () => validateProductCreate({ title: 'x', variants: [{ price: '1', barcode: 'a b' }] }),
+      (e: unknown) => e instanceof AppError && e.code === 'VALIDATION_ERROR',
+    );
+  });
+
+  it('accepts a plausible barcode', () => {
+    const req = validateProductCreate({
+      title: 'x',
+      variants: [{ price: '1', barcode: '5012345678900' }],
+    });
+    assert.equal(req.variants[0]?.barcode, '5012345678900');
+  });
+
+  it('rejects a duplicate media URL', () => {
+    assert.throws(
+      () =>
+        validateProductCreate({
+          ...minimal,
+          mediaUrls: ['https://cdn.example/x.jpg', 'https://cdn.example/x.jpg'],
+        }),
+      (e: unknown) => e instanceof AppError && e.code === 'VALIDATION_ERROR',
+    );
+  });
+
+  it('rejects a media URL with no public hostname', () => {
+    assert.throws(() => validateProductCreate({ ...minimal, mediaUrls: ['https://localhost/x.jpg'] }));
   });
 });
 
 describe('buildProductCreateInput', () => {
+  it('ALWAYS creates as DRAFT, even when ACTIVE was requested', () => {
+    // The single most important property of the create flow: a product is born
+    // invisible and is only activated after publication has been verified.
+    const req = validateProductCreate({ ...minimal, status: 'ACTIVE', publish: true });
+    assert.equal(req.desiredStatus, 'ACTIVE');
+    assert.equal(buildProductCreateInput(req)['status'], 'DRAFT');
+  });
+
   it('includes title and status and maps options to productOptions', () => {
     const req = validateProductCreate({
       title: 'Tee',

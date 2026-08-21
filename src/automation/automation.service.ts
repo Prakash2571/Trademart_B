@@ -17,6 +17,7 @@
 
 import { AppError, toAppError } from '../common/errors';
 import { logger } from '../common/logger';
+import { getContext, getRequestId } from '../common/requestContext';
 import { config, isAutomationEnabled } from '../config';
 import { AutomationRunModel } from '../database/models/AutomationRun';
 import { AutomationSettingsModel } from '../database/models/AutomationSettings';
@@ -30,10 +31,27 @@ import {
 import { shopifyGraphql } from '../shopify/shopify.client';
 import { mapUserErrors } from '../shopify/shopify.errors';
 import { INVENTORY_ITEM_PRODUCT_QUERY } from '../shopify/graphql/inventory.queries';
+import {
+  tryGetProductPublicationState,
+  tryPublishToOnlineStore,
+} from '../shopify/publication.service';
 import { getProduct, listProducts } from '../shopify/shopify.service';
 import type { ProductDto } from '../shopify/shopify.types';
 import { loadManualCostMap } from '../suppliers/manualCost.service';
+import { withAutomationLock } from './automation.lock';
 import { buildAutomationPlan, type AutomationPlan, type PriceAction } from './plan';
+import {
+  hashPlan,
+  hashRules,
+  normaliseScope,
+  shortHash,
+  type PlanScope,
+} from './plan.hash';
+import {
+  consumePreview,
+  issuePreview,
+  type PreviewRecord,
+} from './preview.store';
 import {
   AUTOMATION_HIDDEN_TAG,
   AUTOMATION_REVIEW_TAG,
@@ -88,6 +106,20 @@ export interface AutomationReport {
   summary: AutomationPlan['summary'] & { applied: number; failed: number };
   auditRunId: string | null;
   notes: string[];
+  /** Fingerprint of the rules this run used. */
+  rulesHash: string;
+  /**
+   * Fingerprint of the exact action list. For a preview this is what the operator
+   * is approving; for an apply it is proof the executed plan matched it.
+   */
+  planHash: string;
+  scope: PlanScope;
+  /**
+   * The preview token. Present on a preview (the client must send its previewId
+   * back to apply) and on an apply (the token that authorised it). Null for
+   * internal unreviewed runs.
+   */
+  preview: PreviewRecord | null;
 }
 
 /**
@@ -314,24 +346,42 @@ async function applyPrices(productId: string, actions: PriceAction[]): Promise<v
 }
 
 /**
- * Builds and optionally applies an automation plan.
+ * A plan built from freshly fetched data, together with its fingerprints.
  *
- * Preview (`dryRun: true`) works regardless of the kill switch; applying does not.
+ * The point of this type is that it is a VALUE. Once a PreparedPlan exists, the
+ * plan it holds is fixed: verifying its hash and then executing it cannot
+ * disagree, because nothing is re-fetched or re-decided in between. That is what
+ * makes the preview -> apply guarantee airtight rather than merely likely.
  */
-export async function runAutomation(options: RunOptions): Promise<AutomationReport> {
+export interface PreparedPlan {
+  rules: AutomationRules;
+  plan: AutomationPlan;
+  /** Fingerprint of the rules the plan was built from. */
+  rulesHash: string;
+  /** Fingerprint of the action list. Compared against the reviewed preview. */
+  planHash: string;
+  scope: PlanScope;
+  /** Fields Shopify refused, propagated from the product read. */
+  degraded: string[];
+  notes: string[];
+}
+
+/**
+ * Fetches data and builds a plan. NEVER writes.
+ *
+ * Shared verbatim by preview and apply, which is what makes a preview a truthful
+ * prediction rather than a separate code path that might disagree with what apply
+ * would do.
+ */
+export async function prepareAutomationPlan(
+  options: Omit<RunOptions, 'dryRun'>,
+): Promise<PreparedPlan> {
   const rules = await resolveEffectiveRules(options.rules);
   const problems = validateAutomationRules(rules);
   if (problems.length > 0) {
     throw new AppError('AUTOMATION_RULES_INVALID', 'Automation rules are invalid.', {
       details: { problems },
     });
-  }
-
-  if (!options.dryRun && !isAutomationEnabled()) {
-    throw new AppError(
-      'AUTOMATION_DISABLED',
-      'Storefront writes are disabled. Set AUTOMATION_ENABLED=true to allow Trademart to change prices and product visibility, or use POST /api/automation/preview to see what it would do.',
-    );
   }
 
   const notes: string[] = [];
@@ -378,6 +428,43 @@ export async function runAutomation(options: RunOptions): Promise<AutomationRepo
   }
 
   const plan = buildAutomationPlan(products, rules, manualCosts);
+
+  return {
+    rules,
+    plan,
+    rulesHash: hashRules(rules),
+    planHash: hashPlan(plan),
+    scope: normaliseScope({
+      query: options.query,
+      maxProducts,
+      productIds: options.productIds,
+    }),
+    degraded,
+    notes,
+  };
+}
+
+/**
+ * Executes (or, for a dry run, merely reports) an ALREADY PREPARED plan.
+ *
+ * Takes the prepared plan rather than re-deriving one, so the plan that was
+ * verified against the operator's preview is byte-for-byte the plan that gets
+ * written. Nothing between the hash comparison and the Shopify mutations can
+ * change what is about to happen.
+ */
+export async function executePreparedPlan(
+  prepared: PreparedPlan,
+  options: { dryRun: boolean; trigger?: RunOptions['trigger']; previewId?: string | null },
+): Promise<AutomationReport> {
+  const { rules, plan, degraded } = prepared;
+  const notes = [...prepared.notes];
+
+  if (!options.dryRun && !isAutomationEnabled()) {
+    throw new AppError(
+      'AUTOMATION_DISABLED',
+      'Storefront writes are disabled. Set AUTOMATION_ENABLED=true to allow Trademart to change prices and product visibility, or use POST /api/automation/preview to see what it would do.',
+    );
+  }
 
   const actions: AppliedAction[] = [];
   let applied = 0;
@@ -503,10 +590,15 @@ export async function runAutomation(options: RunOptions): Promise<AutomationRepo
     actions,
     plan,
     summary,
+    rulesHash: prepared.rulesHash,
+    planHash: prepared.planHash,
+    previewId: options.previewId ?? null,
   });
 
   logger.info(options.dryRun ? 'Automation preview complete.' : 'Automation run complete.', {
     dryRun: options.dryRun,
+    planHash: shortHash(prepared.planHash),
+    previewId: options.previewId ?? null,
     ...summary,
   });
 
@@ -520,7 +612,124 @@ export async function runAutomation(options: RunOptions): Promise<AutomationRepo
     summary,
     auditRunId,
     notes,
+    rulesHash: prepared.rulesHash,
+    planHash: prepared.planHash,
+    scope: prepared.scope,
+    preview: null,
   };
+}
+
+/**
+ * Builds a plan, reports it, and issues a single-use token bound to it.
+ *
+ * The token is what `applyAutomation` demands. Its planHash is the operator's
+ * receipt: it says "this exact set of changes is what I approved".
+ */
+export async function previewAutomation(
+  options: Omit<RunOptions, 'dryRun'>,
+): Promise<AutomationReport> {
+  const prepared = await prepareAutomationPlan(options);
+  const report = await executePreparedPlan(prepared, {
+    dryRun: true,
+    trigger: options.trigger ?? 'manual',
+  });
+
+  const preview = await issuePreview({
+    rulesHash: prepared.rulesHash,
+    planHash: prepared.planHash,
+    scope: prepared.scope,
+    summary: report.summary,
+  });
+
+  if (preview === null) {
+    report.notes.push(
+      'This preview could not be recorded, so it cannot be applied. The report above is still accurate. Check the database connection and preview again.',
+    );
+  }
+
+  return { ...report, preview };
+}
+
+/**
+ * Applies automation, but ONLY the exact plan a preview recorded.
+ *
+ * The sequence is the safety property:
+ *
+ *   1. take the store-level lock          (no two concurrent applies)
+ *   2. build a plan from CURRENT data
+ *   3. compare its fingerprint to the reviewed preview, and consume the token
+ *   4. execute THAT SAME prepared plan
+ *
+ * Step 2 before step 3 is deliberate: the comparison has to be against fresh
+ * data, otherwise it proves nothing. Step 4 reusing the object from step 2 is
+ * equally deliberate: re-preparing after verification would reintroduce exactly
+ * the gap this whole mechanism exists to close.
+ */
+export async function applyAutomation(
+  options: Omit<RunOptions, 'dryRun'> & { previewId: string | undefined },
+): Promise<AutomationReport> {
+  if (options.previewId === undefined || options.previewId.length === 0) {
+    throw new AppError(
+      'PREVIEW_REQUIRED',
+      'Applying automation requires the previewId returned by POST /api/automation/preview. Apply can only execute a plan that has been reviewed, so there is nothing to apply without one.',
+    );
+  }
+  const previewId = options.previewId;
+
+  // The kill switch is checked before taking the lock so a disabled deployment
+  // fails immediately and cannot block a legitimate run.
+  if (!isAutomationEnabled()) {
+    throw new AppError(
+      'AUTOMATION_DISABLED',
+      'Storefront writes are disabled. Set AUTOMATION_ENABLED=true to allow Trademart to change prices and product visibility, or use POST /api/automation/preview to see what it would do.',
+    );
+  }
+
+  return withAutomationLock({ trigger: options.trigger ?? 'manual' }, async () => {
+    const prepared = await prepareAutomationPlan(options);
+
+    // Throws PREVIEW_REQUIRED / PREVIEW_EXPIRED / PREVIEW_STALE /
+    // PREVIEW_ALREADY_APPLIED. Nothing has been written at this point, so every
+    // refusal leaves the store untouched.
+    const preview = await consumePreview({
+      previewId,
+      storeDomain: config.shopify.storeDomain,
+      rulesHash: prepared.rulesHash,
+      planHash: prepared.planHash,
+      scope: prepared.scope,
+    });
+
+    const report = await executePreparedPlan(prepared, {
+      dryRun: false,
+      trigger: options.trigger ?? 'manual',
+      previewId,
+    });
+
+    return { ...report, preview };
+  });
+}
+
+/**
+ * Runs automation without a preview. INTERNAL USE ONLY.
+ *
+ * Webhook-triggered runs have no human to review a preview, so they cannot
+ * satisfy the preview gate - but they are also narrowly scoped (a single changed
+ * product) and driven by the merchant's own saved rules, which is a different
+ * risk profile from a bulk catalogue apply. They still take the store lock, so
+ * they can never interleave with an operator's apply.
+ *
+ * Not reachable from the HTTP API: the apply route requires a previewId.
+ */
+export async function runAutomationUnreviewed(
+  options: Omit<RunOptions, 'dryRun'>,
+): Promise<AutomationReport> {
+  return withAutomationLock({ trigger: options.trigger ?? 'webhook' }, async () => {
+    const prepared = await prepareAutomationPlan(options);
+    return executePreparedPlan(prepared, {
+      dryRun: false,
+      trigger: options.trigger ?? 'webhook',
+    });
+  });
 }
 
 /**
@@ -535,6 +744,9 @@ async function persistRun(input: {
   actions: AppliedAction[];
   plan: AutomationPlan;
   summary: AutomationReport['summary'];
+  rulesHash: string;
+  planHash: string;
+  previewId: string | null;
 }): Promise<string | null> {
   if (getDatabaseStatus().status !== 'connected') {
     if (!input.dryRun) {
@@ -556,6 +768,13 @@ async function persistRun(input: {
       actions: input.actions,
       skipped: input.plan.skipped,
       summary: input.summary,
+      // Recorded so a historical run can be tied back to the preview that
+      // authorised it - "what did the operator approve?" stays answerable.
+      rulesHash: input.rulesHash,
+      planHash: input.planHash,
+      previewId: input.previewId,
+      requestId: getRequestId(),
+      actor: getContext()?.actor ?? null,
     });
     return String(run._id);
   } catch (error) {
@@ -626,11 +845,44 @@ export async function holdProductForReview(shopifyProductId: string): Promise<vo
   logger.info('Held new product for review.', { shopifyProductId });
 }
 
+export interface ApprovalResult {
+  shopifyProductId: string;
+  /** Shopify's reported status after the attempt. */
+  status: string;
+  /** Verified against the Online Store publication, never inferred. */
+  publishedToOnlineStore: boolean;
+  /** The only field that may be shown as "customers can see it". */
+  visibleToCustomers: boolean;
+  /** False means the product is still held for review - deliberately. */
+  reviewTagRemoved: boolean;
+  /** True while the product remains in /products/review. */
+  stillInReviewQueue: boolean;
+  warnings: string[];
+}
+
 /**
- * Approves a held product: clears the review and auto-hidden tags and publishes
- * it. This is the deliberate human step that lets a product into the shop.
+ * Approves a held product. The deliberate human step that lets a product into
+ * the shop.
+ *
+ * ORDER IS THE SAFETY PROPERTY
+ * ----------------------------
+ *     product stays DRAFT + review tag
+ *          -> publish to the Online Store
+ *          -> VERIFY publication
+ *          -> set ACTIVE
+ *          -> VERIFY final state
+ *          -> only now remove the review / auto-hidden tags
+ *
+ * The review tag is removed LAST, and only after the product is genuinely live.
+ * Removing it first - which is what this function used to do - meant that any
+ * later failure dropped the product out of /products/review while leaving it
+ * DRAFT: invisible to customers, invisible to the operator, and remembered by
+ * nobody. An imported product could be silently lost that way.
+ *
+ * So every failure path here leaves the product in exactly the state it started
+ * in: DRAFT, tagged, and still in the queue to be tried again.
  */
-export async function approveProduct(shopifyProductId: string): Promise<void> {
+export async function approveProduct(shopifyProductId: string): Promise<ApprovalResult> {
   if (!isAutomationEnabled()) {
     throw new AppError(
       'AUTOMATION_DISABLED',
@@ -638,19 +890,139 @@ export async function approveProduct(shopifyProductId: string): Promise<void> {
     );
   }
 
-  const removal = await shopifyGraphql<{
-    tagsRemove: { userErrors: { field?: string[] | null; message?: string }[] } | null;
-  }>(
-    TAGS_REMOVE_MUTATION,
-    { id: shopifyProductId, tags: [AUTOMATION_REVIEW_TAG, AUTOMATION_HIDDEN_TAG] },
-    { operation: 'automationApproveTagsRemove' },
-  );
-  const removalError = mapUserErrors(removal.data.tagsRemove?.userErrors);
-  if (removalError !== null) throw removalError;
+  const warnings: string[] = [];
 
-  // applyVisibility also strips the auto-hidden tag; harmless and idempotent.
-  await applyVisibility(shopifyProductId, 'ACTIVE');
-  logger.info('Approved product for the storefront.', { shopifyProductId });
+  // ---- Publish first, and verify ------------------------------------------
+  //
+  // If this fails the function returns early WITHOUT touching tags or status, so
+  // the product is untouched and stays in the review queue.
+  const attempt = await tryPublishToOnlineStore(shopifyProductId);
+  if (!attempt.outcome.published) {
+    logger.warn('Approval failed at publication; product remains DRAFT and in review.', {
+      shopifyProductId,
+      code: attempt.outcome.error?.code ?? 'PUBLICATION_FAILED',
+    });
+    throw new AppError(
+      'PUBLICATION_FAILED',
+      `Could not publish this product to the Online Store (${attempt.outcome.error?.code ?? 'PUBLICATION_FAILED'}: ${attempt.outcome.error?.message ?? 'unknown reason'}). It has been left as a DRAFT with the ${AUTOMATION_REVIEW_TAG} tag, so it is still in the review queue and nothing is visible to customers. Fix the cause and approve it again.`,
+      {
+        details: {
+          shopifyProductId,
+          status: 'DRAFT',
+          reviewTagRemoved: false,
+          stillInReviewQueue: true,
+          publication: attempt.outcome,
+        },
+      },
+    );
+  }
+
+  // ---- Then activate, and verify ------------------------------------------
+  try {
+    await applyVisibility(shopifyProductId, 'ACTIVE');
+  } catch (error) {
+    const appError = toAppError(error);
+    logger.warn('Approval published the product but could not set it ACTIVE.', {
+      shopifyProductId,
+      code: appError.code,
+    });
+    // Published but still DRAFT = still invisible. Keep the review tag so the
+    // operator can find it, and say precisely what happened.
+    throw new AppError(
+      'PUBLICATION_FAILED',
+      `The product was published to the Online Store but its status could not be set to ACTIVE (${appError.code}: ${appError.message}). A DRAFT product is not visible to customers, so it has been left in the review queue with the ${AUTOMATION_REVIEW_TAG} tag.`,
+      {
+        details: {
+          shopifyProductId,
+          reviewTagRemoved: false,
+          stillInReviewQueue: true,
+          publishedToOnlineStore: true,
+        },
+      },
+    );
+  }
+
+  const finalState = await tryGetProductPublicationState(shopifyProductId);
+  const status = finalState?.status ?? 'ACTIVE';
+  const publishedToOnlineStore = finalState?.publishedToOnlineStore ?? true;
+  const visibleToCustomers = finalState?.visibleToCustomers ?? false;
+
+  if (finalState === null) {
+    warnings.push(
+      'The final state could not be re-read from Shopify, so visibility is unconfirmed. The review tag was left in place until it can be verified.',
+    );
+    // Unverified means unfinished: keep it in the queue rather than claiming a
+    // clean approval.
+    return {
+      shopifyProductId,
+      status,
+      publishedToOnlineStore,
+      visibleToCustomers: false,
+      reviewTagRemoved: false,
+      stillInReviewQueue: true,
+      warnings,
+    };
+  }
+
+  if (!finalState.visibleToCustomers) {
+    warnings.push(
+      `Shopify reports status=${finalState.status} and publishedToOnlineStore=${finalState.publishedToOnlineStore}, so the product is not visible to customers. It stays in the review queue.`,
+    );
+    return {
+      shopifyProductId,
+      status,
+      publishedToOnlineStore,
+      visibleToCustomers: false,
+      reviewTagRemoved: false,
+      stillInReviewQueue: true,
+      warnings,
+    };
+  }
+
+  // ---- Only now clear the gate --------------------------------------------
+  let reviewTagRemoved = false;
+  try {
+    const removal = await shopifyGraphql<{
+      tagsRemove: { userErrors: { field?: string[] | null; message?: string }[] } | null;
+    }>(
+      TAGS_REMOVE_MUTATION,
+      { id: shopifyProductId, tags: [AUTOMATION_REVIEW_TAG, AUTOMATION_HIDDEN_TAG] },
+      { operation: 'automationApproveTagsRemove' },
+    );
+    const removalError = mapUserErrors(removal.data.tagsRemove?.userErrors);
+    if (removalError !== null) throw removalError;
+    reviewTagRemoved = true;
+  } catch (error) {
+    const appError = toAppError(error);
+    // The product IS live and correct. Failing to remove a bookkeeping tag is the
+    // harmless direction: it reappears in the queue, which is confusing but not
+    // damaging, and approving again is idempotent.
+    logger.warn('Product is live but the review tag could not be removed.', {
+      shopifyProductId,
+      code: appError.code,
+    });
+    warnings.push(
+      `The product is published and ACTIVE, but the ${AUTOMATION_REVIEW_TAG} tag could not be removed (${appError.code}: ${appError.message}), so it will still appear in the review queue. Approving it again is safe.`,
+    );
+  }
+
+  logger.info('Approved product for the storefront.', {
+    shopifyProductId,
+    status,
+    publishedToOnlineStore,
+    visibleToCustomers,
+    reviewTagRemoved,
+  });
+
+  return {
+    shopifyProductId,
+    status,
+    publishedToOnlineStore,
+    visibleToCustomers,
+    reviewTagRemoved,
+    stillInReviewQueue: !reviewTagRemoved,
+    warnings,
+  };
 }
 
 /** Most recent runs, newest first — the "what did automation just do?" view. */

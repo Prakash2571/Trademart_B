@@ -5,6 +5,8 @@
  * is passed through a redactor before printing.
  */
 
+import { getContext } from './requestContext';
+
 const SECRET_PATTERNS: RegExp[] = [
   /shpat_[A-Za-z0-9]+/g, // Admin API access token
   /shpss_[A-Za-z0-9]+/g, // app secret
@@ -41,11 +43,20 @@ function redactMeta(meta: Record<string, unknown>): Record<string, unknown> {
 type Level = 'debug' | 'info' | 'warn' | 'error';
 
 function emit(level: Level, message: string, meta?: Record<string, unknown>): void {
+  const context = getContext();
   const line: Record<string, unknown> = {
     level,
+    // Always UTC. A server whose local timezone leaked into timestamps makes
+    // correlating with Shopify's own timestamps needlessly hard.
     time: new Date().toISOString(),
     message: redact(message),
   };
+  // Correlation fields go on every line without any caller having to pass them.
+  if (context !== undefined) {
+    line['requestId'] = context.requestId;
+    if (context.source !== 'http') line['source'] = context.source;
+    if (context.actor !== null) line['actor'] = context.actor;
+  }
   if (meta && Object.keys(meta).length > 0) {
     Object.assign(line, redactMeta(meta));
   }

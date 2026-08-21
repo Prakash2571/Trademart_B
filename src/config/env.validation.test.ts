@@ -280,7 +280,23 @@ describe('validateEnv - SHOPIFY_SCOPES', () => {
       'read_orders',
       'read_customers',
       'read_inventory',
+      // Needed to tell whether a product is really on the Online Store. Without
+      // it, visibility could only be guessed from `status`, which is wrong in
+      // both directions.
+      'read_publications',
     ]);
+  });
+
+  it('does NOT request write_publications by default', () => {
+    // Publishing changes what customers see, so it stays opt-in rather than
+    // arriving silently with an app update.
+    const result = validateEnv(VALID);
+
+    assert.ok(!(result.config?.shopify.scopes ?? []).includes('write_publications'));
+    assert.ok(
+      result.warnings.some((w) => w.includes('write_publications')),
+      'expected a warning that publishing is unavailable without the scope',
+    );
   });
 
   it('parses a comma-separated list and lowercases it', () => {
@@ -553,9 +569,141 @@ describe('validateEnv - operator authentication', () => {
   it('derives secureCookies from production', () => {
     assert.equal(validateEnv(VALID).config?.operator.secureCookies, false);
     assert.equal(
-      validateEnv({ ...VALID, NODE_ENV: 'production', MONGODB_URI: VALID.MONGODB_URI }).config
-        ?.operator.secureCookies,
+      // FRONTEND_URL must be https in production - a Secure cookie is dropped by
+      // the browser over plain http, so the two settings are not independent.
+      validateEnv({ ...VALID, NODE_ENV: 'production', FRONTEND_URL: 'https://app.example.com' })
+        .config?.operator.secureCookies,
       true,
     );
+  });
+});
+
+describe('validateEnv - production hardening', () => {
+  const PROD = {
+    ...VALID,
+    NODE_ENV: 'production',
+    FRONTEND_URL: 'https://app.example.com',
+  } as const;
+
+  it('accepts a sound production configuration', () => {
+    assert.deepEqual(validateEnv(PROD).errors, []);
+  });
+
+  it('rejects a non-https FRONTEND_URL in production', () => {
+    const result = validateEnv({ ...PROD, FRONTEND_URL: 'http://app.example.com' });
+
+    assert.ok(result.errors.some((e) => e.includes('FRONTEND_URL')));
+    assert.equal(result.config, null);
+  });
+
+  it('rejects a wildcard CORS origin in production', () => {
+    // credentials:true with a wildcard origin would expose the session cookie.
+    assert.ok(
+      validateEnv({ ...PROD, FRONTEND_URL: 'https://*.example.com' }).errors.some((e) =>
+        e.includes('wildcard'),
+      ),
+    );
+  });
+
+  it('refuses AUTOMATION_ENABLED in production with no operator credentials', () => {
+    // Otherwise /api/automation/apply is callable by anyone who finds the URL.
+    const result = validateEnv({ ...PROD, AUTOMATION_ENABLED: 'true' });
+
+    assert.ok(result.errors.some((e) => e.includes('AUTOMATION_ENABLED')));
+  });
+
+  it('rejects a placeholder SESSION_SECRET that is long enough to pass a length check', () => {
+    const result = validateEnv({
+      ...PROD,
+      SESSION_SECRET: 'change-me-change-me-change-me-change-me',
+      OPERATOR_PASSWORD_HASH: 'scrypt$16384$8$1$salt$hash',
+    });
+
+    assert.ok(result.errors.some((e) => e.includes('SESSION_SECRET')));
+  });
+
+  it('allows development to stay easy to run', () => {
+    // The same values that are errors in production are not even warnings worth
+    // blocking on locally.
+    assert.deepEqual(validateEnv({ ...VALID, FRONTEND_URL: 'http://localhost:3000' }).errors, []);
+  });
+});
+
+describe('validateEnv - store mode and live-store writes', () => {
+  it('defaults SHOPIFY_STORE_MODE to production, so an undeclared store is assumed real', () => {
+    assert.equal(validateEnv(VALID).config?.shopify.storeMode, 'production');
+  });
+
+  it('accepts an explicit development declaration', () => {
+    assert.equal(
+      validateEnv({ ...VALID, SHOPIFY_STORE_MODE: 'development' }).config?.shopify.storeMode,
+      'development',
+    );
+  });
+
+  it('rejects an unknown store mode rather than falling back', () => {
+    assert.ok(
+      validateEnv({ ...VALID, SHOPIFY_STORE_MODE: 'staging' }).errors.some((e) =>
+        e.includes('SHOPIFY_STORE_MODE'),
+      ),
+    );
+  });
+
+  it('defaults ALLOW_LIVE_STORE_WRITES to false', () => {
+    assert.equal(validateEnv(VALID).config?.allowLiveStoreWrites, false);
+  });
+
+  it('warns loudly when live-store writes are acknowledged', () => {
+    const result = validateEnv({ ...VALID, ALLOW_LIVE_STORE_WRITES: 'true' });
+
+    assert.equal(result.config?.allowLiveStoreWrites, true);
+    assert.ok(result.warnings.some((w) => w.includes('ALLOW_LIVE_STORE_WRITES')));
+  });
+
+  it('rejects a non-boolean ALLOW_LIVE_STORE_WRITES instead of treating it as falsy', () => {
+    // A typo silently disabling a guard is confusing; silently enabling it would
+    // be dangerous. Either way it must be an error.
+    assert.ok(
+      validateEnv({ ...VALID, ALLOW_LIVE_STORE_WRITES: 'yes' }).errors.some((e) =>
+        e.includes('ALLOW_LIVE_STORE_WRITES'),
+      ),
+    );
+  });
+
+  it('validates the Online Store publication pin', () => {
+    assert.ok(
+      validateEnv({ ...VALID, SHOPIFY_ONLINE_STORE_PUBLICATION_ID: '12345' }).errors.length > 0,
+    );
+    assert.equal(
+      validateEnv({
+        ...VALID,
+        SHOPIFY_ONLINE_STORE_PUBLICATION_ID: 'gid://shopify/Publication/123',
+      }).config?.shopify.onlineStorePublicationId,
+      'gid://shopify/Publication/123',
+    );
+  });
+});
+
+describe('validateEnv - inventory and retention', () => {
+  it('defaults MAX_INVENTORY_DELTA to 500', () => {
+    assert.equal(validateEnv(VALID).config?.maxInventoryDelta, 500);
+  });
+
+  it('rejects a non-numeric MAX_INVENTORY_DELTA', () => {
+    assert.ok(validateEnv({ ...VALID, MAX_INVENTORY_DELTA: 'lots' }).errors.length > 0);
+  });
+
+  it('applies retention defaults', () => {
+    const retention = validateEnv(VALID).config?.retention;
+
+    assert.equal(retention?.webhookEventDays, 45);
+    assert.equal(retention?.idempotencyKeyHours, 48);
+    assert.equal(retention?.auditLogDays, 730);
+    assert.equal(retention?.previewMinutes, 15);
+  });
+
+  it('rejects a retention value outside its bounds', () => {
+    // Audit retention below 30 days would defeat the point of the audit trail.
+    assert.ok(validateEnv({ ...VALID, RETENTION_AUDIT_DAYS: '5' }).errors.length > 0);
   });
 });

@@ -38,6 +38,18 @@ export type ShopifyAuthStrategy =
  */
 export type ShopifyAuthMode = 'auto' | 'oauth';
 
+/**
+ * What KIND of store this deployment points at.
+ *
+ * This is an operator declaration, and it is deliberately NOT trusted on its
+ * own - `shopify/storeMode.ts` compares it against Shopify's own
+ * `shop.plan.partnerDevelopment` and treats a mismatch as a live store. The
+ * declared value only decides what happens when Shopify cannot be reached to
+ * confirm, and it defaults to `production` so an unverifiable store is treated
+ * as real.
+ */
+export type ShopifyStoreMode = 'development' | 'production';
+
 export interface ShopifyConfig {
   storeDomain: string;
   apiVersion: string;
@@ -61,6 +73,16 @@ export interface ShopifyConfig {
   oauthRedirectUri: string | null;
   /** Where webhook deliveries should be sent. Null until APP_URL is set. */
   webhookCallbackUrl: string | null;
+  /** Operator's declaration of the store kind. Verified against Shopify, never trusted alone. */
+  storeMode: ShopifyStoreMode;
+  /**
+   * Optional pin for the Online Store publication GID.
+   *
+   * Normally resolved from Shopify and cached. Setting it explicitly removes a
+   * lookup and is useful when a shop has several publications with confusing
+   * names.
+   */
+  onlineStorePublicationId: string | null;
 }
 
 export interface AppConfig {
@@ -93,8 +115,45 @@ export interface AppConfig {
    * merchant may reasonably want the first without the second.
    */
   automationOnWebhook: boolean;
+  /**
+   * Explicit acknowledgement that automated tooling may write to a store that is
+   * NOT a Shopify development store.
+   *
+   * Defaults to FALSE. Normal merchant actions through the signed-in console are
+   * unaffected; this gates the things that mutate a store without a human
+   * deciding to - smoke tests, seed scripts, dev utilities. The default means a
+   * test run pointed at a real shop fails loudly instead of editing it.
+   */
+  allowLiveStoreWrites: boolean;
+  /**
+   * Largest absolute inventory change a normal write may make without the caller
+   * setting `confirmLargeChange: true`. Enforced server-side; a frontend
+   * confirmation dialog is not a control.
+   */
+  maxInventoryDelta: number;
+  retention: RetentionConfig;
   operator: OperatorConfig;
   shopify: ShopifyConfig;
+}
+
+/**
+ * How long each class of operational data is kept.
+ *
+ * Expressed here rather than hard-coded in the models so the policy is visible
+ * in one place and reviewable against docs/DATA_RETENTION.md.
+ */
+export interface RetentionConfig {
+  /** Webhook delivery records, including payloads. */
+  webhookEventDays: number;
+  /** Idempotency keys. Long enough to cover a client retry storm, no longer. */
+  idempotencyKeyHours: number;
+  /**
+   * Operator audit entries. Longest retention by design: "who changed this
+   * price" must still be answerable months later.
+   */
+  auditLogDays: number;
+  /** Automation preview tokens. Short: a stale preview must not be appliable. */
+  previewMinutes: number;
 }
 
 export interface OperatorConfig {
@@ -148,7 +207,16 @@ export const DEFAULT_SHOPIFY_SCOPES = [
   'read_orders',
   'read_customers',
   'read_inventory',
+  // Needed to READ publication state. Without it Trademart cannot tell whether a
+  // product is actually on the Online Store, and would be reduced to inferring
+  // visibility from `status` - which is exactly the bug this app must not have.
+  // Reading is harmless; PUBLISHING additionally needs write_publications, which
+  // is deliberately NOT requested by default.
+  'read_publications',
 ] as const;
+
+/** Scope required to publish/unpublish. Opt-in: it changes what customers see. */
+export const PUBLICATION_WRITE_SCOPE = 'write_publications';
 
 /** Path of the OAuth callback. Kept as a constant so config and docs agree. */
 export const OAUTH_CALLBACK_PATH = '/api/auth/callback';
@@ -157,6 +225,7 @@ export const WEBHOOK_RECEIVER_PATH = '/api/webhooks/shopify';
 
 const NODE_ENVS: readonly NodeEnv[] = ['development', 'test', 'production'];
 const AUTH_MODES: readonly ShopifyAuthMode[] = ['auto', 'oauth'];
+const STORE_MODES: readonly ShopifyStoreMode[] = ['development', 'production'];
 export const MYSHOPIFY_DOMAIN = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/;
 const API_VERSION = /^\d{4}-\d{2}$/;
 /** Shopify scope names are lowercase snake_case, e.g. read_products. */
@@ -169,6 +238,49 @@ function read(env: RawEnv, key: string): string | null {
   if (value === undefined) return null;
   const trimmed = value.trim();
   return trimmed.length === 0 ? null : trimmed;
+}
+
+/**
+ * Strict boolean parsing: only "true"/"false" are accepted.
+ *
+ * Anything else is an error rather than a falsy default, because the values this
+ * is used for are safety switches. `ALLOW_LIVE_STORE_WRITES=yes` silently
+ * meaning "no" is confusing; silently meaning "yes" would be dangerous.
+ */
+function readBoolean(
+  env: RawEnv,
+  key: string,
+  fallback: boolean,
+  errors: string[],
+): boolean {
+  const raw = read(env, key);
+  if (raw === null) return fallback;
+  const normalised = raw.toLowerCase();
+  if (normalised === 'true') return true;
+  if (normalised === 'false') return false;
+  errors.push(`${key} must be "true" or "false" (received "${raw}").`);
+  return fallback;
+}
+
+/** Bounded integer parsing with a default. */
+function readInt(
+  env: RawEnv,
+  key: string,
+  options: { min: number; max: number; fallback: number },
+  errors: string[],
+): number {
+  const raw = read(env, key);
+  if (raw === null) return options.fallback;
+  if (!/^\d+$/.test(raw)) {
+    errors.push(`${key} must be a non-negative integer (received "${raw}").`);
+    return options.fallback;
+  }
+  const parsed = Number(raw);
+  if (parsed < options.min || parsed > options.max) {
+    errors.push(`${key} must be between ${options.min} and ${options.max}.`);
+    return options.fallback;
+  }
+  return parsed;
 }
 
 /**
@@ -516,6 +628,109 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     );
   }
 
+  // Publication is a separate capability from product writes: write_products can
+  // set a product ACTIVE, but only write_publications puts it on the Online
+  // Store. Warned (not errored) because managed installation supplies scopes from
+  // shopify.app.toml, which this validator cannot see.
+  if (!scopes.includes('read_publications')) {
+    warnings.push(
+      'SHOPIFY_SCOPES does not include read_publications - Trademart cannot verify whether a product is actually published to the Online Store, so publication state will be reported as unknown rather than guessed from status.',
+    );
+  }
+  if (!scopes.includes(PUBLICATION_WRITE_SCOPE)) {
+    warnings.push(
+      `SHOPIFY_SCOPES does not include ${PUBLICATION_WRITE_SCOPE} - publishing and unpublishing will fail with SHOPIFY_SCOPE_MISSING. Products can still be created and edited; they will simply stay off the Online Store. Add it when you want Trademart to publish.`,
+    );
+  }
+
+  // ---- SHOPIFY_STORE_MODE ------------------------------------------------
+  //
+  // Declares whether this deployment points at a development store or a real
+  // one. Defaults to `production`: an undeclared store must be assumed real, so
+  // that forgetting to set anything is the SAFE outcome rather than the unsafe
+  // one.
+  //
+  // This value is never trusted on its own - shopify/storeMode.ts checks it
+  // against Shopify's shop.plan.partnerDevelopment and reports a disagreement.
+  const rawStoreMode = read(env, 'SHOPIFY_STORE_MODE');
+  let storeMode: ShopifyStoreMode = 'production';
+  if (rawStoreMode !== null) {
+    const normalised = rawStoreMode.toLowerCase();
+    if ((STORE_MODES as readonly string[]).includes(normalised)) {
+      storeMode = normalised as ShopifyStoreMode;
+    } else {
+      errors.push(
+        `SHOPIFY_STORE_MODE must be one of ${STORE_MODES.join(', ')} (received "${rawStoreMode}").`,
+      );
+    }
+  }
+
+  // ---- ALLOW_LIVE_STORE_WRITES -------------------------------------------
+  const allowLiveStoreWrites = readBoolean(env, 'ALLOW_LIVE_STORE_WRITES', false, errors);
+  if (allowLiveStoreWrites) {
+    warnings.push(
+      'ALLOW_LIVE_STORE_WRITES=true - automated tooling (tests, seed and dev scripts) is permitted to mutate a NON-development store. Unset this outside a deliberate, supervised operation.',
+    );
+  }
+  if (storeMode === 'development' && isProduction) {
+    // Not an error: a staging deployment legitimately runs NODE_ENV=production
+    // against a development store. But it is worth saying out loud.
+    warnings.push(
+      'SHOPIFY_STORE_MODE=development with NODE_ENV=production - treating this as a staging deployment against a Shopify development store.',
+    );
+  }
+
+  // ---- SHOPIFY_ONLINE_STORE_PUBLICATION_ID -------------------------------
+  const onlineStorePublicationId = read(env, 'SHOPIFY_ONLINE_STORE_PUBLICATION_ID');
+  if (
+    onlineStorePublicationId !== null &&
+    !onlineStorePublicationId.startsWith('gid://shopify/Publication/')
+  ) {
+    errors.push(
+      'SHOPIFY_ONLINE_STORE_PUBLICATION_ID must be a gid://shopify/Publication/... value. Leave it unset to let Trademart discover it.',
+    );
+  }
+
+  // ---- MAX_INVENTORY_DELTA -----------------------------------------------
+  //
+  // A server-side cap on how far a single stock write may move. The frontend also
+  // confirms large changes, but a browser dialog is not a control - anything that
+  // can be bypassed with curl has to be enforced here too.
+  const maxInventoryDelta = readInt(
+    env,
+    'MAX_INVENTORY_DELTA',
+    { min: 1, max: 1_000_000, fallback: 500 },
+    errors,
+  );
+
+  // ---- Retention ---------------------------------------------------------
+  const retention: RetentionConfig = {
+    webhookEventDays: readInt(
+      env,
+      'RETENTION_WEBHOOK_EVENT_DAYS',
+      { min: 1, max: 365, fallback: 45 },
+      errors,
+    ),
+    idempotencyKeyHours: readInt(
+      env,
+      'RETENTION_IDEMPOTENCY_HOURS',
+      { min: 1, max: 720, fallback: 48 },
+      errors,
+    ),
+    auditLogDays: readInt(
+      env,
+      'RETENTION_AUDIT_DAYS',
+      { min: 30, max: 3650, fallback: 730 },
+      errors,
+    ),
+    previewMinutes: readInt(
+      env,
+      'AUTOMATION_PREVIEW_TTL_MINUTES',
+      { min: 1, max: 120, fallback: 15 },
+      errors,
+    ),
+  };
+
   // ---- Operator authentication -------------------------------------------
   //
   // Protects every endpoint that can change the Shopify store. CORS is not
@@ -606,6 +821,79 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     );
   }
 
+  // ---- Production hardening ----------------------------------------------
+  //
+  // Configurations that are merely awkward in development but genuinely unsafe
+  // in production. These are ERRORS there and silent (or warnings) elsewhere, so
+  // a local machine stays easy to run while a real deployment cannot boot into a
+  // state nobody intended.
+  if (isProduction) {
+    // A wildcard origin with credentials:true is forbidden by the CORS spec and
+    // would, if a browser honoured it, expose the session cookie to any site.
+    if (frontendUrl === '*' || frontendUrl.includes('*')) {
+      errors.push(
+        'FRONTEND_URL must be an exact origin in production - a wildcard CORS origin cannot be used with credentialed requests.',
+      );
+    }
+    if (!frontendUrl.startsWith('https://')) {
+      errors.push(
+        `FRONTEND_URL must use https:// when NODE_ENV=production (received "${frontendUrl}"). The operator session cookie is marked Secure and a browser will not send it over plain http.`,
+      );
+    }
+
+    // Automation writes to a real store. Leaving it enabled with no way to
+    // authenticate means the apply endpoint is reachable by anyone who finds it.
+    if (automationEnabled && !hasPasswordLogin && operatorApiKey === null) {
+      errors.push(
+        'AUTOMATION_ENABLED=true in production with no operator credentials. Configure OPERATOR_PASSWORD_HASH + SESSION_SECRET (or OPERATOR_API_KEY) before allowing storefront writes.',
+      );
+    }
+
+    // Placeholder secrets copied straight out of the example file. Length checks
+    // alone would pass these.
+    const placeholder = /(change[-_ ]?me|example|placeholder|your[-_ ]?secret|xxxx|s3cret|password123)/i;
+    if (sessionSecret !== null && placeholder.test(sessionSecret)) {
+      errors.push(
+        'SESSION_SECRET looks like a placeholder value. Generate a real one: openssl rand -base64 48',
+      );
+    }
+    if (operatorApiKey !== null && placeholder.test(operatorApiKey)) {
+      errors.push(
+        'OPERATOR_API_KEY looks like a placeholder value. Generate a real one: openssl rand -base64 32',
+      );
+    }
+    if (operatorPasswordHash === null && operatorApiKey === null) {
+      warnings.push(
+        'No operator password hash in production - the console cannot be signed into. Generate one with: npm run operator:hash',
+      );
+    }
+
+    // Reads include cost prices, margins and customer counts. Open by default is
+    // a deliberate convenience for first deploys, but it is worth flagging.
+    if (!protectReads) {
+      warnings.push(
+        'OPERATOR_PROTECT_READS=false in production - read endpoints (including costs and margins) are reachable without signing in. Set it to true once the login screen is deployed.',
+      );
+    }
+
+    // Debug switches in production produce noisy logs and can widen what is
+    // printed. Warned rather than blocked so an emergency debug session is still
+    // possible.
+    if (read(env, 'DEBUG') !== null) {
+      warnings.push('DEBUG is set in production - verbose third-party logging is enabled.');
+    }
+    const logLevel = read(env, 'LOG_LEVEL');
+    if (logLevel !== null && logLevel.toLowerCase() === 'debug') {
+      warnings.push('LOG_LEVEL=debug in production - expect high log volume.');
+    }
+
+    if (sessionTtlHours > 168) {
+      warnings.push(
+        `SESSION_TTL_HOURS=${sessionTtlHours} - an operator session lasting over a week widens the window for a stolen cookie.`,
+      );
+    }
+  }
+
   if (errors.length > 0) {
     return { config: null, errors, warnings };
   }
@@ -621,6 +909,9 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
       tokenEncryptionKey,
       automationEnabled,
       automationOnWebhook,
+      allowLiveStoreWrites,
+      maxInventoryDelta,
+      retention,
       operator: {
         username: operatorUsername,
         passwordHash: operatorPasswordHash,
@@ -646,6 +937,8 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
         tokenEndpoint: `https://${storeDomain}/admin/oauth/access_token`,
         oauthRedirectUri: appUrl === null ? null : `${appUrl}${OAUTH_CALLBACK_PATH}`,
         webhookCallbackUrl: appUrl === null ? null : `${appUrl}${WEBHOOK_RECEIVER_PATH}`,
+        storeMode,
+        onlineStorePublicationId,
       },
     },
     errors,

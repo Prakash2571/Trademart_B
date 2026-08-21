@@ -90,6 +90,21 @@ export const isAutomationEnabled = (): boolean => config.automationEnabled;
 export const isAutomationOnWebhookEnabled = (): boolean =>
   config.automationOnWebhook && config.automationEnabled;
 
+/**
+ * True when the operator has explicitly acknowledged that automated tooling may
+ * mutate a store that is not a Shopify development store.
+ *
+ * Only consulted by the live-store guard (shopify/storeMode.ts). Interactive
+ * merchant actions in the signed-in console are NOT gated on this - a merchant
+ * operating their own live shop is the normal case. It exists to stop test
+ * suites, seed scripts and dev utilities from touching a real storefront.
+ */
+export const isLiveStoreWriteAcknowledged = (): boolean => config.allowLiveStoreWrites;
+
+/** True when the OAuth scope list requests permission to publish. */
+export const isPublicationWriteConfigured = (): boolean =>
+  config.shopify.scopes.includes('write_publications');
+
 /** True when an operator can sign in with a username and password. */
 export const isOperatorPasswordLoginConfigured = (): boolean =>
   config.operator.passwordHash !== null && config.operator.sessionSecret !== null;

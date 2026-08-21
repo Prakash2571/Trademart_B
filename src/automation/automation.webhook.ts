@@ -19,7 +19,7 @@ import {
   holdProductForReview,
   resolveEffectiveRules,
   resolveProductFromInventoryItem,
-  runAutomation,
+  runAutomationUnreviewed,
 } from './automation.service';
 import { TriggerCooldown, decideTrigger } from './automation.triggers';
 
@@ -108,11 +108,30 @@ async function execute(
     }
   }
 
-  const report = await runAutomation({
-    dryRun: false,
-    trigger: 'webhook',
-    productIds: [productId],
-  });
+  // Unreviewed by necessity: a webhook has no operator to approve a preview. It
+  // is narrowly scoped to the single changed product and uses the merchant's own
+  // saved rules, and it takes the store-level automation lock, so it can never
+  // interleave with an operator's bulk apply.
+  //
+  // AUTOMATION_ALREADY_RUNNING is an expected outcome here, not a fault: an
+  // operator apply already holds the lock and will cover this product anyway.
+  let report;
+  try {
+    report = await runAutomationUnreviewed({
+      trigger: 'webhook',
+      productIds: [productId],
+    });
+  } catch (error) {
+    const appError = toAppError(error);
+    if (appError.code === 'AUTOMATION_ALREADY_RUNNING') {
+      logger.info('Skipped webhook-triggered automation: a run is already in progress.', {
+        topic,
+        shopifyProductId: productId,
+      });
+      return;
+    }
+    throw appError;
+  }
 
   logger.info('Webhook-triggered automation finished.', {
     topic,
