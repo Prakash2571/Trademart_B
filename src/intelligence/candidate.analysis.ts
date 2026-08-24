@@ -29,6 +29,13 @@ import {
   type PricingScenarioName,
 } from '../pricing/recommendation';
 import type { ManualResearchEntry, ProductCandidate, TargetMarket } from './candidate.types';
+import {
+  applySourceabilityGate,
+  computeSourceability,
+  DEFAULT_SOURCEABILITY_CONFIG,
+  type SourceabilityConfig,
+  type SourceabilityResult,
+} from './sourceability';
 import type { ResearchSignals } from './providers/provider.types';
 import { scoreCandidate, type CandidateScore, type ScoringOptions } from './scoring/scoring.service';
 import type { ScoringInput } from './scoring/scoring.types';
@@ -220,17 +227,36 @@ export function applyAnalysisToCandidate(
   candidate: ProductCandidate,
   analysis: CandidateAnalysis,
   now: Date,
+  config: SourceabilityConfig = DEFAULT_SOURCEABILITY_CONFIG,
 ): ProductCandidate {
   const { score } = analysis;
+
+  /*
+   * The opportunity score is set verbatim; the RECOMMENDATION is then gated by
+   * sourceability. This is the invariant the whole phase adds: a strong market opportunity
+   * with an unverified supplier is WATCH, not STRONG_CANDIDATE, and an UNAVAILABLE supplier
+   * is REJECT regardless of the score. overallScore is never touched - the reason for the
+   * cap stays legible instead of being hidden inside a lowered number.
+   */
+  const sourceability = computeSourceability(candidate.supplier, now, config);
+  const gate = applySourceabilityGate(
+    { recommendation: score.recommendation, confidenceScore: score.confidenceScore },
+    sourceability,
+  );
+
+  const reasons = gate.reason === null ? score.reasons : [...score.reasons, gate.reason];
 
   return {
     ...candidate,
     factors: score.factors,
     overallScore: score.overallScore,
-    confidenceScore: score.confidenceScore,
-    recommendation: score.recommendation,
+    // Confidence reflects sourceability uncertainty too (UNKNOWN/STALE dent it), because a
+    // recommendation resting on an unverified supplier is less trustworthy.
+    confidenceScore: score.overallScore === null ? score.confidenceScore : gate.confidenceScore,
+    // The FINAL, sourceability-gated recommendation.
+    recommendation: gate.recommendation,
     seasonState: score.seasonState,
-    reasons: score.reasons,
+    reasons,
     risks: score.risks,
     evidence: score.evidence,
     freshness: score.freshness,
@@ -240,6 +266,20 @@ export function applyAnalysisToCandidate(
     // operator's own decision (WATCHING, REJECTED, PUSHED_TO_SHOPIFY) must never be
     // overwritten by a recalculation.
   };
+}
+
+/**
+ * The current sourceability verdict for a candidate.
+ *
+ * A thin re-export so callers that only need the verdict (the controller for display, the
+ * push gate) do not each reach into sourceability.ts with the candidate's supplier field.
+ */
+export function sourceabilityOf(
+  candidate: Pick<ProductCandidate, 'supplier'>,
+  now: Date,
+  config: SourceabilityConfig = DEFAULT_SOURCEABILITY_CONFIG,
+): SourceabilityResult {
+  return computeSourceability(candidate.supplier, now, config);
 }
 
 /**

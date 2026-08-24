@@ -20,6 +20,13 @@ import type { PricingResult } from '../pricing/pricing.service';
 import type { CandidateAnalysis } from './candidate.analysis';
 import type { ProductCandidate } from './candidate.types';
 import type {
+  SourceabilityResult,
+  SupplierAvailability,
+  SupplierAvailabilitySource,
+  SupplierProvider,
+  SupplierVariantAvailability,
+} from './sourceability';
+import type {
   ExistingCandidateRef,
   ExistingProductRef,
 } from './duplicate.detection';
@@ -80,6 +87,8 @@ export interface PreparedAnalysis {
   freshCandidate: ProductCandidate;
   analysis: CandidateAnalysis;
   policy: PricingPolicy;
+  /** The supplier sourceability verdict the push gate acts on. */
+  sourceability: SourceabilityResult;
   decisionHash: string;
   /**
    * Prices an arbitrary amount against the same cost model.
@@ -126,6 +135,19 @@ export interface PushIntent {
   confidenceScore: number | null;
   recommendation: string | null;
   analyzedInputRevision: number | null;
+  /**
+   * Why Trademart believed this product was sourceable when the draft was created.
+   *
+   * Frozen with the rest of the intent so crash recovery has a truthful record of the
+   * supplier decision, rather than recomputing sourceability later and pretending that was
+   * the original basis.
+   */
+  supplierProvider: SupplierProvider;
+  supplierProductId: string | null;
+  supplierAvailability: SupplierAvailability;
+  supplierAvailabilitySource: SupplierAvailabilitySource;
+  supplierAvailabilityCheckedAt: string | null;
+  supplierVariantSnapshot: SupplierVariantAvailability[];
   createdAt: string;
 }
 
@@ -194,6 +216,17 @@ export interface PushAuditFacts {
   duplicateOverridden: boolean;
   /** Whether the operator explicitly accepted a price below their own floors. */
   guardBreachOverridden: boolean;
+  /** Whether the operator explicitly accepted partial supplier variant coverage. */
+  partialVariantsOverridden: boolean;
+  // Supplier sourceability, so the audit trail records WHY the product was believed
+  // sourceable when the draft was created (or reconciled).
+  supplierProvider?: SupplierProvider | null;
+  supplierProductId?: string | null;
+  supplierAvailability?: SupplierAvailability | null;
+  supplierAvailabilitySource?: SupplierAvailabilitySource | null;
+  supplierCheckedAt?: string | null;
+  supplierFreshness?: string | null;
+  supplierVariantCoverage?: string | null;
   productState?: ShopifyProductState | null;
   costRecorded?: boolean;
   safetyIncident?: string | null;

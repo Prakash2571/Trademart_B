@@ -181,6 +181,75 @@ const pushIntentSchema = new Schema(
   { _id: false },
 );
 
+/** One supplier-side variant's availability. */
+const supplierVariantSchema = new Schema(
+  {
+    supplierVariantId: { type: String, default: null },
+    sku: { type: String, default: null },
+    title: { type: String, required: true },
+    // A free-form option map (e.g. { Color: 'Black', Size: 'M' }).
+    optionValues: { type: Schema.Types.Mixed, default: () => ({}) },
+    availability: {
+      type: String,
+      enum: ['AVAILABLE', 'UNAVAILABLE', 'UNKNOWN'],
+      default: 'UNKNOWN',
+    },
+    stockKnown: { type: Boolean, default: false },
+    cost: { type: Number, default: null },
+    currencyCode: { type: String, default: null },
+    checkedAt: { type: String, default: null },
+  },
+  { _id: false },
+);
+
+/**
+ * Recorded supplier verification - whether the product can be SOURCED.
+ *
+ * Evidence, never a live fetch: `checkedAt` means a genuine verification happened then, and
+ * the current freshness-aware verdict is derived from it at read time. Nullable and fully
+ * defaulted so candidate rows written before this field existed remain valid; a missing
+ * block reads as availability UNKNOWN, which is distinct from UNAVAILABLE.
+ */
+const supplierInfoSchema = new Schema(
+  {
+    provider: {
+      type: String,
+      enum: ['TRADELLE', 'OTHER', 'UNKNOWN'],
+      default: 'UNKNOWN',
+    },
+    supplierProductId: { type: String, default: null },
+    sourceUrl: { type: String, default: null },
+    availability: {
+      type: String,
+      enum: ['AVAILABLE', 'UNAVAILABLE', 'UNKNOWN'],
+      default: 'UNKNOWN',
+    },
+    availabilitySource: {
+      type: String,
+      // No DIRECT_API: there is no Tradelle API, so nothing may record availability as
+      // having come from one.
+      enum: ['SHOPIFY_BRIDGE', 'MANUAL', 'DIRECT_API'],
+      default: 'MANUAL',
+    },
+    checkedAt: { type: String, default: null },
+    observedAt: { type: String, default: null },
+    note: { type: String, default: null },
+    stockKnown: { type: Boolean, default: false },
+    productAvailable: { type: Boolean, default: null },
+    productCost: { type: Number, default: null },
+    productCurrency: { type: String, default: null },
+    shippingCost: { type: Number, default: null },
+    shippingCurrency: { type: String, default: null },
+    shippingDays: { type: Number, default: null },
+    variants: { type: [supplierVariantSchema], default: [] },
+    evidence: {
+      type: [new Schema({ source: { type: String, required: true }, value: { type: String, required: true } }, { _id: false })],
+      default: [],
+    },
+  },
+  { _id: false },
+);
+
 const productCandidateSchema = new Schema(
   {
     shopDomain: { type: String, required: true, index: true },
@@ -213,6 +282,8 @@ const productCandidateSchema = new Schema(
 
     commercials: { type: commercialsSchema, default: () => ({}) },
     manualResearch: { type: manualResearchSchema, default: () => ({}) },
+    /** Supplier sourceability verification. Null until recorded; see supplierInfoSchema. */
+    supplier: { type: supplierInfoSchema, default: null },
 
     factors: { type: [factorScoreSchema], default: [] },
     // Null until analysed, and null rather than 0 afterwards when nothing could be

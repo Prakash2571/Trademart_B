@@ -51,6 +51,7 @@ function candidate(overrides: Partial<ProductCandidate> = {}): ProductCandidate 
       expectedSellingCurrency: 'GBP',
       costObservedAt: NOW,
     },
+    supplier: null,
     manualResearch: { ...EMPTY_MANUAL_RESEARCH },
     factors: [],
     overallScore: 79,

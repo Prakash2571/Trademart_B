@@ -56,6 +56,7 @@ import type { EvidenceItem } from '../common/dataQuality';
 import { scoreInputsOf, type ScoreInputs } from './candidate.revision';
 import type { FactorScore, ProductCandidate } from './candidate.types';
 import type { CandidateScore } from './scoring/scoring.service';
+import type { SourceabilityResult } from './sourceability';
 
 /**
  * Bumped if the hashed SET changes.
@@ -65,7 +66,11 @@ import type { CandidateScore } from './scoring/scoring.service';
  * nothing had touched. With it, the version is part of the hash input, so the change is
  * deliberate and traceable to a release rather than mysterious.
  */
-export const DECISION_HASH_VERSION = 1;
+// Bumped to 2: supplier sourceability is now part of the decision. A candidate the
+// operator approved as AVAILABLE that becomes UNAVAILABLE (or goes stale) before push must
+// produce a different hash, so RECOMMENDATION_CHANGED fires rather than a product being
+// created on a sourcing assumption the operator never saw.
+export const DECISION_HASH_VERSION = 2;
 
 export interface DecisionHashInput {
   candidate: Pick<ProductCandidate, keyof ScoreInputs>;
@@ -73,6 +78,8 @@ export interface DecisionHashInput {
   pricing: PriceRecommendation;
   /** The policy actually applied, after store settings and any override. */
   policy: PricingPolicy;
+  /** The supplier sourceability verdict at decision time. */
+  sourceability: SourceabilityResult;
 }
 
 /**
@@ -129,7 +136,7 @@ function sortByKey(entries: Record<string, unknown>[]): Record<string, unknown>[
  * to diff two of these is the difference between a five-minute answer and an afternoon.
  */
 export function decisionMaterial(input: DecisionHashInput): Record<string, unknown> {
-  const { score, pricing, policy } = input;
+  const { score, pricing, policy, sourceability } = input;
 
   return {
     v: DECISION_HASH_VERSION,
@@ -198,6 +205,37 @@ export function decisionMaterial(input: DecisionHashInput): Record<string, unkno
           // Sorted: the breach list is a set, and its order is an implementation detail.
           gb: [...scenario.guardBreaches].sort(),
           mv: money(scenario.minimumViablePrice),
+        })),
+      ),
+    },
+
+    // The material supplier decision inputs. This is what makes an availability change (or
+    // a check going stale) invalidate an approved decision. `current` is included because
+    // it is the freshness-aware verdict the push gate acts on, so a check that has aged
+    // into STALE since review changes the hash even though checkedAt did not move.
+    supplier: {
+      pr: sourceability.provider,
+      av: sourceability.availability,
+      as: sourceability.availabilitySource,
+      ca: sourceability.checkedAt,
+      fr: sourceability.freshness,
+      cur: sourceability.current,
+      vc: sourceability.variantCoverage,
+      sk: sourceability.stockKnown,
+      pid: sourceability.supplierProductId,
+      pc: money(sourceability.productCost),
+      pcc: sourceability.productCurrency,
+      sc: money(sourceability.shippingCost),
+      scc: sourceability.shippingCurrency,
+      sd: sourceability.shippingDays,
+      // Each variant reduced to what decides sourcing: identity + availability + cost.
+      vs: sortByKey(
+        sourceability.variants.map((variant) => ({
+          k: variant.supplierVariantId ?? variant.sku ?? variant.title,
+          a: variant.availability,
+          sk: variant.stockKnown,
+          c: money(variant.cost),
+          cc: variant.currencyCode,
         })),
       ),
     },
