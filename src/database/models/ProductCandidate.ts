@@ -226,6 +226,25 @@ const productCandidateSchema = new Schema(
 
     notes: { type: String, default: null },
     analyzedAt: { type: String, default: null },
+
+    /**
+     * Revision of the SCORING INPUTS, bumped only when one of them changes.
+     *
+     * Not a Mongoose timestamp, and deliberately not derived from one. `updatedAt`
+     * cannot answer "is the score stale" because the analysis write bumps it, as does
+     * adding a note or setting a watch date. See candidate.revision.ts.
+     *
+     * Starts at 1 so that 0 is never a valid revision and cannot be confused with an
+     * absent value.
+     */
+    inputRevision: { type: Number, required: true, default: 1 },
+    /**
+     * The revision the stored score was computed from. Null until first analysed.
+     *
+     * A stored score with a null revision predates this mechanism and is treated as
+     * stale, because "we cannot tell" must not read as "it is fine".
+     */
+    analyzedInputRevision: { type: Number, default: null },
   },
   { timestamps: true, collection: 'product_candidates' },
 );

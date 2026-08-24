@@ -39,13 +39,17 @@ import type { OrderDto, ProductDto } from '../shopify/shopify.types';
 import { analyseCandidate, researchRequestFor } from './candidate.analysis';
 import {
   EMPTY_MANUAL_RESEARCH,
-  SUPPORTED_HORIZONS,
   type CandidateSource,
   type CandidateStatus,
   type ManualResearchEntry,
   type ProductCandidate,
   type TargetMarket,
 } from './candidate.types';
+import { changedScoreInputs } from './candidate.revision';
+import {
+  validateCandidateInput as validateCandidateInputRules,
+  type CreateCandidateInput as CreateCandidateInputShape,
+} from './candidate.validation';
 import { gatherSignals } from './providers/provider.types';
 import { describeResearchSupport, researchProvidersFor } from './providers/registry';
 import {
@@ -170,6 +174,12 @@ function toCandidate(row: ProductCandidateDocument): ProductCandidate {
     createdAt: toIso(row.createdAt),
     analyzedAt: orNull(row.analyzedAt),
     updatedAt: toIso(row.updatedAt),
+
+    // Defaults matter for rows written before these fields existed: revision 1 with a
+    // null analyzed revision reads as "analysed, but we cannot prove from what", which
+    // scoreIsStale treats as stale rather than as fine.
+    inputRevision: row.inputRevision ?? 1,
+    analyzedInputRevision: orNull(row.analyzedInputRevision),
   };
 }
 
@@ -181,65 +191,11 @@ function toIso(value: unknown): string {
  * Validation
  * ======================================================================== */
 
-export interface CreateCandidateInput {
-  title: string;
-  source?: CandidateSource;
-  sourceProductId?: string | null;
-  sourceUrl?: string | null;
-  category?: string | null;
-  imageUrl?: string | null;
-  keywords?: string[];
-  market?: Partial<TargetMarket>;
-  commercials?: Partial<ProductCandidate['commercials']>;
-  manualResearch?: Partial<ManualResearchEntry>;
-  notes?: string | null;
-}
-
-/**
- * Validates a candidate, reporting every problem at once.
- *
- * Matches how automation rules and pricing policies are validated: a form should show
- * all of its errors, not the first one and then another after each retry.
- */
-export function validateCandidateInput(input: CreateCandidateInput): string[] {
-  const problems: string[] = [];
-
-  if (typeof input.title !== 'string' || input.title.trim() === '') {
-    problems.push('A title is required - it is how the candidate is identified.');
-  }
-
-  const horizon = input.market?.horizonDays;
-  if (horizon !== undefined && !SUPPORTED_HORIZONS.includes(horizon)) {
-    problems.push(
-      `Horizon must be one of ${SUPPORTED_HORIZONS.join(', ')} days. Other windows are not supported because the trend bands are calibrated for these.`,
-    );
-  }
-
-  const country = input.market?.countryCode;
-  if (country !== undefined && (typeof country !== 'string' || country.trim().length !== 2)) {
-    problems.push(
-      'Target market country must be a two-letter ISO country code. Region isolation depends on it being exact.',
-    );
-  }
-
-  for (const [field, value] of [
-    ['supplierCost', input.commercials?.supplierCost],
-    ['shippingCost', input.commercials?.shippingCost],
-    ['expectedSellingPrice', input.commercials?.expectedSellingPrice],
-  ] as const) {
-    if (value === undefined || value === null) continue;
-    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-      problems.push(`${field} must be a number of at least 0, or omitted when unknown.`);
-    }
-  }
-
-  const months = input.manualResearch?.peakMonths;
-  if (months != null && months.some((month) => month < 1 || month > 12)) {
-    problems.push('Peak months must be between 1 and 12.');
-  }
-
-  return problems;
-}
+// Validation moved to candidate.validation.ts so the rules can be unit tested: this
+// module imports the config singleton, which calls process.exit(1) at import time.
+// Re-exported so every existing caller is unaffected.
+export { validateCandidateInput } from './candidate.validation';
+export type { CreateCandidateInput } from './candidate.validation';
 
 /* ===========================================================================
  * Writes
@@ -247,11 +203,11 @@ export function validateCandidateInput(input: CreateCandidateInput): string[] {
 
 /** Creates a candidate. Never analyses it - that is a separate, explicit action. */
 export async function createCandidate(
-  input: CreateCandidateInput,
+  input: CreateCandidateInputShape,
 ): Promise<ProductCandidate> {
   requireDatabase();
 
-  const problems = validateCandidateInput(input);
+  const problems = validateCandidateInputRules(input);
   if (problems.length > 0) {
     throw new AppError('VALIDATION_ERROR', 'This candidate cannot be saved.', {
       details: { problems },
@@ -335,7 +291,7 @@ export async function updateCandidate(
   requireDatabase();
   const existing = await getCandidate(candidateId);
 
-  const problems = validateCandidateInput({
+  const problems = validateCandidateInputRules({
     title: patch.title ?? existing.title,
     market: { ...existing.market, ...(patch.market ?? {}) },
     commercials: { ...existing.commercials, ...(patch.commercials ?? {}) },
@@ -367,10 +323,41 @@ export async function updateCandidate(
     $set.marketHorizonDays = patch.market.horizonDays;
   }
 
-  await ProductCandidateModel.updateOne(
-    { shopDomain: shopDomain(), candidateId },
-    { $set },
-  );
+  /*
+   * The revision moves only when a SCORING INPUT actually moved.
+   *
+   * Compared by VALUE against what is already stored, not by which keys the patch
+   * mentioned: a form submit normally resends the whole commercials object, and bumping
+   * on mere presence would mark the score stale every time somebody edited a note.
+   *
+   * The comparison runs against a projection of the candidate AFTER the patch, built
+   * from the same $set that is about to be written, so the two cannot disagree.
+   */
+  const after: ProductCandidate = {
+    ...existing,
+    title: patch.title === undefined ? existing.title : patch.title.trim(),
+    category: patch.category === undefined ? existing.category : patch.category,
+    keywords: patch.keywords === undefined ? existing.keywords : patch.keywords,
+    market: { ...existing.market, ...(patch.market ?? {}) },
+    commercials: { ...existing.commercials, ...(patch.commercials ?? {}) },
+    manualResearch: merged,
+  };
+
+  const changed = changedScoreInputs(existing, after);
+  if (changed.length > 0) {
+    // $inc rather than a computed value: two concurrent edits both bump it, so neither
+    // can silently reuse the other's revision and leave a stale score looking current.
+    await ProductCandidateModel.updateOne(
+      { shopDomain: shopDomain(), candidateId },
+      { $set, $inc: { inputRevision: 1 } },
+    );
+    logger.info('Research candidate scoring inputs changed.', { candidateId, changed });
+  } else {
+    await ProductCandidateModel.updateOne(
+      { shopDomain: shopDomain(), candidateId },
+      { $set },
+    );
+  }
 
   return getCandidate(candidateId);
 }
@@ -567,6 +554,16 @@ export async function analyzeCandidate(
         evidence: score.evidence,
         freshness: score.freshness,
         analyzedAt: now.toISOString(),
+        /*
+         * Records WHICH revision of the inputs this score was computed from.
+         *
+         * Read from the candidate loaded at the top of this function, so if an operator
+         * edits an input while the analysis is running, the stored revision is the one
+         * actually scored and the score correctly reports itself stale afterwards.
+         * Writing the current revision here instead would claim the score covers an edit
+         * it never saw.
+         */
+        analyzedInputRevision: candidate.inputRevision,
         // NEW -> ANALYZED. A deliberate operator decision (WATCHING, SELECTED,
         // REJECTED) is never overwritten by re-running an analysis.
         ...(candidate.status === 'NEW' ? { status: 'ANALYZED' } : {}),

@@ -69,6 +69,9 @@ function candidate(overrides: Partial<ProductCandidate> = {}): ProductCandidate 
     createdAt: NOW_ISO,
     analyzedAt: NOW_ISO,
     updatedAt: NOW_ISO,
+    // Analysed from the current inputs, so not stale.
+    inputRevision: 1,
+    analyzedInputRevision: 1,
     ...overrides,
   };
 }

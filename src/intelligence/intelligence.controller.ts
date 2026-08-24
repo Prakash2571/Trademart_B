@@ -19,6 +19,7 @@ import { Router } from 'express';
 import { asyncHandler, sendSuccess } from '../common/http';
 import { parseIntParam, parseStringParam } from '../common/validate';
 import { AppError } from '../common/errors';
+import { scoreIsStale } from './candidate.revision';
 import { getCandidate, listCandidates } from './intelligence.service';
 import { describeResearchSupport } from './providers/registry';
 import { TRADELLE_DOCUMENTATION, TRADELLE_MODES, tradelleResearchMode } from './providers/tradelle.provider';
@@ -131,10 +132,17 @@ intelligenceRouter.get(
   asyncHandler(async (req, res) => {
     const candidate = await getCandidate(req.params.id ?? '');
     sendSuccess(res, candidate, {
-      // Stated rather than left for the UI to work out, because a score computed against
-      // costs that have since changed is the thing most likely to mislead.
-      scoreIsStale:
-        candidate.analyzedAt !== null && candidate.updatedAt > candidate.analyzedAt,
+      /*
+       * Computed from the input REVISION, not from a timestamp comparison.
+       *
+       * The previous `candidate.updatedAt > candidate.analyzedAt` was wrong in both
+       * directions: Mongoose bumps updatedAt during the analysis write itself, so a
+       * freshly analysed candidate reported stale, and watching or adding a note bumped
+       * it without touching any scoring input. See candidate.revision.ts.
+       */
+      scoreIsStale: scoreIsStale(candidate),
+      inputRevision: candidate.inputRevision,
+      analyzedInputRevision: candidate.analyzedInputRevision,
       note:
         candidate.analyzedAt === null
           ? 'This candidate has never been analysed, so it has no score. That is not a low score.'

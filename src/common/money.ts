@@ -358,3 +358,101 @@ export function sumSameCurrency(
     currencyCode,
   };
 }
+
+
+/* ===========================================================================
+ * Explicit currency labelling
+ *
+ * resolveSharedCurrency answers "are these the same currency?". It deliberately does
+ * NOT answer "is every amount labelled at all", because an unlabelled amount cannot
+ * CONTRADICT anything - it reports those through `missingCurrency` and leaves the
+ * decision to the caller.
+ *
+ * That was the right split and the wrong default. For anything that feeds a
+ * commercial decision, an unlabelled amount is not a lesser problem than a mismatched
+ * one, it is a worse one:
+ *
+ *   supplierCost = 10, supplierCurrency = null, sellingCurrency = INR
+ *
+ * A mismatch is loud. This is silent, and the tempting "fix" is to assume the amount
+ * is in the selling currency - which turns 10 USD of cost into 10 INR and reports a
+ * margin of about 99%. Nothing about the number looks wrong afterwards.
+ *
+ * So amounts that participate in a decision must be LABELLED, and that is asserted
+ * here rather than remembered at each call site.
+ * ======================================================================== */
+
+/**
+ * ISO-4217 shape: three ASCII letters.
+ *
+ * Not an exhaustive currency list - Shopify is the authority on which codes a store
+ * actually uses, and enumerating them here would reject a valid one the day it is
+ * added. What this catches is the real failure: an empty string, a stray number, or a
+ * placeholder that would later be compared against a real code and silently differ.
+ *
+ * The single definition. suppliers/manualCost.validate.ts had its own copy of this
+ * regex; two definitions of "looks like a currency" is one more than can be kept
+ * consistent.
+ */
+const CURRENCY_CODE = /^[A-Za-z]{3}$/;
+
+/** True when `value` is an explicit, plausibly-shaped currency code. */
+export function isExplicitCurrencyCode(value: unknown): value is string {
+  return typeof value === 'string' && CURRENCY_CODE.test(value.trim());
+}
+
+/**
+ * Normalises a currency code, or returns null when it is not explicit.
+ *
+ * Use in preference to `value ?? somethingElse`: the whole point is that there is no
+ * acceptable substitute for a missing currency.
+ */
+export function normaliseCurrencyCode(value: unknown): string | null {
+  return isExplicitCurrencyCode(value) ? value.trim().toUpperCase() : null;
+}
+
+/**
+ * Throws CURRENCY_MISMATCH unless every PRESENT amount carries an explicit currency.
+ *
+ * Absent amounts are fine and are skipped. `shippingCost: null` with
+ * `shippingCurrency: null` means UNKNOWN SHIPPING, which is a legitimate state the
+ * pricing engine already handles by excluding it and labelling the margin an upper
+ * bound. What is refused is an amount that exists with no unit attached.
+ *
+ * Reports EVERY unlabelled entry rather than the first, so an operator fixing a form
+ * sees the whole problem in one attempt.
+ */
+export function assertLabelledCurrencies(
+  entries: readonly CurrencyAmount[],
+  operation: string,
+): void {
+  const unlabelled: string[] = [];
+  const malformed: string[] = [];
+
+  for (const [index, entry] of entries.entries()) {
+    if (entry.amount === null || entry.amount === undefined) continue;
+    const label = entry.label ?? `value ${index + 1}`;
+
+    const raw = typeof entry.currencyCode === 'string' ? entry.currencyCode.trim() : '';
+    if (raw.length === 0) {
+      unlabelled.push(label);
+      continue;
+    }
+    if (!isExplicitCurrencyCode(raw)) malformed.push(`${label} ("${raw}")`);
+  }
+
+  if (unlabelled.length === 0 && malformed.length === 0) return;
+
+  const problems = [
+    unlabelled.length === 0
+      ? null
+      : `${unlabelled.join(', ')} ${unlabelled.length === 1 ? 'has' : 'have'} an amount but no currency`,
+    malformed.length === 0 ? null : `${malformed.join(', ')} is not a currency code`,
+  ].filter((part): part is string => part !== null);
+
+  throw new AppError(
+    'CURRENCY_MISMATCH',
+    `Cannot ${operation}: ${problems.join('; ')}. An amount with no currency cannot take part in a commercial decision, and Trademart will not assume it matches another field - a supplier cost silently read as the selling currency would report a margin that is completely wrong and looks completely normal.`,
+    { details: { operation, unlabelled, malformed } },
+  );
+}

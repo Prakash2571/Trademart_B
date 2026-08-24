@@ -33,6 +33,7 @@ import {
   type CreateCandidateInput,
   type UpdateCandidateInput,
 } from './intelligence.service';
+import { scoreIsStale } from './candidate.revision';
 import { pushCandidateAsDraft } from './push.service';
 
 export const intelligenceWriteRouter = Router();
@@ -112,12 +113,23 @@ intelligenceWriteRouter.patch(
       },
     });
 
+    /*
+     * `scoreIsStale` is computed, not assumed.
+     *
+     * This used to be `candidate.analyzedAt !== null` - i.e. "if it was ever analysed,
+     * the edit invalidated it". That was wrong for a note-only or watch-date edit, which
+     * changes no scoring input. The revision comparison answers the real question.
+     */
+    const stale = scoreIsStale(candidate);
     sendSuccess(res, candidate, {
-      scoreIsStale: candidate.analyzedAt !== null,
-      note:
-        candidate.analyzedAt === null
+      scoreIsStale: stale,
+      inputRevision: candidate.inputRevision,
+      analyzedInputRevision: candidate.analyzedInputRevision,
+      note: stale
+        ? 'A scoring input changed, so the stored score no longer reflects this candidate. Re-analyse to update it.'
+        : candidate.analyzedAt === null
           ? null
-          : 'The stored score was computed before this change. Re-analyse to update it.',
+          : 'Nothing that affects the score changed, so the stored score is still current.',
     });
   }),
 );

@@ -8,6 +8,10 @@
  */
 
 import { AppError } from '../common/errors';
+// The shape check for a currency code lives in common/money, next to the arithmetic
+// that depends on it. This module had its own copy of the regex, and two definitions of
+// "looks like a currency" is one more than can be kept consistent.
+import { isExplicitCurrencyCode } from '../common/money';
 import { toShopifyGid } from '../common/validate';
 import type { SupplierClassification } from './supplier.types';
 
@@ -39,8 +43,6 @@ function pick(body: Record<string, unknown>, canonical: string, alias: string): 
 }
 
 const PROVIDERS: readonly SupplierClassification[] = ['TRADELLE', 'OTHER', 'UNKNOWN'];
-/** ISO-4217-ish: three ASCII letters. Not an exhaustive currency list. */
-const CURRENCY = /^[A-Za-z]{3}$/;
 
 function requirePositive(raw: unknown, field: string): number {
   if (typeof raw !== 'number' || !Number.isFinite(raw)) {
@@ -86,7 +88,7 @@ export function validateManualCostInput(body: Record<string, unknown>): ManualCo
   }
 
   const currencyRaw = body['currencyCode'];
-  if (typeof currencyRaw !== 'string' || !CURRENCY.test(currencyRaw)) {
+  if (!isExplicitCurrencyCode(currencyRaw)) {
     throw new AppError(
       'VALIDATION_ERROR',
       'currencyCode must be a 3-letter code, e.g. GBP or INR.',

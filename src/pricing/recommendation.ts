@@ -37,7 +37,9 @@ import { AppError } from '../common/errors';
 import {
   ceilMoney,
   divideMoney,
+  isExplicitCurrencyCode,
   multiplyMoney,
+  normaliseCurrencyCode,
   percentageOf,
   resolveSharedCurrency,
   roundMoney,
@@ -399,8 +401,42 @@ export function recommendPrice(input: PriceRecommendationInput): PriceRecommenda
     );
   }
 
+  // An amount with NO currency BLOCKS, it does not merely get noted.
+  //
+  // This used to fall through, and the consequence was the worst kind of bug: a
+  // supplier cost of 10 with no currency, priced against an INR selling currency,
+  // produced a margin of about 99% and nothing on the screen looked wrong. A
+  // mismatch is loud; an unlabelled amount is silent, so it needs the louder guard.
+  if (shared.missingCurrency.length > 0) {
+    return blocked(
+      `CURRENCY_MISMATCH: ${shared.missingCurrency.join(' and ')} ${shared.missingCurrency.length === 1 ? 'has' : 'have'} an amount recorded but no currency. Trademart will not assume the missing currency matches the selling price - a supplier cost read as the wrong currency reports a margin that is completely wrong and looks completely normal. Record the currency, or clear the amount if it is genuinely unknown.`,
+    );
+  }
+
+  // Malformed codes are refused for the same reason: "12" or "" would later be
+  // compared against a real code and silently differ, or worse, silently agree.
+  const malformed = entries.filter(
+    (entry) =>
+      entry.amount !== null &&
+      entry.amount !== undefined &&
+      !isExplicitCurrencyCode(entry.currencyCode),
+  );
+  if (malformed.length > 0) {
+    return blocked(
+      `CURRENCY_MISMATCH: ${malformed.map((entry) => `${entry.label} ("${String(entry.currencyCode)}")`).join(', ')} is not a 3-letter currency code.`,
+    );
+  }
+
   const costCurrency = shared.currencyCode;
-  const sellingCurrency = input.sellingCurrency?.trim().toUpperCase() ?? null;
+  // normaliseCurrencyCode, not `?.trim().toUpperCase()`: a malformed selling currency
+  // must become null rather than a plausible-looking string that would then be compared
+  // against the cost currency and produce a misleading "mismatch" or a false match.
+  const sellingCurrency = normaliseCurrencyCode(input.sellingCurrency);
+  if (input.sellingCurrency !== null && sellingCurrency === null) {
+    return blocked(
+      `CURRENCY_MISMATCH: the selling currency ("${String(input.sellingCurrency)}") is not a 3-letter currency code.`,
+    );
+  }
   if (costCurrency !== null && sellingCurrency !== null && costCurrency !== sellingCurrency) {
     return blocked(
       `CURRENCY_MISMATCH: costs are in ${costCurrency} but the product would sell in ${sellingCurrency}, and no exchange rate is configured. Record the cost in the selling currency to price this product.`,

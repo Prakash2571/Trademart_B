@@ -332,14 +332,82 @@ describe('currency safety', () => {
     assert.equal(result.currencyCode, 'GBP');
   });
 
-  it('prices without a currency at all rather than refusing', () => {
-    // A missing currency code is a plumbing gap, not a conflict - the arithmetic is
-    // still valid, it just cannot be labelled.
+  /*
+   * This block previously asserted the OPPOSITE: that a present amount with no
+   * currency was "a plumbing gap, not a conflict" and priced happily. That was wrong,
+   * and it was the most dangerous kind of wrong.
+   *
+   *   supplierCost = 10, supplierCurrency = null, sellingCurrency = INR
+   *
+   * The arithmetic is only "still valid" if the 10 really is in INR. If it is USD, the
+   * reported margin is about 99% instead of about -3,500%, and NOTHING on the screen
+   * looks unusual. A mismatch is loud; an unlabelled amount is silent, so it needs the
+   * louder guard, not the quieter one.
+   */
+  it('REFUSES a present amount that carries no currency', () => {
     const result = recommendPrice(
       input({ supplierCurrency: null, shippingCurrency: null, sellingCurrency: null }),
     );
+    assert.ok(result.blockedReason?.startsWith('CURRENCY_MISMATCH'));
+    assert.ok(result.blockedReason?.includes('no currency'));
+    assert.deepEqual(result.scenarios, []);
+  });
+
+  it('refuses a supplier cost with no currency even when the selling currency is known', () => {
+    // The exact scenario the hardening pass exists to make impossible. The selling
+    // currency must never be borrowed to label a supplier cost.
+    const result = recommendPrice(
+      input({ supplierCurrency: null, shippingCost: null, shippingCurrency: null, sellingCurrency: 'INR' }),
+    );
+    assert.ok(result.blockedReason?.startsWith('CURRENCY_MISMATCH'));
+    assert.ok(
+      result.blockedReason?.includes('will not assume'),
+      'the refusal must say it is refusing to assume, not just that something is missing',
+    );
+    assert.deepEqual(result.scenarios, []);
+  });
+
+  it('names EVERY unlabelled amount, not just the first', () => {
+    const result = recommendPrice(
+      input({ supplierCurrency: null, shippingCurrency: null, sellingCurrency: 'GBP' }),
+    );
+    assert.ok(result.blockedReason?.includes('supplier cost'));
+    assert.ok(result.blockedReason?.includes('supplier shipping'));
+  });
+
+  it('refuses a shipping cost with no currency while the supplier cost has one', () => {
+    const result = recommendPrice(
+      input({ shippingCurrency: null, sellingCurrency: 'GBP' }),
+    );
+    assert.ok(result.blockedReason?.startsWith('CURRENCY_MISMATCH'));
+    assert.ok(result.blockedReason?.includes('supplier shipping'));
+  });
+
+  it('still allows UNKNOWN shipping - a null amount needs no currency', () => {
+    // The distinction that makes the guard usable: absent is fine, unlabelled is not.
+    // This is UNKNOWN SHIPPING, not free shipping, and the margin is an upper bound.
+    const result = recommendPrice(
+      input({ shippingCost: null, shippingCurrency: null, sellingCurrency: 'GBP' }),
+    );
     assert.equal(result.blockedReason, null);
-    assert.equal(scenario(result, 'BALANCED').price, 22.99);
+    assert.equal(result.shippingIncluded, false);
+    assert.equal(result.landedCost, 10);
+    assert.ok(result.warnings.some((warning) => warning.includes('upper bound')));
+    assert.ok(result.warnings.some((warning) => warning.includes('EXCLUDED - not zero')));
+  });
+
+  it('refuses a malformed currency code rather than comparing it as a string', () => {
+    // "12" would later be compared against a real code and silently differ.
+    const result = recommendPrice(
+      input({ supplierCurrency: '12', shippingCurrency: '12', sellingCurrency: 'GBP' }),
+    );
+    assert.ok(result.blockedReason?.includes('not a 3-letter currency code'));
+  });
+
+  it('refuses a malformed SELLING currency', () => {
+    const result = recommendPrice(input({ sellingCurrency: 'pounds' }));
+    assert.ok(result.blockedReason?.includes('selling currency'));
+    assert.ok(result.blockedReason?.includes('not a 3-letter currency code'));
   });
 });
 

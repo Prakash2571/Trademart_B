@@ -392,6 +392,22 @@ export interface ProductCandidate {
   createdAt: string;
   analyzedAt: string | null;
   updatedAt: string;
+
+  /**
+   * Bumped whenever a SCORING INPUT changes. See candidate.revision.ts.
+   *
+   * Exists because `updatedAt > analyzedAt` cannot answer "is the score stale": Mongoose
+   * bumps updatedAt during the analysis write itself, and watching or adding a note
+   * bumps it without touching a single input.
+   */
+  inputRevision: number;
+  /**
+   * The revision the stored score was computed from. Null before the first analysis.
+   *
+   * Equal to inputRevision means the score is current. This is a statement about data
+   * rather than about clocks.
+   */
+  analyzedInputRevision: number | null;
 }
 
 /** Statuses from which a candidate may still be pushed to Shopify. */
