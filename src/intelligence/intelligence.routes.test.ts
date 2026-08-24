@@ -78,6 +78,7 @@ describe('research routes are relative to the /api mount', () => {
         'GET /intelligence/candidates',
         'GET /intelligence/candidates/:id',
         'GET /intelligence/candidates/:id/decision',
+        'GET /intelligence/candidates/:id/supplier',
         'GET /intelligence/candidates/:id/duplicates',
         'POST /intelligence/candidates',
         'PATCH /intelligence/candidates/:id',
@@ -85,6 +86,7 @@ describe('research routes are relative to the /api mount', () => {
         'POST /intelligence/candidates/:id/watch',
         'POST /intelligence/candidates/:id/reject',
         'POST /intelligence/candidates/:id/push',
+        'POST /intelligence/candidates/:id/supplier-verification',
       ]),
     );
   });

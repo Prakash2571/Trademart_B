@@ -65,6 +65,10 @@ import {
   type SupplierVariantAvailability,
 } from './sourceability';
 import {
+  validateSupplierVerification,
+  type SupplierVerificationInput,
+} from './supplier.validation';
+import {
   validateCandidateInput as validateCandidateInputRules,
   type CreateCandidateInput as CreateCandidateInputShape,
 } from './candidate.validation';
@@ -117,6 +121,13 @@ function shopDomain(): string {
  */
 function orNull<T>(value: T | null | undefined): T | null {
   return value == null ? null : value;
+}
+
+/** Trims a string, returning null for absent/blank - so a blank input never stores "". */
+function nullableTrim(value: string | null | undefined): string | null {
+  if (value == null) return null;
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
 }
 
 /**
@@ -493,6 +504,100 @@ export async function getCandidate(candidateId: string): Promise<ProductCandidat
 }
 
 /* ===========================================================================
+ * Supplier verification
+ * ======================================================================== */
+
+export interface SupplierVerificationResult {
+  candidate: ProductCandidate;
+  sourceability: SourceabilityResult;
+  /** The supplier block before this write, for the audit trail. */
+  previousSupplier: SupplierInfo | null;
+  /** True when the candidate already had a supplier verification (an update, not a first). */
+  wasUpdate: boolean;
+}
+
+/**
+ * Records an operator's supplier (Tradelle) verification onto a candidate.
+ *
+ * This is the ONLY place `checkedAt` is set to now: it stamps the moment a human actually
+ * verified availability, which is what freshness ages from. Opening a page never sets it.
+ *
+ * `availabilitySource` is forced to MANUAL - this endpoint is a human verification, and a
+ * caller cannot claim SHOPIFY_BRIDGE or a (non-existent) DIRECT_API through it. The URL is
+ * stored as evidence and never fetched.
+ */
+export async function recordSupplierVerification(
+  candidateId: string,
+  input: SupplierVerificationInput,
+): Promise<SupplierVerificationResult> {
+  requireDatabase();
+
+  const existing = await getCandidate(candidateId);
+
+  const problems = validateSupplierVerification(input);
+  if (problems.length > 0) {
+    throw new AppError('VALIDATION_ERROR', 'This supplier verification cannot be saved.', {
+      details: { problems },
+    });
+  }
+
+  const now = new Date();
+  const availability = input.availability ?? 'UNKNOWN';
+
+  const supplier: SupplierInfo = {
+    provider: input.provider ?? 'TRADELLE',
+    supplierProductId: nullableTrim(input.supplierProductId),
+    sourceUrl: nullableTrim(input.sourceUrl),
+    availability,
+    // Forced: this endpoint is a human verification, full stop.
+    availabilitySource: 'MANUAL',
+    checkedAt: now.toISOString(),
+    observedAt: nullableTrim(input.observedAt) ?? now.toISOString(),
+    note: nullableTrim(input.note),
+    stockKnown: input.stockKnown ?? availability !== 'UNKNOWN',
+    productAvailable:
+      availability === 'AVAILABLE' ? true : availability === 'UNAVAILABLE' ? false : null,
+    productCost: input.productCost ?? null,
+    productCurrency: nullableTrim(input.productCurrency),
+    shippingCost: input.shippingCost ?? null,
+    shippingCurrency: nullableTrim(input.shippingCurrency),
+    shippingDays: input.shippingDays ?? null,
+    variants: (input.variants ?? []).map(
+      (variant): SupplierVariantAvailability => ({
+        supplierVariantId: nullableTrim(variant.supplierVariantId),
+        sku: nullableTrim(variant.sku),
+        title: variant.title.trim(),
+        optionValues: variant.optionValues ?? {},
+        availability: variant.availability ?? 'UNKNOWN',
+        stockKnown: variant.stockKnown ?? (variant.availability ?? 'UNKNOWN') !== 'UNKNOWN',
+        cost: variant.cost ?? null,
+        currencyCode: nullableTrim(variant.currencyCode),
+        checkedAt: now.toISOString(),
+      }),
+    ),
+    evidence: [
+      { source: 'MANUAL_VERIFICATION', value: 'Operator verified availability in Tradelle' },
+      ...(nullableTrim(input.sourceUrl) === null
+        ? []
+        : [{ source: 'SUPPLIER_URL', value: nullableTrim(input.sourceUrl) as string }]),
+    ],
+  };
+
+  await ProductCandidateModel.updateOne(
+    { shopDomain: shopDomain(), candidateId },
+    { $set: { supplier } },
+  );
+
+  const candidate = await getCandidate(candidateId);
+  return {
+    candidate,
+    sourceability: computeSourceability(supplier, now, sourceabilityConfig()),
+    previousSupplier: existing.supplier,
+    wasUpdate: existing.supplier !== null,
+  };
+}
+
+/* ===========================================================================
  * Store history
  * ======================================================================== */
 
@@ -676,12 +781,7 @@ export async function prepareCandidateAnalysis(
   // all three describe the same supplier decision.
   const sourceability = computeSourceability(storedCandidate.supplier, now, sourceabilityConfig());
 
-  const freshCandidate = applyAnalysisToCandidate(
-    storedCandidate,
-    analysis,
-    now,
-    sourceabilityConfig(),
-  );
+  const freshCandidate = applyAnalysisToCandidate(storedCandidate, analysis, now);
 
   return {
     storedCandidate,

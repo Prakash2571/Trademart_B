@@ -36,6 +36,7 @@ import {
   type SourceabilityConfig,
   type SourceabilityResult,
 } from './sourceability';
+// applySourceabilityGate + computeSourceability are used by finalRecommendationOf below.
 import type { ResearchSignals } from './providers/provider.types';
 import { scoreCandidate, type CandidateScore, type ScoringOptions } from './scoring/scoring.service';
 import type { ScoringInput } from './scoring/scoring.types';
@@ -227,36 +228,27 @@ export function applyAnalysisToCandidate(
   candidate: ProductCandidate,
   analysis: CandidateAnalysis,
   now: Date,
-  config: SourceabilityConfig = DEFAULT_SOURCEABILITY_CONFIG,
 ): ProductCandidate {
   const { score } = analysis;
 
   /*
-   * The opportunity score is set verbatim; the RECOMMENDATION is then gated by
-   * sourceability. This is the invariant the whole phase adds: a strong market opportunity
-   * with an unverified supplier is WATCH, not STRONG_CANDIDATE, and an UNAVAILABLE supplier
-   * is REJECT regardless of the score. overallScore is never touched - the reason for the
-   * cap stays legible instead of being hidden inside a lowered number.
+   * Stores the OPPORTUNITY recommendation and its raw data confidence, unchanged.
+   *
+   * The sourceability GATE is applied at READ/decision/push time, not baked into the stored
+   * recommendation - see finalRecommendationOf. Keeping the stored value the pure
+   * opportunity verdict means the final recommendation is always computed against the
+   * CURRENT supplier state (which ages between analyses), rather than a snapshot that would
+   * silently go stale, and it keeps overallScore/recommendation meaning exactly what they
+   * meant before this phase.
    */
-  const sourceability = computeSourceability(candidate.supplier, now, config);
-  const gate = applySourceabilityGate(
-    { recommendation: score.recommendation, confidenceScore: score.confidenceScore },
-    sourceability,
-  );
-
-  const reasons = gate.reason === null ? score.reasons : [...score.reasons, gate.reason];
-
   return {
     ...candidate,
     factors: score.factors,
     overallScore: score.overallScore,
-    // Confidence reflects sourceability uncertainty too (UNKNOWN/STALE dent it), because a
-    // recommendation resting on an unverified supplier is less trustworthy.
-    confidenceScore: score.overallScore === null ? score.confidenceScore : gate.confidenceScore,
-    // The FINAL, sourceability-gated recommendation.
-    recommendation: gate.recommendation,
+    confidenceScore: score.confidenceScore,
+    recommendation: score.recommendation,
     seasonState: score.seasonState,
-    reasons,
+    reasons: score.reasons,
     risks: score.risks,
     evidence: score.evidence,
     freshness: score.freshness,
@@ -266,6 +258,29 @@ export function applyAnalysisToCandidate(
     // operator's own decision (WATCHING, REJECTED, PUSHED_TO_SHOPIFY) must never be
     // overwritten by a recalculation.
   };
+}
+
+/**
+ * The FINAL, sourceability-gated recommendation for display and decision.
+ *
+ * Computed from the stored OPPORTUNITY recommendation plus the CURRENT sourceability, so it
+ * always reflects live supplier freshness rather than a snapshot. This is the number the
+ * shortlist, the detail page, the decision endpoint and the push confirmation all show.
+ */
+export function finalRecommendationOf(
+  candidate: Pick<
+    ProductCandidate,
+    'overallScore' | 'confidenceScore' | 'recommendation' | 'supplier'
+  >,
+  now: Date,
+  config: SourceabilityConfig = DEFAULT_SOURCEABILITY_CONFIG,
+): { sourceability: SourceabilityResult; gate: ReturnType<typeof applySourceabilityGate> } {
+  const sourceability = computeSourceability(candidate.supplier, now, config);
+  const gate = applySourceabilityGate(
+    { recommendation: candidate.recommendation, confidenceScore: candidate.confidenceScore ?? 0 },
+    sourceability,
+  );
+  return { sourceability, gate };
 }
 
 /**
