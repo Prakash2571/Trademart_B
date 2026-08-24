@@ -247,7 +247,10 @@ export async function createCandidate(
         category: input.category ?? null,
         imageUrl: input.imageUrl ?? null,
         keywords: input.keywords ?? [],
-        marketCountryCode: (input.market?.countryCode ?? 'GB').trim().toUpperCase(),
+        // No default. validateCandidateInput has already refused a missing/blank country,
+        // so the non-null assertion here is safe - and there is deliberately no `?? 'GB'`
+        // to fall back to, because Trademart must never invent a market.
+        marketCountryCode: input.market!.countryCode!.trim().toUpperCase(),
         marketRegion: input.market?.region ?? null,
         marketHorizonDays: input.market?.horizonDays ?? 30,
         commercials: input.commercials ?? {},

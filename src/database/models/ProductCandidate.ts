@@ -148,6 +148,39 @@ const commercialsSchema = new Schema(
   { _id: false },
 );
 
+/**
+ * The immutable snapshot of the decision that is about to create a Shopify draft.
+ *
+ * Written after every refusal gate passes but BEFORE the Shopify create, so that a crash
+ * in the window between creation and bookkeeping can be recovered from the exact figures
+ * the draft was made with - the listed price, the decision hash, the score and the
+ * supplier cost - instead of nulls. Recovery READS this; it never recomputes a new
+ * decision and pretends that was the one.
+ *
+ * Every field beyond the identifying trio is nullable, and the whole subdocument defaults
+ * to null, so candidate rows written before this field existed remain valid and readable.
+ */
+const pushIntentSchema = new Schema(
+  {
+    operationId: { type: String, required: true },
+    expectedDecisionHash: { type: String, default: null },
+    actualDecisionHash: { type: String, required: true },
+    scenario: { type: String, default: null },
+    listedPrice: { type: Number, required: true },
+    sellingCurrency: { type: String, default: null },
+    supplierCost: { type: Number, default: null },
+    supplierCurrency: { type: String, default: null },
+    shippingCost: { type: Number, default: null },
+    shippingCurrency: { type: String, default: null },
+    overallScore: { type: Number, default: null },
+    confidenceScore: { type: Number, default: null },
+    recommendation: { type: String, default: null },
+    analyzedInputRevision: { type: Number, default: null },
+    createdAt: { type: String, required: true },
+  },
+  { _id: false },
+);
+
 const productCandidateSchema = new Schema(
   {
     shopDomain: { type: String, required: true, index: true },
@@ -254,6 +287,12 @@ const productCandidateSchema = new Schema(
      * explanation matters most would have been the one that lost it.
      */
     pushSafetyReason: { type: String, default: null },
+
+    /**
+     * The frozen decision behind an in-flight or completed push. Null when none is in
+     * flight and none crashed. See pushIntentSchema.
+     */
+    pushIntent: { type: pushIntentSchema, default: null },
 
     watchUntil: { type: String, default: null },
 

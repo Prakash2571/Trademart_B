@@ -87,9 +87,12 @@ export function matchGeography(
   if (signalRegion === marketRegion) return 'REGION_EXACT';
   if (signalRegion === null) return 'COUNTRY_ONLY';
 
-  // A DIFFERENT region of the right country. Treated as country-only evidence: it
-  // is real data about the market, but says nothing specific about the target region.
-  return 'COUNTRY_ONLY';
+  // A DIFFERENT non-null region of the same country is a MISMATCH, not country-wide
+  // evidence. A figure measured in Maharashtra says nothing about demand in Jharkhand;
+  // treating it as national data would let one region's numbers drive another region's
+  // score. Only a genuinely country-level signal (signalRegion === null, handled above)
+  // may stand in for a national question, and does so at reduced confidence.
+  return 'MISMATCH';
 }
 
 /** Confidence a geography match can support, at best. */

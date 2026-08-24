@@ -49,6 +49,14 @@ export interface ShopifyProductState {
 /** A product already carrying a candidate's research identity tag. */
 export interface ExistingResearchProduct {
   shopifyProductId: string;
+  /**
+   * The first variant's id, when Shopify returned one.
+   *
+   * Carried so a reconciliation can restore the supplier cost against the right variant.
+   * Null when the product has no readable variant, in which case the cost cannot be
+   * re-attached and that is reported rather than guessed.
+   */
+  shopifyVariantId: string | null;
   state: ShopifyProductState;
 }
 
@@ -88,6 +96,54 @@ export interface ClaimRequest {
   operationId: string;
   now: Date;
   leaseMs: number;
+}
+
+/**
+ * The exact decision that is about to create a Shopify draft, frozen in the candidate row
+ * BEFORE the first Shopify write.
+ *
+ * Its whole purpose is crash recovery. If the process dies after Shopify creates the
+ * product but before the bookkeeping is written, a later attempt finds the product by its
+ * identity tag and reads THIS snapshot to restore the listed price, the decision hash, the
+ * score and - most importantly - the supplier cost, instead of returning a pile of nulls
+ * and marking the candidate "succeeded" with no record of what it was priced at.
+ *
+ * It is written once, attributable to one operationId, and NOT overwritten during recovery
+ * (recovery reads it; it does not recompute a new decision and pretend that was the one).
+ */
+export interface PushIntent {
+  operationId: string;
+  expectedDecisionHash: string | null;
+  actualDecisionHash: string;
+  scenario: string | null;
+  listedPrice: number;
+  sellingCurrency: string | null;
+  supplierCost: number | null;
+  supplierCurrency: string | null;
+  shippingCost: number | null;
+  shippingCurrency: string | null;
+  overallScore: number | null;
+  confidenceScore: number | null;
+  recommendation: string | null;
+  analyzedInputRevision: number | null;
+  createdAt: string;
+}
+
+/**
+ * Persist the push intent AND renew/assert claim ownership, in one conditional write.
+ *
+ * Doubles as the ownership renewal the critical section needs: the Mongo filter requires
+ * this operation still owns the IN_PROGRESS claim and no product exists yet, so a single
+ * write both proves ownership and freezes the intent. Returns false when ownership has been
+ * lost (an expired lease was taken over by another operation), and the caller must then
+ * create nothing.
+ */
+export interface RecordIntentRequest {
+  candidateId: string;
+  operationId: string;
+  now: Date;
+  leaseMs: number;
+  intent: PushIntent;
 }
 
 export interface CompletionRequest {
@@ -159,7 +215,24 @@ export interface PushPorts {
     claim(request: ClaimRequest): Promise<ProductCandidate | null>;
     /** Releases a claim this operation owns. Never releases another operation's claim. */
     release(request: { candidateId: string; operationId: string }): Promise<void>;
-    markSucceeded(request: CompletionRequest): Promise<void>;
+    /**
+     * Freezes the push intent and renews/asserts ownership in one conditional write.
+     *
+     * Returns false when this operation no longer owns the claim (its lease expired and
+     * another operation took over). A false result MUST stop the caller before any Shopify
+     * creation - this is the gate that closes the lease-expiry duplicate race.
+     */
+    recordIntent(request: RecordIntentRequest): Promise<boolean>;
+    /** Reads the frozen push intent, for recovery. Null when none was recorded. */
+    loadIntent(candidateId: string): Promise<PushIntent | null>;
+    /**
+     * Marks the push succeeded, ONLY if this operation still owns the IN_PROGRESS claim.
+     *
+     * Returns false when ownership has been lost, so a stale operation cannot finalize a
+     * candidate another operation is (or has finished) handling. A false result is an
+     * ownership/integrity failure, not a success.
+     */
+    markSucceeded(request: CompletionRequest): Promise<boolean>;
     markSafetyIncident(request: IncidentRequest): Promise<void>;
     listForDuplicates(): Promise<ExistingCandidateRef[]>;
   };

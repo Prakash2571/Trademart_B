@@ -18,11 +18,17 @@ import {
 } from './candidate.validation';
 
 function input(overrides: Partial<CreateCandidateInput> = {}): CreateCandidateInput {
-  return { title: 'Portable neck fan', ...overrides };
+  // A valid target market is REQUIRED now, so the base fixture carries one; tests that
+  // exercise the country rules override `market` explicitly.
+  return {
+    title: 'Portable neck fan',
+    market: { countryCode: 'GB', region: null, horizonDays: 30 },
+    ...overrides,
+  };
 }
 
 describe('the basics', () => {
-  it('accepts a title alone - every other field is optional', () => {
+  it('accepts a title and a target market - everything else is optional', () => {
     assert.deepEqual(validateCandidateInput(input()), []);
   });
 
@@ -42,20 +48,59 @@ describe('the basics', () => {
   });
 
   it('restricts the horizon to the windows the trend bands are calibrated for', () => {
-    assert.deepEqual(validateCandidateInput(input({ market: { horizonDays: 30 } })), []);
+    assert.deepEqual(
+      validateCandidateInput(input({ market: { countryCode: 'GB', horizonDays: 30 } })),
+      [],
+    );
     assert.ok(
-      validateCandidateInput(input({ market: { horizonDays: 45 } })).some((problem) =>
-        problem.includes('Horizon must be one of'),
+      validateCandidateInput(input({ market: { countryCode: 'GB', horizonDays: 45 } })).some(
+        (problem) => problem.includes('Horizon must be one of'),
       ),
     );
   });
+});
 
-  it('requires a two-letter target country, because region isolation depends on it', () => {
+/* ===========================================================================
+ * Target market country is REQUIRED - Trademart never invents a market
+ * ======================================================================== */
+
+describe('the target market country is required, not defaulted', () => {
+  it('rejects a candidate with no market at all', () => {
+    const problems = validateCandidateInput({ title: 'Portable neck fan' });
+    assert.ok(
+      problems.some((problem) => problem.includes('target market country is required')),
+      'a missing market must be refused, not silently defaulted to a country',
+    );
+  });
+
+  it('rejects an empty market object', () => {
+    const problems = validateCandidateInput(input({ market: {} }));
+    assert.ok(problems.some((problem) => problem.includes('target market country is required')));
+  });
+
+  it('rejects a blank country string', () => {
+    for (const blank of ['', '   ']) {
+      const problems = validateCandidateInput(input({ market: { countryCode: blank } }));
+      assert.ok(
+        problems.some((problem) => problem.includes('target market country is required')),
+        `"${blank}" must be refused`,
+      );
+    }
+  });
+
+  it('rejects a country that is not two letters', () => {
     assert.ok(
       validateCandidateInput(input({ market: { countryCode: 'GBR' } })).some((problem) =>
         problem.includes('two-letter'),
       ),
     );
+  });
+
+  it('accepts a valid two-letter code, in any case - the service upper-cases it', () => {
+    // Validation accepts 'in'; the service stores it as 'IN'. There is no GB fallback in
+    // either place.
+    assert.deepEqual(validateCandidateInput(input({ market: { countryCode: 'in' } })), []);
+    assert.deepEqual(validateCandidateInput(input({ market: { countryCode: 'IN' } })), []);
   });
 });
 

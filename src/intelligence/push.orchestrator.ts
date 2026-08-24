@@ -54,6 +54,7 @@ import {
 import type { PreparedAnalysis } from './push.ports';
 import type {
   PushAuditFacts,
+  PushIntent,
   PushPorts,
   ShopifyProductState,
 } from './push.ports';
@@ -361,6 +362,50 @@ async function pushWithClaim(
 
   warnings.push(...prepared.analysis.warnings);
 
+  // ---- 8b. freeze the intent AND renew/assert ownership -------------------
+  //
+  // Written after every refusal gate passes but BEFORE the first Shopify write. Two jobs
+  // in one atomic conditional write:
+  //
+  //   1. It freezes the exact decision - price, hash, score, supplier cost - so that a
+  //      crash between the create below and the bookkeeping at step 11 can be recovered
+  //      from real figures rather than nulls (see reconcileExisting).
+  //   2. It RENEWS the lease and ASSERTS ownership. If this operation's lease expired and
+  //      another operation took the claim over, the conditional write matches nothing and
+  //      returns false. This is the gate that closes the lease-expiry race: operation A,
+  //      resuming after B took over, cannot create a product because it no longer owns the
+  //      claim.
+  const intent = buildPushIntent(input, candidate, listedPrice, prepared, now);
+  const stillOwned = await ports.candidates.recordIntent({
+    candidateId,
+    operationId: input.operationId,
+    now,
+    leaseMs: PUSH_CLAIM_LEASE_MS,
+    intent,
+  });
+  if (!stillOwned) {
+    // ZERO Shopify writes. Another operation owns the claim now; it will create (or has
+    // created) the product, and this one must not race it.
+    throw new AppError(
+      'PUSH_CLAIM_LOST',
+      'Another push or recovery operation took ownership of this candidate before this one could create the draft, so nothing was created here. Refresh the candidate to see its current state before retrying.',
+      { details: { candidateId, operationId: input.operationId } },
+    );
+  }
+
+  // ---- 8c. FINAL identity reconciliation ----------------------------------
+  //
+  // One last exact lookup, immediately before the create. Between the step-4 lookup and
+  // here we ran a fresh analysis and several gates; a concurrent operation (or a previous
+  // attempt) could have created the product in that window. Ownership alone does not rule
+  // this out - an operation can hold the claim yet a product from an earlier lease can
+  // exist - so we look again and reconcile rather than create a second one.
+  const raceWinner = await ports.shopify.findByResearchTag(candidateId);
+  if (raceWinner !== null) {
+    recordProductId(raceWinner.shopifyProductId);
+    return reconcileExisting(ports, claimed, input, raceWinner, now, warnings);
+  }
+
   // ---- 9. create ----------------------------------------------------------
   const request = buildDraftRequest(candidate, listedPrice.amount);
   // Belt and braces over buildDraftRequest, which hard-codes both fields. A property this
@@ -392,12 +437,25 @@ async function pushWithClaim(
   await ports.analysis.persist(prepared);
 
   if (safety.incident === null) {
-    await ports.candidates.markSucceeded({
+    const owned = await ports.candidates.markSucceeded({
       candidateId,
       operationId: input.operationId,
       shopifyProductId: product.shopifyProductId,
       now,
     });
+    if (!owned) {
+      /*
+       * Ownership was lost between the create and here. The product EXISTS, so it is not
+       * released or hidden - the operation that took the claim over will find it by its
+       * identity tag and reconcile it. This one fails loudly with the product id preserved
+       * (the outer catch attaches it), never reporting a success it did not own.
+       */
+      throw new AppError(
+        'PUSH_CLAIM_LOST',
+        'This push created a Shopify product but another operation had taken ownership of the candidate by the time it finished, so it could not record completion. The product exists and will be reconciled by the operation that now owns the candidate.',
+        { details: { candidateId, operationId: input.operationId, shopifyProductId: product.shopifyProductId } },
+      );
+    }
   } else {
     await ports.candidates.markSafetyIncident({
       candidateId,
@@ -478,11 +536,17 @@ async function reconcileExisting(
   ports: PushPorts,
   claimed: ProductCandidate,
   input: PushAsDraftInput,
-  found: { shopifyProductId: string; state: ShopifyProductState },
+  found: { shopifyProductId: string; shopifyVariantId: string | null; state: ShopifyProductState },
   now: Date,
   warnings: string[],
 ): Promise<PushAsDraftResult> {
   const candidateId = claimed.id;
+
+  // The decision the ORIGINAL push froze before it created this product. This is what
+  // makes recovery complete rather than a shrug: the listed price, the decision hash, the
+  // score and the supplier cost all come from here, not from a fresh recomputation that
+  // would misrepresent what the draft was actually made with.
+  const intent = await ports.candidates.loadIntent(candidateId);
 
   warnings.push(
     `A Shopify product for this candidate already existed (${found.shopifyProductId}), so nothing new was created. It was almost certainly made by an earlier attempt that did not finish recording itself.`,
@@ -490,13 +554,41 @@ async function reconcileExisting(
 
   const safety = await enforceHidden(ports, found.shopifyProductId, found.state, warnings);
 
+  // Restore the supplier cost from the original intent. upsertManualCost is idempotent, so
+  // re-recording a cost the crashed attempt already saved is harmless; the point is to
+  // cover the case where it crashed BEFORE saving it.
+  let costRecorded = false;
+  if (intent === null) {
+    // Conservative reconcile: the product exists but its original commercial intent is
+    // gone. Nothing is invented - the price, hash and cost are reported as unknown.
+    warnings.push(
+      'The original push intent for this product could not be found, so its listed price, decision hash and supplier cost cannot be reconstructed. The product has been reconciled and hidden, but these historical values are recorded as unknown rather than guessed. Check the draft in Shopify and re-enter its supplier cost if needed.',
+    );
+  } else {
+    costRecorded = await recordCostFromIntent(
+      ports,
+      candidateId,
+      intent,
+      found.shopifyProductId,
+      found.shopifyVariantId,
+      warnings,
+    );
+  }
+
   if (safety.incident === null) {
-    await ports.candidates.markSucceeded({
+    const owned = await ports.candidates.markSucceeded({
       candidateId,
       operationId: input.operationId,
       shopifyProductId: found.shopifyProductId,
       now,
     });
+    if (!owned) {
+      throw new AppError(
+        'PUSH_CLAIM_LOST',
+        'Reconciled an existing Shopify product but another operation had taken ownership of the candidate by the time this one finished, so it could not record completion. The product exists and the owning operation will reconcile it.',
+        { details: { candidateId, operationId: input.operationId, shopifyProductId: found.shopifyProductId } },
+      );
+    }
   } else {
     await ports.candidates.markSafetyIncident({
       candidateId,
@@ -510,12 +602,24 @@ async function reconcileExisting(
   await ports.audit({
     candidateId,
     operationId: input.operationId,
-    expectedDecisionHash: input.expectedDecisionHash ?? null,
-    actualDecisionHash: null,
+    // From the ORIGINAL intent, so the audit trail records the decision that actually
+    // created the product rather than a row of nulls.
+    expectedDecisionHash: input.expectedDecisionHash ?? intent?.expectedDecisionHash ?? null,
+    actualDecisionHash: intent?.actualDecisionHash ?? null,
     shopifyProductId: found.shopifyProductId,
     outcome: 'RECONCILED',
+    overallScore: intent?.overallScore ?? null,
+    confidenceScore: intent?.confidenceScore ?? null,
+    recommendation: intent?.recommendation ?? null,
+    listedPrice: intent?.listedPrice ?? null,
+    priceSource: intent === null ? null : 'Recovered from the original push intent',
+    currencyCode: intent?.sellingCurrency ?? null,
+    supplierCost: intent?.supplierCost ?? null,
+    supplierCurrency: intent?.supplierCurrency ?? null,
+    shippingCost: intent?.shippingCost ?? null,
+    shippingCurrency: intent?.shippingCurrency ?? null,
     productState: safety.state,
-    costRecorded: false,
+    costRecorded,
     safetyIncident: safety.incident,
     ...auditDefaults(input),
   });
@@ -536,11 +640,107 @@ async function reconcileExisting(
     shopifyProductId: found.shopifyProductId,
     productState: safety.state,
     duplicates: { matches: [], blocking: [], summary: null },
-    listedPrice: null,
-    costRecorded: false,
+    // The recovered price, so the UI shows what the draft was actually listed at rather
+    // than null. Null only when the intent genuinely could not be found.
+    listedPrice:
+      intent === null
+        ? null
+        : {
+            amount: intent.listedPrice,
+            currencyCode: intent.sellingCurrency,
+            source: 'Recovered from the original push intent',
+          },
+    costRecorded,
     safetyIncident: null,
     warnings: dedupe(warnings),
   };
+}
+
+/**
+ * Builds the immutable push-intent snapshot from the validated decision.
+ *
+ * Everything here has already passed its gate: currency labelling, the decision-hash
+ * match, the duplicate and guard checks. Freezing it now means recovery reads a decision
+ * that was real, not a reconstruction.
+ */
+function buildPushIntent(
+  input: PushAsDraftInput,
+  candidate: ProductCandidate,
+  listedPrice: ResolvedListingPrice,
+  prepared: PreparedAnalysis,
+  now: Date,
+): PushIntent {
+  return {
+    operationId: input.operationId,
+    expectedDecisionHash: input.expectedDecisionHash ?? null,
+    actualDecisionHash: prepared.decisionHash,
+    scenario: input.scenario ?? null,
+    listedPrice: listedPrice.amount,
+    sellingCurrency: listedPrice.currencyCode,
+    supplierCost: candidate.commercials.supplierCost,
+    supplierCurrency: candidate.commercials.supplierCurrency,
+    shippingCost: candidate.commercials.shippingCost,
+    shippingCurrency: candidate.commercials.shippingCurrency,
+    overallScore: candidate.overallScore,
+    confidenceScore: candidate.confidenceScore,
+    recommendation: candidate.recommendation,
+    analyzedInputRevision: candidate.analyzedInputRevision,
+    createdAt: now.toISOString(),
+  };
+}
+
+/**
+ * Restores the supplier cost recorded in a push intent, against a reconciled product.
+ *
+ * No currency fallback and no invention: an intent whose supplier cost has no currency, or
+ * a product with no readable variant, is reported rather than guessed. upsertManualCost is
+ * idempotent, so this is safe to run whether or not the crashed attempt got as far as
+ * saving the cost.
+ */
+async function recordCostFromIntent(
+  ports: PushPorts,
+  candidateId: string,
+  intent: PushIntent,
+  shopifyProductId: string,
+  shopifyVariantId: string | null,
+  warnings: string[],
+): Promise<boolean> {
+  if (intent.supplierCost === null) {
+    warnings.push(
+      'The original push recorded no supplier cost, so the reconciled draft has none either. Its margin will show as unknown until you enter one.',
+    );
+    return false;
+  }
+  if (intent.supplierCurrency === null) {
+    warnings.push(
+      'The original supplier cost had no currency recorded, so it was NOT restored. An unlabelled amount cannot be used in a margin calculation.',
+    );
+    return false;
+  }
+  if (shopifyVariantId === null) {
+    warnings.push(
+      'The reconciled product exposes no variant id, so the original supplier cost could not be attached. Enter it against the variant in Trademart.',
+    );
+    return false;
+  }
+
+  try {
+    await ports.costs.record({
+      shopifyProductId,
+      shopifyVariantId,
+      supplierProductCost: intent.supplierCost,
+      supplierShippingCost: intent.shippingCost,
+      currencyCode: intent.supplierCurrency,
+      provider: 'OTHER',
+      note: `Restored from the original push intent for research candidate ${candidateId} during reconciliation.`,
+    });
+    return true;
+  } catch {
+    warnings.push(
+      'The product was reconciled but its original supplier cost could not be saved. Enter it in Trademart, or the margin will show as unknown.',
+    );
+    return false;
+  }
 }
 
 /* ===========================================================================

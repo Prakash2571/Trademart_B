@@ -49,7 +49,9 @@ function emptyInput(overrides: Partial<ScoringInput> = {}): ScoringInput {
 
 const HERE = { countryCode: 'GB', region: null };
 
-function meta(geography = HERE) {
+function meta(
+  geography: { countryCode: string | null; region: string | null } = HERE,
+) {
   return { source: 'Test source', geography, observedAt: OBSERVED, fetchedAt: OBSERVED };
 }
 
@@ -78,10 +80,25 @@ describe('matchGeography classifies signal coverage', () => {
     );
   });
 
-  it('treats a DIFFERENT region of the right country as country-only, not exact', () => {
+  it('treats a DIFFERENT non-null region of the right country as a MISMATCH', () => {
+    // Kerala data is not evidence about Jharkhand. It must be discarded, not down-weighted
+    // to country-only - one region's demand says nothing about another's, and treating it
+    // as national data would let Kerala's numbers drive Jharkhand's score.
     assert.equal(
       matchGeography(
         { countryCode: 'IN', region: 'Kerala' },
+        { countryCode: 'IN', region: 'Jharkhand', horizonDays: 30 },
+      ),
+      'MISMATCH',
+    );
+  });
+
+  it('still treats country-level data (no region) as country-only for a regional target', () => {
+    // The valid national-evidence case survives: a signal with NO region may stand in for
+    // a regional question at reduced confidence.
+    assert.equal(
+      matchGeography(
+        { countryCode: 'IN', region: null },
         { countryCode: 'IN', region: 'Jharkhand', horizonDays: 30 },
       ),
       'COUNTRY_ONLY',
@@ -164,6 +181,25 @@ describe('scoreDemand', () => {
     assert.ok(score.risks.some((risk) => risk.includes('Jharkhand')));
   });
 
+  it('DISCARDS demand from a DIFFERENT region of the same country', () => {
+    // Target IN/Jharkhand, figure IN/Maharashtra. Maharashtra searches are not evidence
+    // about Jharkhand and must be discarded, not treated as national data.
+    const score = scoreDemand(
+      emptyInput({
+        market: { countryCode: 'IN', region: 'Jharkhand', horizonDays: 30 },
+        demand: {
+          ...meta({ countryCode: 'IN', region: 'Maharashtra' }),
+          averageMonthlySearches: 500_000,
+        },
+      }),
+    );
+    assert.equal(score.value, null);
+    assert.equal(score.evidence.length, 0);
+    assert.equal(score.confidence, 'UNKNOWN');
+    // The message names the region so the operator understands why it was dropped.
+    assert.ok(score.risks.some((risk) => /Maharashtra|region/i.test(risk)));
+  });
+
   it('does not score when the source replies with no volume', () => {
     const score = scoreDemand(
       emptyInput({ demand: { ...meta(), averageMonthlySearches: null } }),
@@ -227,6 +263,28 @@ describe('scoreTrend', () => {
     );
     assert.equal(slowing.value, plain.value);
     assert.ok(slowing.risks.some((risk) => risk.includes('slowing')));
+  });
+
+  it('DISCARDS a trend from a DIFFERENT region of the same country', () => {
+    // Target IN/Jharkhand, +120% momentum measured in IN/Maharashtra. Discarded, and the
+    // score is identical to having recorded no trend at all - the mismatched figure has
+    // NO influence rather than a downgraded one.
+    const noTrend = scoreTrend(
+      emptyInput({ market: { countryCode: 'IN', region: 'Jharkhand', horizonDays: 30 } }),
+    );
+    const wrongRegion = scoreTrend(
+      emptyInput({
+        market: { countryCode: 'IN', region: 'Jharkhand', horizonDays: 30 },
+        trend: {
+          ...meta({ countryCode: 'IN', region: 'Maharashtra' }),
+          momentumPercentage: 120,
+          accelerationPercentage: null,
+        },
+      }),
+    );
+    assert.equal(wrongRegion.value, null);
+    assert.equal(wrongRegion.value, noTrend.value); // no influence, not down-weighted
+    assert.equal(wrongRegion.evidence.length, 0);
   });
 });
 

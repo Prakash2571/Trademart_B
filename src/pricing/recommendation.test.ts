@@ -324,6 +324,26 @@ describe('currency safety', () => {
     assert.ok(result.blockedReason?.includes('sell in GBP'));
   });
 
+  it('blocks a USD supplier cost against an INR selling price, inventing no margin', () => {
+    // Part 5's exact case: supplier in USD, product sold in INR, no FX configured. The
+    // candidate can be stored truthfully, but pricing must NOT fabricate a margin from
+    // two currencies it cannot add.
+    const result = recommendPrice(
+      input({
+        supplierCost: 8,
+        supplierCurrency: 'USD',
+        shippingCost: 3,
+        shippingCurrency: 'USD',
+        sellingCurrency: 'INR',
+      }),
+    );
+    assert.ok(result.blockedReason?.startsWith('CURRENCY_MISMATCH'));
+    assert.ok(result.blockedReason?.includes('no exchange rate is configured'));
+    // No fake profit/margin: nothing to choose from and no recommendation.
+    assert.deepEqual(result.scenarios, []);
+    assert.equal(result.recommended, null);
+  });
+
   it('accepts matching currencies case-insensitively', () => {
     const result = recommendPrice(
       input({ supplierCurrency: 'gbp', shippingCurrency: 'GBP', sellingCurrency: ' gbp ' }),

@@ -135,14 +135,29 @@ export function assessGeography(
         risk: `This figure is global, not specific to ${market.countryCode}. It shows general interest only.`,
         coverageNote: 'measured globally',
       };
-    default:
+    default: {
+      // MISMATCH covers two distinct cases, and the operator needs to know which:
+      // a different COUNTRY, or a different REGION of the same country. Both are
+      // discarded, but the explanation differs.
+      const signalCountry = geography.countryCode?.trim().toUpperCase() ?? null;
+      const marketCountry = market.countryCode.trim().toUpperCase();
+      const sameCountryDifferentRegion =
+        signalCountry !== null && signalCountry === marketCountry;
+
+      const risk = sameCountryDifferentRegion
+        ? `The available figure describes ${geography.region ?? 'a different region'}, not ${market.region ?? 'the requested region'} (both in ${marketCountry}). It has been discarded rather than used: one region's demand is not evidence about another, so a figure for ${geography.region ?? 'another region'} would only mislead the score for ${market.region ?? 'this region'}.`
+        : `The available figure describes ${geography.countryCode ?? 'another market'}, not ${market.countryCode}. It has been discarded rather than used, because data about a different country is not weak evidence - it is no evidence.`;
+
       return {
         usable: false,
         match,
         confidence: 'UNKNOWN',
-        risk: `The available figure describes ${geography.countryCode ?? 'another market'}, not ${market.countryCode}. It has been discarded rather than used, because data about a different country is not weak evidence - it is no evidence.`,
-        coverageNote: 'not applicable to this market',
+        risk,
+        coverageNote: sameCountryDifferentRegion
+          ? `measured for ${geography.region ?? 'a different region'}, not ${market.region ?? 'the requested region'}`
+          : 'not applicable to this market',
       };
+    }
   }
 }
 

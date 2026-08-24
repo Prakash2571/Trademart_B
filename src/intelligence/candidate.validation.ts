@@ -68,8 +68,20 @@ export function validateCandidateInput(input: CreateCandidateInput): string[] {
     );
   }
 
+  /*
+   * The target market country is REQUIRED, not defaulted.
+   *
+   * There used to be a `?? 'GB'` fallback deeper in the service, which meant a candidate
+   * created with no country was silently judged as a UK product - and every region-
+   * isolation guarantee below rests on the country being the operator's, not an assumption.
+   * A missing or blank country is refused here so the assumption can never be made.
+   */
   const country = input.market?.countryCode;
-  if (country !== undefined && (typeof country !== 'string' || country.trim().length !== 2)) {
+  if (country === undefined || country === null || (typeof country === 'string' && country.trim() === '')) {
+    problems.push(
+      'A target market country is required. Trademart does not assume a default market - region isolation and every geographic signal depend on it being the country you actually mean.',
+    );
+  } else if (typeof country !== 'string' || country.trim().length !== 2) {
     problems.push(
       'Target market country must be a two-letter ISO country code. Region isolation depends on it being exact.',
     );

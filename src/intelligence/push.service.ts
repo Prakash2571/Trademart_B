@@ -45,7 +45,9 @@ import type {
   ExistingResearchProduct,
   IncidentRequest,
   PushAuditFacts,
+  PushIntent,
   PushPorts,
+  RecordIntentRequest,
   ShopifyProductState,
 } from './push.ports';
 import {
@@ -153,20 +155,85 @@ async function releaseClaim(request: {
   }
 }
 
-async function markSucceeded(request: CompletionRequest): Promise<void> {
-  await ProductCandidateModel.updateOne(
-    { shopDomain: shopDomain(), candidateId: request.candidateId },
+/**
+ * Freezes the push intent and renews the claim, in ONE ownership-conditional write.
+ *
+ * The filter is the ownership assertion: this operation must still hold the IN_PROGRESS
+ * claim and no product may exist yet. If an expired lease was taken over by another
+ * operation between the claim and here, the filter matches nothing and this returns false
+ * - which is exactly the gate that stops operation A from creating a product after
+ * operation B has taken the claim over.
+ *
+ * `matchedCount`, not `modifiedCount`: writing an identical pushClaimedAt is theoretically
+ * possible within the same millisecond, and ownership must be judged by whether the row
+ * matched, not by whether a byte changed.
+ */
+async function recordIntent(request: RecordIntentRequest): Promise<boolean> {
+  const result = await ProductCandidateModel.updateOne(
+    {
+      shopDomain: shopDomain(),
+      candidateId: request.candidateId,
+      pushState: 'IN_PROGRESS',
+      pushOperationId: request.operationId,
+      pushedShopifyProductId: null,
+    },
+    {
+      $set: {
+        pushClaimedAt: request.now.toISOString(),
+        pushIntent: request.intent,
+      },
+    },
+  );
+
+  return result.matchedCount > 0;
+}
+
+/** Reads the frozen push intent for recovery. Null when none was recorded. */
+async function loadIntent(candidateId: string): Promise<PushIntent | null> {
+  const row = await ProductCandidateModel.findOne(
+    { shopDomain: shopDomain(), candidateId },
+    { pushIntent: 1 },
+  ).lean();
+  const intent = (row as { pushIntent?: unknown } | null)?.pushIntent;
+  return intent === undefined || intent === null ? null : (intent as PushIntent);
+}
+
+/**
+ * Marks the push succeeded, ONLY if this operation still owns the claim.
+ *
+ * Ownership is in the FILTER, so a stale operation whose lease was taken over cannot
+ * finalize the candidate - the update matches nothing and returns false. The orchestration
+ * treats false as an integrity failure and preserves the product id rather than reporting
+ * a success it did not own.
+ */
+async function markSucceeded(request: CompletionRequest): Promise<boolean> {
+  const result = await ProductCandidateModel.updateOne(
+    {
+      shopDomain: shopDomain(),
+      candidateId: request.candidateId,
+      pushState: 'IN_PROGRESS',
+      pushOperationId: request.operationId,
+    },
     {
       $set: {
         status: 'PUSHED_TO_SHOPIFY',
         pushState: 'SUCCEEDED',
-        pushOperationId: request.operationId,
         pushClaimedAt: null,
         pushedShopifyProductId: request.shopifyProductId,
         pushedAt: request.now.toISOString(),
       },
     },
   );
+
+  if (result.matchedCount === 0) {
+    logger.warn('Research push completion found the claim no longer owned.', {
+      candidateId: request.candidateId,
+      operationId: request.operationId,
+      shopifyProductId: request.shopifyProductId,
+    });
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -251,6 +318,9 @@ async function findByResearchTag(candidateId: string): Promise<ExistingResearchP
   const visibility = await getProductVisibility(first.shopifyProductId);
   return {
     shopifyProductId: first.shopifyProductId,
+    // The first variant, so a reconciliation can restore the supplier cost against it.
+    // Null when Shopify returned no variant - reported rather than guessed downstream.
+    shopifyVariantId: first.variants[0]?.shopifyVariantId ?? null,
     state: {
       status: first.status,
       published: visibility.publishedAnywhere,
@@ -328,6 +398,8 @@ function realPorts(): PushPorts {
       load: getCandidate,
       claim: claimPush,
       release: releaseClaim,
+      recordIntent,
+      loadIntent,
       markSucceeded,
       markSafetyIncident,
       listForDuplicates: async () =>

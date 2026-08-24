@@ -43,7 +43,9 @@ import type {
   IncidentRequest,
   PreparedAnalysis,
   PushAuditFacts,
+  PushIntent,
   PushPorts,
+  RecordIntentRequest,
   ShopifyProductState,
 } from './push.ports';
 
@@ -182,6 +184,12 @@ interface FakeConfig {
   prepared?: PreparedAnalysis;
   /** A product already in Shopify carrying the identity tag (the reconcile case). */
   existingResearchProduct?: ExistingResearchProduct | null;
+  /**
+   * A push intent already frozen by a crashed earlier attempt, returned by loadIntent.
+   * Recovery reads this to restore price/cost/hash. Left undefined for the "intent lost"
+   * conservative-reconcile case.
+   */
+  pushIntent?: PushIntent | null;
   /** State createProduct reports back. Default hidden. */
   createdState?: ShopifyProductState;
   /** State forceHidden reports back. Default hidden (a successful repair). */
@@ -192,6 +200,17 @@ interface FakeConfig {
   otherCandidates?: ProductCandidate[];
   /** Injected failures, keyed by the port method that should throw once. */
   failOnce?: Partial<Record<string, () => never>>;
+  /**
+   * Side effects run (once) at the entry of a named port method, to simulate a CONCURRENT
+   * operation interfering mid-push - e.g. taking the claim over while this push analyses.
+   */
+  interfereOnce?: Partial<Record<string, () => void>>;
+  /**
+   * Sequential return values for findByResearchTag, one per call. Used to model a product
+   * appearing between the early (step-4) lookup and the final (step-8c) lookup. When
+   * absent, findByResearchTag returns `existingResearchProduct` on every call.
+   */
+  findByResearchTagSequence?: (ExistingResearchProduct | null)[];
   now?: Date;
 }
 
@@ -205,12 +224,16 @@ function makePorts(config: FakeConfig): {
   audits: PushAuditFacts[];
   costs: CostRequest[];
   createRequests: ProductCreateRequest[];
+  intents: PushIntent[];
   world: FakeConfig;
 } {
   const calls: string[] = [];
   const audits: PushAuditFacts[] = [];
   const costs: CostRequest[] = [];
   const createRequests: ProductCreateRequest[] = [];
+  const intents: PushIntent[] = [];
+  // The intent frozen this run; falls back to a preset (a crashed attempt's intent).
+  let storedIntent: PushIntent | null = config.pushIntent ?? null;
   let createdCounter = 0;
   const now = config.now ?? NOW;
 
@@ -222,6 +245,17 @@ function makePorts(config: FakeConfig): {
       thrower();
     }
   }
+
+  const interfered = new Set<string>();
+  function maybeInterfere(method: string): void {
+    const effect = config.interfereOnce?.[method];
+    if (effect !== undefined && !interfered.has(method)) {
+      interfered.add(method);
+      effect();
+    }
+  }
+
+  let findTagCall = 0;
 
   const ports: PushPorts = {
     now: () => now,
@@ -275,9 +309,43 @@ function makePorts(config: FakeConfig): {
         }
       },
 
-      async markSucceeded(request: CompletionRequest) {
+      /*
+       * The intent freeze + ownership renewal, atomic. Mirrors the Mongo CAS: it succeeds
+       * only if this operation still owns the IN_PROGRESS claim and no product exists yet.
+       */
+      recordIntent(request: RecordIntentRequest) {
+        calls.push('recordIntent');
+        maybeFail('recordIntent');
+        const row = config.row;
+        const owned =
+          row.pushState === 'IN_PROGRESS' &&
+          row.pushOperationId === request.operationId &&
+          row.pushedShopifyProductId === null;
+        if (!owned) return Promise.resolve(false);
+        storedIntent = request.intent;
+        intents.push(request.intent);
+        config.row = { ...row, pushClaimedAt: request.now.toISOString() };
+        return Promise.resolve(true);
+      },
+
+      async loadIntent(candidateId) {
+        calls.push('loadIntent');
+        void candidateId;
+        return storedIntent;
+      },
+
+      /*
+       * Ownership CAS: only the operation still holding the IN_PROGRESS claim may finalize.
+       * A stale operation (whose lease was taken over) gets false and must not report
+       * success. Returns boolean rather than mutating unconditionally.
+       */
+      async markSucceeded(request: CompletionRequest): Promise<boolean> {
         calls.push('markSucceeded');
         maybeFail('markSucceeded');
+        const row = config.row;
+        const owned =
+          row.pushState === 'IN_PROGRESS' && row.pushOperationId === request.operationId;
+        if (!owned) return false;
         config.row = {
           ...config.row,
           pushState: 'SUCCEEDED',
@@ -285,6 +353,7 @@ function makePorts(config: FakeConfig): {
           pushedShopifyProductId: request.shopifyProductId,
           pushClaimedAt: null,
         };
+        return true;
       },
 
       async markSafetyIncident(request: IncidentRequest) {
@@ -313,12 +382,14 @@ function makePorts(config: FakeConfig): {
     analysis: {
       async prepare(candidateId, options) {
         calls.push('prepare');
+        maybeInterfere('prepare');
         maybeFail('prepare');
         void options;
         return config.prepared ?? preparedFor({ ...config.row, id: candidateId });
       },
       async persist() {
         calls.push('persist');
+        maybeInterfere('persist');
         maybeFail('persist');
       },
     },
@@ -328,6 +399,12 @@ function makePorts(config: FakeConfig): {
         calls.push('findByResearchTag');
         maybeFail('findByResearchTag');
         void candidateId;
+        const sequence = config.findByResearchTagSequence;
+        if (sequence !== undefined) {
+          const value = sequence[Math.min(findTagCall, sequence.length - 1)] ?? null;
+          findTagCall += 1;
+          return value;
+        }
         return config.existingResearchProduct ?? null;
       },
 
@@ -374,7 +451,7 @@ function makePorts(config: FakeConfig): {
     },
   };
 
-  return { ports, calls, audits, costs, createRequests, world: config };
+  return { ports, calls, audits, costs, createRequests, intents, world: config };
 }
 
 function input(overrides: Partial<PushAsDraftInput> = {}): PushAsDraftInput {
@@ -625,10 +702,10 @@ describe('two pushes cannot both create a product', () => {
       pushCandidateAsDraft(fx.ports, 'cand-1', input({ operationId: 'op-A' })),
       pushCandidateAsDraft(fx.ports, 'cand-1', input({ operationId: 'op-B' })),
     ]);
-    // One create, one findByResearchTag (the winner's reconcile lookup). The loser never
-    // reached either.
+    // One create. The winner does TWO identity lookups (the step-4 reconcile check and the
+    // final pre-create check); the loser never reaches either, so the total is 2, not more.
     assert.equal(count(fx.calls, 'createProduct'), 1);
-    assert.equal(count(fx.calls, 'findByResearchTag'), 1);
+    assert.equal(count(fx.calls, 'findByResearchTag'), 2);
   });
 });
 
@@ -669,6 +746,7 @@ describe('recovery after a create that never finished recording', () => {
     // The orphaned product is now discoverable by its identity tag.
     fx.world.existingResearchProduct = {
       shopifyProductId: 'gid://shopify/Product/1',
+      shopifyVariantId: 'gid://shopify/ProductVariant/1',
       state: hiddenState,
     };
 
@@ -694,6 +772,7 @@ describe('recovery after a create that never finished recording', () => {
       }),
       existingResearchProduct: {
         shopifyProductId: 'gid://shopify/Product/orphan',
+        shopifyVariantId: 'gid://shopify/ProductVariant/orphan',
         state: hiddenState,
       },
     });
@@ -796,6 +875,7 @@ describe('reconcile adopts an existing product without re-pricing it', () => {
       row: candidate(),
       existingResearchProduct: {
         shopifyProductId: 'gid://shopify/Product/already',
+        shopifyVariantId: 'gid://shopify/ProductVariant/already',
         state: hiddenState,
       },
     });
@@ -807,5 +887,205 @@ describe('reconcile adopts an existing product without re-pricing it', () => {
     assert.equal(fx.costs.length, 0);
     assert.equal(count(fx.calls, 'markSucceeded'), 1);
     assert.equal(fx.audits[0]?.outcome, 'RECONCILED');
+  });
+});
+
+/* ===========================================================================
+ * Claim ownership - the lease-expiry race and the completion CAS
+ * ======================================================================== */
+
+describe('a push that loses its claim mid-flight creates nothing', () => {
+  it('refuses with PUSH_CLAIM_LOST and ZERO Shopify writes when another op takes over during analysis', async () => {
+    /*
+     * The race Part 1 is about: A claims, A is slow, A's lease expires, B takes over. A
+     * resumes. Modelled by having a concurrent operation seize ownership during A's
+     * analysis (interfereOnce.prepare). A then reaches the renew/assert-ownership write,
+     * finds it no longer owns the claim, and MUST create nothing.
+     */
+    const fx = makePorts({
+      row: candidate(),
+      interfereOnce: {
+        prepare: () => {
+          // B takes the claim over while A is analysing.
+          fx.world.row = {
+            ...fx.world.row,
+            pushState: 'IN_PROGRESS',
+            pushOperationId: 'op-B',
+            pushClaimedAt: NOW.toISOString(),
+          };
+        },
+      },
+    });
+
+    const error = await expectAppError(
+      pushCandidateAsDraft(fx.ports, 'cand-1', input({ operationId: 'op-A' })),
+    );
+    assert.equal(error.code, 'PUSH_CLAIM_LOST');
+    // The renew/assert happened, but the create did NOT.
+    assert.equal(count(fx.calls, 'recordIntent'), 1);
+    assert.equal(count(fx.calls, 'createProduct'), 0);
+    // And it never reached the final lookup either - ownership is checked first.
+    assert.equal(count(fx.calls, 'markSucceeded'), 0);
+  });
+
+  it('the stale owner cannot mark success after it lost ownership post-create (markSucceeded CAS)', async () => {
+    /*
+     * A holds the claim, renews it, and creates the product. Between persistence and the
+     * completion write, B takes the claim over. A's markSucceeded is an ownership CAS, so
+     * it returns false and A raises PUSH_CLAIM_LOST rather than finalizing a candidate it
+     * no longer owns. The product id is preserved for the owner (B) to reconcile.
+     */
+    const fx = makePorts({
+      row: candidate(),
+      interfereOnce: {
+        persist: () => {
+          fx.world.row = {
+            ...fx.world.row,
+            pushOperationId: 'op-B',
+          };
+        },
+      },
+    });
+
+    const error = await expectAppError(
+      pushCandidateAsDraft(fx.ports, 'cand-1', input({ operationId: 'op-A' })),
+    );
+    assert.equal(error.code, 'PUSH_CLAIM_LOST');
+    assert.equal(count(fx.calls, 'createProduct'), 1);
+    assert.equal(count(fx.calls, 'markSucceeded'), 1); // attempted...
+    // ...but it returned false, so the candidate was NOT finalized by A.
+    assert.notEqual(fx.world.row.pushState, 'SUCCEEDED');
+    // The product exists, so the id is preserved in the error for the owner to reconcile.
+    assert.match(
+      String((error.details as { shopifyProductId?: string })?.shopifyProductId),
+      /Product/,
+    );
+    // A does NOT release the claim - a product exists.
+    assert.equal(count(fx.calls, 'release'), 0);
+  });
+});
+
+/* ===========================================================================
+ * Final identity reconciliation - a product appearing between the two lookups
+ * ======================================================================== */
+
+describe('a product created between the early and final lookups is reconciled, not duplicated', () => {
+  it('does NOT create a second product when the final pre-create lookup finds one', async () => {
+    const fx = makePorts({
+      row: candidate(),
+      // Step-4 lookup: nothing. Step-8c lookup: a product has appeared.
+      findByResearchTagSequence: [
+        null,
+        {
+          shopifyProductId: 'gid://shopify/Product/raced',
+          shopifyVariantId: 'gid://shopify/ProductVariant/raced',
+          state: hiddenState,
+        },
+      ],
+    });
+
+    const result = await pushCandidateAsDraft(fx.ports, 'cand-1', input());
+
+    assert.equal(result.outcome, 'RECONCILED');
+    assert.equal(result.shopifyProductId, 'gid://shopify/Product/raced');
+    // The whole point: no create, even though the early lookup was clear.
+    assert.equal(count(fx.calls, 'createProduct'), 0);
+    assert.equal(count(fx.calls, 'findByResearchTag'), 2);
+    // Ownership was renewed before the final lookup.
+    assert.equal(count(fx.calls, 'recordIntent'), 1);
+  });
+});
+
+/* ===========================================================================
+ * Crash recovery uses the frozen intent, not nulls
+ * ======================================================================== */
+
+describe('recovery restores the original decision from the push intent', () => {
+  it('reconciles a crashed push using its frozen price, currency and supplier cost', async () => {
+    // A crashed attempt already exists: a product carries the identity tag, and the intent
+    // it froze before creating is present. This is the complete-recovery case.
+    const frozenIntent: PushIntent = {
+      operationId: 'op-original',
+      expectedDecisionHash: 'hash-current',
+      actualDecisionHash: 'hash-current',
+      scenario: 'BALANCED',
+      listedPrice: 21.5,
+      sellingCurrency: 'GBP',
+      supplierCost: 10,
+      supplierCurrency: 'GBP',
+      shippingCost: 2,
+      shippingCurrency: 'GBP',
+      overallScore: 79,
+      confidenceScore: 61,
+      recommendation: 'GOOD_CANDIDATE',
+      analyzedInputRevision: 1,
+      createdAt: NOW.toISOString(),
+    };
+    const fx = makePorts({
+      row: candidate(),
+      existingResearchProduct: {
+        shopifyProductId: 'gid://shopify/Product/crashed',
+        shopifyVariantId: 'gid://shopify/ProductVariant/crashed',
+        state: hiddenState,
+      },
+      pushIntent: frozenIntent,
+    });
+
+    const result = await pushCandidateAsDraft(fx.ports, 'cand-1', input());
+
+    assert.equal(result.outcome, 'RECONCILED');
+    assert.equal(count(fx.calls, 'createProduct'), 0);
+    // The listed price is RECOVERED from the intent, not returned as null.
+    assert.equal(result.listedPrice?.amount, 21.5);
+    assert.equal(result.listedPrice?.currencyCode, 'GBP');
+    // The supplier cost is restored from the intent, against the reconciled variant.
+    assert.equal(result.costRecorded, true);
+    assert.equal(fx.costs.length, 1);
+    assert.equal(fx.costs[0]?.currencyCode, 'GBP');
+    assert.equal(fx.costs[0]?.supplierProductCost, 10);
+    assert.equal(fx.costs[0]?.shopifyVariantId, 'gid://shopify/ProductVariant/crashed');
+    // The audit records the ORIGINAL decision hash and price, not nulls.
+    assert.equal(fx.audits[0]?.actualDecisionHash, 'hash-current');
+    assert.equal(fx.audits[0]?.listedPrice, 21.5);
+  });
+
+  it('reconciles conservatively, inventing nothing, when the intent is missing', async () => {
+    // A legacy/partial row: the product exists but no intent was ever frozen. Recovery must
+    // NOT invent a price or cost - it reconciles honestly and says the values are unknown.
+    const fx = makePorts({
+      row: candidate(),
+      existingResearchProduct: {
+        shopifyProductId: 'gid://shopify/Product/legacy',
+        shopifyVariantId: 'gid://shopify/ProductVariant/legacy',
+        state: hiddenState,
+      },
+      // no pushIntent
+    });
+
+    const result = await pushCandidateAsDraft(fx.ports, 'cand-1', input());
+
+    assert.equal(result.outcome, 'RECONCILED');
+    assert.equal(result.listedPrice, null); // not invented
+    assert.equal(result.costRecorded, false); // not invented
+    assert.equal(fx.costs.length, 0);
+    assert.equal(fx.audits[0]?.listedPrice ?? null, null);
+    assert.ok(
+      result.warnings.some((warning) => /could not be (found|reconstructed)/i.test(warning)),
+      'a conservative reconcile must say the historical values are unknown',
+    );
+  });
+});
+
+/* ===========================================================================
+ * Terminal status cannot push
+ * ======================================================================== */
+
+describe('a terminal candidate cannot be pushed', () => {
+  it('refuses a REJECTED candidate before any claim or Shopify call', async () => {
+    const fx = makePorts({ row: candidate({ status: 'REJECTED' }) });
+    const error = await expectAppError(pushCandidateAsDraft(fx.ports, 'cand-1', input()));
+    assert.notEqual(error.code, 'INTERNAL_ERROR');
+    assert.equal(count(fx.calls, 'claim'), 0);
+    assert.equal(count(fx.calls, 'createProduct'), 0);
   });
 });

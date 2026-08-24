@@ -20,6 +20,8 @@ describe('research push safety codes', () => {
     assert.equal(defaultStatusForCode('RECOMMENDATION_CHANGED'), 409);
     assert.equal(defaultStatusForCode('RESEARCH_PUSH_IN_PROGRESS'), 409);
     assert.equal(defaultStatusForCode('RESEARCH_ALREADY_PUSHED'), 409);
+    // A claim taken over mid-push. Well-formed request, the world moved underneath it.
+    assert.equal(defaultStatusForCode('PUSH_CLAIM_LOST'), 409);
   });
 
   it('maps an unrepaired safety incident to 500, explicitly', () => {
@@ -36,6 +38,7 @@ describe('research push safety codes', () => {
       'RECOMMENDATION_CHANGED',
       'RESEARCH_PUSH_IN_PROGRESS',
       'RESEARCH_ALREADY_PUSHED',
+      'PUSH_CLAIM_LOST',
       'RESEARCH_PUSH_SAFETY',
     ] as const) {
       assert.equal(defaultRetryableForCode(code), false, `${code} must not be retryable`);
