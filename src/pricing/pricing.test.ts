@@ -7,7 +7,12 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { AppError } from '../common/errors';
-import { calculatePricing, calculateSuggestedPrice, round2 } from './pricing.service';
+import {
+  calculatePricing,
+  calculateSuggestedPrice,
+  pricingGuardBreaches,
+  round2,
+} from './pricing.service';
 
 describe('calculatePricing', () => {
   it('reproduces the worked example from the brief', () => {
@@ -159,5 +164,114 @@ describe('calculateSuggestedPrice', () => {
       (error: unknown) =>
         error instanceof AppError && error.code === 'VALIDATION_ERROR',
     );
+  });
+});
+
+
+describe('calculateSuggestedPrice with a percentage advertising allowance', () => {
+  it('solves for the allowance alongside the margin rather than applying it after', () => {
+    const result = calculateSuggestedPrice({
+      desiredMarginPercentage: 45,
+      supplierProductCost: 10,
+      supplierShippingCost: 2,
+      otherCosts: 0,
+      paymentFeePercentage: 2.9,
+      advertisingPercentage: 15,
+    });
+
+    // 12 / (1 - (2.9 + 15 + 45)/100) = 12 / 0.371 = 32.35
+    assert.equal(result.suggestedPrice, 32.35);
+    assert.equal(result.percentageCosts, 17.9);
+    // The projection must actually achieve the margin that was asked for, which is
+    // the whole point of solving rather than post-applying.
+    assert.ok((result.projection.profitMarginPercentage as number) >= 44.9);
+  });
+
+  it('folds the allowance into the projected advertising cost', () => {
+    const result = calculateSuggestedPrice({
+      desiredMarginPercentage: 40,
+      supplierProductCost: 10,
+      advertisingPercentage: 20,
+    });
+    const advertising = result.projection.breakdown.find(
+      (entry) => entry.key === 'advertisingCost',
+    );
+    // 20% of the suggested price, reported as PROVIDED - it is a configured cost, not
+    // a missing input.
+    assert.equal(advertising?.provided, true);
+    assert.equal(advertising?.amount, round2(result.suggestedPrice * 0.2));
+  });
+
+  it('leaves an omitted advertising cost reported as missing when no allowance is set', () => {
+    const result = calculateSuggestedPrice({
+      desiredMarginPercentage: 40,
+      supplierProductCost: 10,
+    });
+    // Without this, adding the percentage feature would have turned every absent
+    // advertising cost into a silent zero.
+    assert.ok(result.missingInputs.includes('advertisingCost'));
+  });
+
+  it('rejects a negative allowance', () => {
+    assert.throws(
+      () =>
+        calculateSuggestedPrice({
+          desiredMarginPercentage: 40,
+          supplierProductCost: 10,
+          advertisingPercentage: -5,
+        }),
+      (error: unknown) => error instanceof AppError && error.code === 'VALIDATION_ERROR',
+    );
+  });
+});
+
+describe('pricingGuardBreaches', () => {
+  /** A priced result at `sellingPrice` with a single supplier cost. */
+  function at(sellingPrice: number, cost: number) {
+    return calculatePricing({
+      sellingPrice,
+      supplierProductCost: cost,
+      supplierShippingCost: 0,
+      paymentFee: 0,
+      shopifyFee: 0,
+      advertisingCost: 0,
+      taxes: 0,
+      otherCosts: 0,
+    });
+  }
+
+  it('returns nothing when both floors are cleared', () => {
+    assert.deepEqual(pricingGuardBreaches(at(100, 50), 15, 5), []);
+  });
+
+  it('reports a margin below the percentage floor', () => {
+    const breaches = pricingGuardBreaches(at(100, 90), 15, 0);
+    assert.equal(breaches.length, 1);
+    assert.ok(breaches[0]?.includes('10.00% margin'));
+    assert.ok(breaches[0]?.includes('below the 15% floor'));
+  });
+
+  it('reports a thin absolute contribution the percentage floor would miss', () => {
+    // 3.00 item at 20% margin: clears a 15% floor, yields 60p.
+    const breaches = pricingGuardBreaches(at(3, 2.4), 15, 1);
+    assert.equal(breaches.length, 1);
+    assert.ok(breaches[0]?.includes('0.60 contribution per unit'));
+  });
+
+  it('reports both breaches together when both bind', () => {
+    assert.equal(pricingGuardBreaches(at(100, 95), 15, 10).length, 2);
+  });
+
+  it('ignores the absolute floor when it is set to zero', () => {
+    // Every price clears a floor of 0, so checking it would only add noise.
+    assert.deepEqual(pricingGuardBreaches(at(100, 50), 15, 0), []);
+  });
+
+  it('treats an incomputable margin as clearing, not as a loss', () => {
+    // A zero selling price gives a null margin. Refusing on it would block pricing
+    // for a reason nobody could act on.
+    const result = at(0, 0);
+    assert.equal(result.profitMarginPercentage, null);
+    assert.deepEqual(pricingGuardBreaches(result, 15, 0), []);
   });
 });

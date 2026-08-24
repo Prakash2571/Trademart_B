@@ -22,11 +22,15 @@
 /**
  * How a computed price is rounded before being written.
  *
- *   none    - exact 2dp value
- *   charm99 - round to the nearest .99 (never below the minimum-margin floor)
- *   integer - whole currency units
+ * Defined in pricing/rounding.ts, which is where the implementation now lives -
+ * price recommendation rounds prices too, and charm pricing must mean the same thing
+ * in both places. Re-exported so importers of this module are unaffected.
  */
-export type PriceRounding = 'none' | 'charm99' | 'integer';
+export type { PriceRounding } from '../pricing/rounding';
+
+// Imported as well as re-exported: `export ... from` does not bring the name into
+// this module's own scope, and PriceRules below uses it.
+import type { PriceRounding } from '../pricing/rounding';
 
 /**
  * How a target price is derived from the supplier cost.

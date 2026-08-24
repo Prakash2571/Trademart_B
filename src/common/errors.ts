@@ -83,7 +83,45 @@ export type ErrorCode =
   // Storefront / theme safety
   | 'THEME_PROTECTED'
   // Dev/test tooling attempted to write to a non-development store
-  | 'LIVE_STORE_WRITE_BLOCKED';
+  | 'LIVE_STORE_WRITE_BLOCKED'
+  // ---- Research push safety ----------------------------------------------
+  /**
+   * The analysis the operator reviewed is no longer the current one.
+   *
+   * Raised BEFORE any Shopify write. The operator approved a specific
+   * recommendation and price; if the underlying costs, settings or store history
+   * have moved since, pushing would create a product on a decision nobody
+   * approved. The fix is to re-read and re-approve, never to substitute the new
+   * numbers silently.
+   */
+  | 'RECOMMENDATION_CHANGED'
+  /**
+   * Another push for this candidate holds the claim.
+   *
+   * Distinct from IDEMPOTENCY_IN_PROGRESS: that means "this exact request is
+   * already running", whereas this means "a DIFFERENT operation owns this
+   * candidate". Both are 409, and conflating them would tell the operator to
+   * retry when they should wait.
+   */
+  | 'RESEARCH_PUSH_IN_PROGRESS'
+  /** The candidate already has a Shopify draft. Pushing again would duplicate it. */
+  | 'RESEARCH_ALREADY_PUSHED'
+  /**
+   * This operation's push claim was taken over by another operation before it could
+   * create the product. 409. Zero Shopify writes happened; the operator refreshes and
+   * retries. Distinct from RESEARCH_PUSH_IN_PROGRESS, which is raised when a push cannot
+   * even start; this is raised when one started and then lost ownership mid-flight.
+   */
+  | 'PUSH_CLAIM_LOST'
+  /**
+   * A pushed product is in an unsafe state that could not be repaired.
+   *
+   * The only code in this group that may be a 500: a Shopify product exists and
+   * Trademart could not verify it is hidden. It is never reported as a success,
+   * and the response always carries the Shopify product id so a human can finish
+   * the job by hand.
+   */
+  | 'RESEARCH_PUSH_SAFETY';
 
 /**
  * The wire format for a failure.
@@ -209,6 +247,14 @@ export function defaultStatusForCode(code: ErrorCode): number {
     case 'PRODUCT_CHANGED':
     case 'IDEMPOTENCY_CONFLICT':
     case 'IDEMPOTENCY_IN_PROGRESS':
+    // The reviewed analysis is no longer current. Same family as PRODUCT_CHANGED:
+    // the request was well-formed, the world moved.
+    case 'RECOMMENDATION_CHANGED':
+    // Another operation owns this candidate's push, or it is already pushed.
+    case 'RESEARCH_PUSH_IN_PROGRESS':
+    case 'RESEARCH_ALREADY_PUSHED':
+    // A concurrent operation took the claim over mid-push. Nothing was created.
+    case 'PUSH_CLAIM_LOST':
     case 'INVENTORY_DELTA_TOO_LARGE':
     // Refusing to price is a state conflict, not a bad request: the caller asked
     // for something reasonable and the data is not good enough to do it safely.
@@ -253,6 +299,12 @@ export function defaultStatusForCode(code: ErrorCode): number {
     // so the resulting state is safe.
     case 'PUBLICATION_FAILED':
       return 502;
+    // A Shopify product exists and Trademart could not verify it is hidden. Listed
+    // explicitly rather than left to the `default` below, because this switch
+    // silently turns an unlisted code into a 500 and a safety incident is exactly
+    // the case that must not depend on a fallthrough nobody noticed.
+    case 'RESEARCH_PUSH_SAFETY':
+      return 500;
     case 'INTERNAL_ERROR':
     default:
       return 500;
@@ -295,6 +347,20 @@ export function defaultRetryableForCode(code: ErrorCode): boolean {
     case 'LOGIN_FAILED':
     case 'OPERATOR_NOT_CONFIGURED':
     case 'THEME_PROTECTED':
+    // A stale recommendation needs a HUMAN to review the new one. An automatic
+    // retry would resubmit the same rejected decision hash forever, and a client
+    // that "helpfully" retried until it worked would defeat the review gate.
+    case 'RECOMMENDATION_CHANGED':
+    // The product already exists. Retrying cannot improve the outcome and the
+    // point of the refusal is to stop a second one being created.
+    case 'RESEARCH_ALREADY_PUSHED':
+    // A claim is held. Recovery is by lease expiry, not by a client retry loop.
+    case 'RESEARCH_PUSH_IN_PROGRESS':
+    // Ownership was lost mid-push. The operator must refresh to see who won before
+    // retrying; an automatic retry would race the operation that took over.
+    case 'PUSH_CLAIM_LOST':
+    // A product exists in an unverified state. This needs a person, not a retry.
+    case 'RESEARCH_PUSH_SAFETY':
       return false;
     default:
       return false;

@@ -34,6 +34,11 @@ describe('write routers are guarded', () => {
     'publicationsWriteRouter',
     'inventoryWriteRouter',
     'manualCostRouter',
+    // Changes which orders are flagged and what price Research recommends. Not a Shopify
+    // write, but still store configuration nobody anonymous should be able to change.
+    'dropshippingWriteRouter',
+    // Creates Shopify DRAFT products, and changes research state.
+    'intelligenceWriteRouter',
   ];
 
   for (const router of writeRouters) {
@@ -43,6 +48,27 @@ describe('write routers are guarded', () => {
       assert.ok(
         line.includes('requireOperatorForWrites'),
         `${router} must be mounted with requireOperatorForWrites, got: ${line?.trim()}`,
+      );
+    });
+  }
+});
+
+describe('read routers stay on the read guard', () => {
+  // The mirror of the above. A READ router accidentally mounted with
+  // requireOperatorForWrites would leave its GETs open even when
+  // OPERATOR_PROTECT_READS is true, because that guard only checks mutating methods.
+  const readRouters = ['dropshippingRouter', 'intelligenceRouter'];
+
+  for (const router of readRouters) {
+    it(`${router} is mounted behind requireOperatorForReads`, () => {
+      // Matched with the leading comma so `dropshippingRouter` cannot match the
+      // `dropshippingWriteRouter` line, and `intelligenceRouter` cannot match
+      // `intelligenceWriteRouter`.
+      const line = mountLine(`, ${router})`);
+      assert.ok(line !== undefined, `${router} is not mounted in app.ts`);
+      assert.ok(
+        line.includes('requireOperatorForReads'),
+        `${router} must be mounted with requireOperatorForReads, got: ${line?.trim()}`,
       );
     });
   }

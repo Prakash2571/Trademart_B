@@ -77,6 +77,41 @@ describe('dropshipping routes are relative to the /api mount', () => {
   });
 });
 
+describe('the settings write router is separate and guarded', () => {
+  const WRITE = readFileSync(
+    join(process.cwd(), 'src', 'dropshipping', 'dropshipping.write.controller.ts'),
+    'utf8',
+  );
+
+  it('registers PUT /dropshipping/settings and nothing else', () => {
+    const found: string[] = [];
+    const re = /dropshippingWriteRouter\.(get|post|put|patch|delete)\(\s*'([^']+)'/g;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(WRITE)) !== null) {
+      found.push(`${(match[1] ?? '').toUpperCase()} ${match[2] ?? ''}`);
+    }
+    assert.deepEqual(found, ['PUT /dropshipping/settings']);
+  });
+
+  it('is mounted at /api behind requireOperatorForWrites', () => {
+    assert.match(
+      APP,
+      /app\.use\('\/api', requireOperatorForWrites, dropshippingWriteRouter\)/,
+      'dropshippingWriteRouter must be mounted at /api with requireOperatorForWrites',
+    );
+  });
+
+  it('changes no price in Shopify', () => {
+    // Settings decide which orders are FLAGGED and what price is RECOMMENDED. Repricing
+    // existing variants stays in automation, behind its own preview and apply steps.
+    assert.ok(
+      !/MUTATION/.test(WRITE),
+      'the settings writer must not reference a Shopify mutation',
+    );
+    assert.ok(WRITE.includes('They do not change any price in Shopify.'));
+  });
+});
+
 describe('the dropshipping module is read-only', () => {
   it('registers no state-changing routes', () => {
     // If a write is ever genuinely needed here it must go on a SEPARATE router behind

@@ -65,6 +65,20 @@ export interface SuggestedPriceInput {
   paymentFeePercentage?: number;
   /** Percentage of the selling price taken as a platform fee. */
   shopifyFeePercentage?: number;
+  /**
+   * Acquisition allowance as a percentage of the selling price.
+   *
+   * Separate from `advertisingCost`, which is an absolute amount. Both are
+   * supported because the two are genuinely different models: a store with a
+   * measured cost-per-acquisition knows an amount, whereas a store budgeting
+   * "15% of revenue goes to ads" knows a percentage - and a percentage must be
+   * solved for alongside the margin rather than applied to a price that has
+   * already been computed, or the resulting margin is wrong.
+   *
+   * The order view models the advertising allowance as a percentage of revenue too,
+   * so pricing this way keeps a recommended price and a reported margin consistent.
+   */
+  advertisingPercentage?: number;
 }
 
 export interface SuggestedPriceResult {
@@ -222,9 +236,12 @@ export function calculateSuggestedPrice(
 
   const paymentFeePercentage = input.paymentFeePercentage ?? 0;
   const shopifyFeePercentage = input.shopifyFeePercentage ?? 0;
+  const advertisingPercentage = input.advertisingPercentage ?? 0;
   assertNonNegative(paymentFeePercentage, 'paymentFeePercentage');
   assertNonNegative(shopifyFeePercentage, 'shopifyFeePercentage');
-  const percentageCosts = paymentFeePercentage + shopifyFeePercentage;
+  assertNonNegative(advertisingPercentage, 'advertisingPercentage');
+  const percentageCosts =
+    paymentFeePercentage + shopifyFeePercentage + advertisingPercentage;
 
   const divisor = 1 - (percentageCosts + input.desiredMarginPercentage) / 100;
   if (divisor <= 0) {
@@ -253,7 +270,15 @@ export function calculateSuggestedPrice(
     sellingPrice: suggestedPrice,
     supplierProductCost: input.supplierProductCost,
     supplierShippingCost: input.supplierShippingCost,
-    advertisingCost: input.advertisingCost,
+    // The percentage allowance is resolved against the price that was just solved
+    // for, then added to any absolute advertising cost. When no percentage is
+    // configured the absolute value passes through untouched, so an omitted
+    // advertising cost is still reported as a missing input rather than becoming a
+    // spurious zero.
+    advertisingCost:
+      advertisingPercentage > 0
+        ? sumMoney(input.advertisingCost, percentageOf(suggestedPrice, advertisingPercentage))
+        : input.advertisingCost,
     taxes: input.taxes,
     otherCosts: input.otherCosts,
     paymentFee: percentageOf(suggestedPrice, paymentFeePercentage),
@@ -280,4 +305,55 @@ export function calculateSuggestedPrice(
     missingInputs,
     notes,
   };
+}
+
+
+/**
+ * Checks a priced result against the two commercial floors, returning a readable
+ * description of each breach. Empty means the price is acceptable.
+ *
+ * WHY BOTH FLOORS
+ * ---------------
+ * They catch different failures and neither subsumes the other. A percentage floor
+ * misses a thin absolute contribution on a cheap item - 15% of 3.00 is 45p, which
+ * does not cover one support email or one return. An absolute floor misses a poor
+ * percentage on an expensive one. Whichever binds harder wins.
+ *
+ * A NULL FIGURE CLEARS THE FLOOR
+ * ------------------------------
+ * profitMarginPercentage is null when the selling price is zero, and an incomputable
+ * margin is not evidence of a loss. Refusing on it would block pricing for a reason
+ * nobody could act on, so it passes and the caller's own missing-input reporting is
+ * what surfaces the gap.
+ *
+ * Lives here rather than in either caller because automation (repricing an existing
+ * variant) and the recommendation engine (pricing a new candidate) must apply the
+ * same floors with the same wording. Two implementations of the same two checks is
+ * how a price that automation would refuse gets recommended in Research.
+ */
+export function pricingGuardBreaches(
+  result: PricingResult,
+  minimumMarginPercentage: number,
+  minimumProfitAmount: number,
+): string[] {
+  const breaches: string[] = [];
+
+  if (
+    result.profitMarginPercentage !== null &&
+    result.profitMarginPercentage < minimumMarginPercentage
+  ) {
+    breaches.push(
+      `yields ${result.profitMarginPercentage.toFixed(2)}% margin, below the ${minimumMarginPercentage}% floor`,
+    );
+  }
+
+  // Gated on > 0 because 0 means the absolute floor is disabled - every price clears
+  // a floor of zero, so checking it would only ever add noise.
+  if (minimumProfitAmount > 0 && result.grossProfit < minimumProfitAmount) {
+    breaches.push(
+      `yields only ${result.grossProfit.toFixed(2)} contribution per unit, below the ${minimumProfitAmount.toFixed(2)} minimum`,
+    );
+  }
+
+  return breaches;
 }
