@@ -3,6 +3,7 @@
  * GET /api/intelligence/candidates          - the research shortlist
  * GET /api/intelligence/candidates/:id      - one candidate with its full score
  * GET /api/intelligence/candidates/:id/decision   - the current decision + its hash
+ * GET /api/intelligence/candidates/:id/supplier    - supplier verification + sourceability
  * GET /api/intelligence/candidates/:id/duplicates - duplicate check before a push
  *
  * READ-ONLY. Every write - create, analyse, watch, reject, push - lives on
@@ -22,11 +23,13 @@ import { parseIntParam, parseStringParam } from '../common/validate';
 import { AppError } from '../common/errors';
 import { scoreIsStale } from './candidate.revision';
 import { allowedActions } from './candidate.transitions';
+import { finalRecommendationOf } from './candidate.analysis';
 import {
   getCandidate,
   listCandidates,
   prepareCandidateAnalysis,
 } from './intelligence.service';
+import type { CurrentSourceability } from './sourceability';
 import { describeResearchSupport } from './providers/registry';
 import { TRADELLE_DOCUMENTATION, TRADELLE_MODES, tradelleResearchMode } from './providers/tradelle.provider';
 import {
@@ -46,6 +49,47 @@ const STATUSES: readonly CandidateStatus[] = [
   'PUSHED_TO_SHOPIFY',
   'REJECTED',
 ];
+
+type SupplierFilter = 'available' | 'needs-verification' | 'stale' | 'unavailable' | 'partial';
+const SUPPLIER_FILTERS: readonly SupplierFilter[] = [
+  'available',
+  'needs-verification',
+  'stale',
+  'unavailable',
+  'partial',
+];
+
+/** The sourceability + final-recommendation meta block for a single candidate read. */
+function supplierMeta(candidate: Parameters<typeof finalRecommendationOf>[0]): {
+  sourceability: ReturnType<typeof finalRecommendationOf>['sourceability'];
+  finalRecommendation: string | null;
+  opportunityRecommendation: string | null;
+} {
+  const { sourceability, gate } = finalRecommendationOf(candidate, new Date());
+  return {
+    sourceability,
+    finalRecommendation: gate.recommendation,
+    opportunityRecommendation: gate.opportunityRecommendation,
+  };
+}
+
+/** Maps a supplier-availability list filter to the sourceability verdicts it accepts. */
+function matchesSupplierFilter(current: CurrentSourceability, filter: SupplierFilter): boolean {
+  switch (filter) {
+    case 'available':
+      return current === 'SOURCEABLE' || current === 'PARTIALLY_SOURCEABLE';
+    case 'partial':
+      return current === 'PARTIALLY_SOURCEABLE';
+    case 'needs-verification':
+      return current === 'UNVERIFIED';
+    case 'stale':
+      return current === 'NEEDS_RECHECK';
+    case 'unavailable':
+      return current === 'NOT_SOURCEABLE';
+    default:
+      return true;
+  }
+}
 
 /**
  * What this module can actually measure.
@@ -71,6 +115,27 @@ intelligenceRouter.get(
           GOOGLE_ADS_RESEARCH_DESCRIPTOR,
           GOOGLE_TRENDS_RESEARCH_DESCRIPTOR,
         ],
+        /*
+         * Supplier sourceability, stated as honestly as everything else here.
+         *
+         *   manual         an operator verifies in Tradelle and records it - real, and the
+         *                  primary path today.
+         *   shopifyBridge  a Tradelle-imported Shopify product proves supplier IDENTITY,
+         *                  but Shopify does not report Tradelle's current stock, so this
+         *                  supports "appears Tradelle-sourced", never "AVAILABLE now".
+         *   direct         no documented Tradelle production API exists, so there is no
+         *                  live availability poll. Unavailable until one is configured.
+         */
+        supplier: {
+          productAvailability: 'AVAILABLE',
+          variantAvailability: 'AVAILABLE',
+          modes: {
+            manual: 'AVAILABLE',
+            shopifyBridge: 'IDENTITY_ONLY',
+            direct: 'API_UNAVAILABLE',
+          },
+          note: 'Supplier availability is established by manual Tradelle verification or by Shopify-bridge identity evidence. There is no live Tradelle API, so current stock is never polled automatically - a recorded verification ages and must be refreshed.',
+        },
       },
       {
         note: 'Store performance and fulfillment history are read from Shopify. Demand, trend, competition and seasonality come only from figures an operator records by hand, because Tradelle publishes no API and the keyword integrations are not built.',
@@ -96,6 +161,7 @@ intelligenceRouter.get(
     });
     const status = parseStringParam(req.query['status'], 'status', { maxLength: 40 });
     const sort = parseStringParam(req.query['sort'], 'sort', { maxLength: 10 });
+    const supplierFilter = parseStringParam(req.query['supplier'], 'supplier', { maxLength: 24 });
 
     if (status !== undefined && !STATUSES.includes(status as CandidateStatus)) {
       throw new AppError(
@@ -106,15 +172,59 @@ intelligenceRouter.get(
     if (sort !== undefined && sort !== 'score' && sort !== 'recent') {
       throw new AppError('VALIDATION_ERROR', "sort must be 'score' or 'recent'.");
     }
+    if (supplierFilter !== undefined && !SUPPLIER_FILTERS.includes(supplierFilter as SupplierFilter)) {
+      throw new AppError(
+        'VALIDATION_ERROR',
+        `supplier must be one of ${SUPPLIER_FILTERS.join(', ')}.`,
+      );
+    }
 
-    const candidates = await listCandidates({
+    const loaded = await listCandidates({
       limit,
       ...(status === undefined ? {} : { status: status as CandidateStatus }),
       ...(sort === undefined ? {} : { sort: sort as 'score' | 'recent' }),
     });
 
+    // Sourceability is derived per candidate with one clock, so the shortlist badge, the
+    // final recommendation and the supplier filter all agree.
+    const now = new Date();
+    const withSource = loaded.map((candidate) => ({
+      candidate,
+      ...finalRecommendationOf(candidate, now),
+    }));
+
+    const candidates =
+      supplierFilter === undefined
+        ? withSource.map((entry) => entry.candidate)
+        : withSource
+            .filter((entry) => matchesSupplierFilter(entry.sourceability.current, supplierFilter as SupplierFilter))
+            .map((entry) => entry.candidate);
+
     sendSuccess(res, candidates, {
       count: candidates.length,
+      /*
+       * Sourceability and the FINAL (supplier-gated) recommendation, keyed by candidate id.
+       * The shortlist shows a supplier badge without opening each row, and the final
+       * recommendation reflects live supplier freshness rather than the stored opportunity
+       * verdict.
+       */
+      sourceability: Object.fromEntries(
+        withSource.map((entry) => [
+          entry.candidate.id,
+          {
+            provider: entry.sourceability.provider,
+            availability: entry.sourceability.availability,
+            current: entry.sourceability.current,
+            freshness: entry.sourceability.freshness,
+            variantCoverage: entry.sourceability.variantCoverage,
+            finalRecommendation: entry.gate.recommendation,
+          },
+        ]),
+      ),
+      // Supplier attention counts, for the Needs-Attention surface.
+      needsSupplierVerification: withSource.filter((e) => e.sourceability.current === 'UNVERIFIED').length,
+      staleSupplier: withSource.filter((e) => e.sourceability.current === 'NEEDS_RECHECK').length,
+      unavailableSupplier: withSource.filter((e) => e.sourceability.current === 'NOT_SOURCEABLE').length,
       /*
        * What may be done to each candidate, computed from the backend's own transition
        * table and keyed by candidate id.
@@ -169,6 +279,9 @@ intelligenceRouter.get(
       analyzedInputRevision: candidate.analyzedInputRevision,
       // See the list route: one source of truth for what may be done.
       actions: allowedActions(candidate),
+      // The current sourceability verdict and the FINAL (supplier-gated) recommendation,
+      // computed fresh so freshness is live.
+      ...supplierMeta(candidate),
       note:
         candidate.analyzedAt === null
           ? 'This candidate has never been analysed, so it has no score. That is not a low score.'
@@ -179,6 +292,33 @@ intelligenceRouter.get(
        */
       pushSafetyReason: candidate.pushSafetyReason,
     });
+  }),
+);
+
+/**
+ * A candidate's supplier verification and current sourceability verdict.
+ *
+ * Read-only. Returns the recorded supplier block plus the freshness-aware `sourceability`,
+ * so the UI can show availability, source, last-checked, freshness and variant coverage
+ * without recomputing the rules client-side.
+ */
+intelligenceRouter.get(
+  '/intelligence/candidates/:id/supplier',
+  asyncHandler(async (req, res) => {
+    const candidate = await getCandidate(req.params.id ?? '');
+    const { sourceability, gate } = finalRecommendationOf(candidate, new Date());
+    sendSuccess(
+      res,
+      { supplier: candidate.supplier, sourceability },
+      {
+        finalRecommendation: gate.recommendation,
+        opportunityRecommendation: gate.opportunityRecommendation,
+        note:
+          candidate.supplier === null
+            ? 'This candidate has not been verified as sourceable from a supplier. Record a Tradelle verification to make it pushable.'
+            : null,
+      },
+    );
   }),
 );
 
@@ -219,6 +359,12 @@ intelligenceRouter.get(
         policy: prepared.policy,
         warnings: prepared.analysis.warnings,
         actions: allowedActions(prepared.freshCandidate),
+        // The supplier verdict THIS decision was computed against, and the FINAL
+        // (supplier-gated) recommendation the operator is approving. From the same prepared
+        // analysis whose hash is returned, so what they confirm is what the hash covers.
+        sourceability: prepared.sourceability,
+        finalRecommendation: finalRecommendationOf(prepared.freshCandidate, prepared.now).gate
+          .recommendation,
       },
       {
         /*

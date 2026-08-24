@@ -26,6 +26,7 @@ import type {
   EvidenceItem,
   Freshness,
 } from '../common/dataQuality';
+import type { SupplierInfo } from './sourceability';
 
 /* ===========================================================================
  * Provenance
@@ -376,6 +377,15 @@ export interface ProductCandidate {
   market: TargetMarket;
   commercials: CandidateCommercials;
   /**
+   * Recorded supplier verification: whether this product can actually be SOURCED.
+   *
+   * Null until an operator (or the Shopify bridge) records it, which reads as availability
+   * UNKNOWN - deliberately distinct from UNAVAILABLE. The current, freshness-aware verdict
+   * is DERIVED from this via computeSourceability; it is not stored, so "checked six months
+   * ago" can never read as current.
+   */
+  supplier: SupplierInfo | null;
+  /**
    * Market figures the operator typed in, because no API supplies them.
    *
    * Kept separate from `factors` so the raw input remains visible next to the score
@@ -470,3 +480,19 @@ export {
   isTerminal,
 } from './candidate.transitions';
 export type { ActionDecision, AllowedActions, ResearchAction } from './candidate.transitions';
+
+// Supplier-sourceability types live in sourceability.ts (which is pure and has no cycle
+// with this module beyond the type-only Recommendation import). Re-exported so callers
+// keep importing supplier concepts from candidate.types alongside the candidate itself.
+export type {
+  SupplierAvailability,
+  SupplierAvailabilitySource,
+  SupplierProvider,
+  SupplierInfo,
+  SupplierVariantAvailability,
+  SupplierEvidence,
+  SourceabilityResult,
+  CurrentSourceability,
+  VariantCoverage,
+  SourceabilityReason,
+} from './sourceability';

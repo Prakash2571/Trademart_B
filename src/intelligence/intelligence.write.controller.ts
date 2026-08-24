@@ -31,11 +31,13 @@ import type { PricingScenarioName } from '../pricing/recommendation';
 import {
   analyzeCandidate,
   createCandidate,
+  recordSupplierVerification,
   setCandidateStatus,
   updateCandidate,
   type CreateCandidateInput,
   type UpdateCandidateInput,
 } from './intelligence.service';
+import type { SupplierVerificationInput } from './supplier.validation';
 import { scoreIsStale } from './candidate.revision';
 import { pushCandidateAsDraft } from './push.service';
 
@@ -252,6 +254,51 @@ intelligenceWriteRouter.post(
 );
 
 /**
+ * Record a supplier (Tradelle) verification: whether this product can be SOURCED.
+ *
+ * This is EVIDENCE recorded by a human who looked. `checkedAt` is set server-side to now,
+ * so freshness ages from a genuine verification. The supplied URL is stored as evidence and
+ * NEVER fetched - the service does no server-side supplier calls.
+ *
+ * A push consumes this: an UNAVAILABLE product is refused, an UNVERIFIED or STALE one is
+ * refused until verified. Recording it here is how an operator makes a strong-but-
+ * unverified candidate pushable.
+ */
+intelligenceWriteRouter.post(
+  '/intelligence/candidates/:id/supplier-verification',
+  asyncHandler(async (req, res) => {
+    const id = requireId(req.params.id);
+    const payload = body(req);
+
+    const result = await recordSupplierVerification(id, payload as SupplierVerificationInput);
+
+    await recordAudit({
+      action: result.wasUpdate ? 'RESEARCH_SUPPLIER_UPDATE' : 'RESEARCH_SUPPLIER_VERIFY',
+      resourceType: 'RESEARCH_CANDIDATE',
+      resourceId: id,
+      before: result.previousSupplier,
+      after: {
+        provider: result.sourceability.provider,
+        availability: result.sourceability.availability,
+        availabilitySource: result.sourceability.availabilitySource,
+        checkedAt: result.sourceability.checkedAt,
+        current: result.sourceability.current,
+        variantCoverage: result.sourceability.variantCoverage,
+        supplierProductId: result.sourceability.supplierProductId,
+      },
+    });
+
+    sendSuccess(res, result.candidate, {
+      sourceability: result.sourceability,
+      note:
+        result.sourceability.current === 'SOURCEABLE'
+          ? 'Recorded. This candidate is now verified as sourceable and can be pushed.'
+          : 'Recorded. Note the current sourceability verdict - a push is only allowed when the product is currently sourceable.',
+    });
+  }),
+);
+
+/**
  * Create a Shopify DRAFT from the candidate.
  *
  * Named `push` and not `publish`, and it cannot publish: see push.draft.ts, where DRAFT and
@@ -308,6 +355,10 @@ intelligenceWriteRouter.post(
      */
     const allowDuplicate = payload['allowDuplicate'] === true;
     const acknowledgeGuardBreach = payload['acknowledgeGuardBreach'] === true;
+    // Separate, explicit acknowledgement that the operator accepts PARTIAL supplier variant
+    // coverage. The unavailable variants are never created regardless; this only unblocks
+    // creating the draft for the available coverage. Must be exactly true.
+    const acknowledgePartialVariants = payload['acknowledgePartialVariants'] === true;
 
     /*
      * One operation id per logical push.
@@ -325,6 +376,7 @@ intelligenceWriteRouter.post(
       expectedDecisionHash: expectedDecisionHash.trim(),
       allowDuplicate,
       acknowledgeGuardBreach,
+      acknowledgePartialVariants,
       operationId,
     });
 

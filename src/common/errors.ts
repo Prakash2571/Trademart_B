@@ -113,6 +113,20 @@ export type ErrorCode =
    * even start; this is raised when one started and then lost ownership mid-flight.
    */
   | 'PUSH_CLAIM_LOST'
+  /*
+   * The supplier sourceability gate on a research push. All 409: the request is
+   * well-formed, but the product cannot be sourced right now. Deliberately DISTINCT from
+   * SUPPLIER_UNAVAILABLE above, which is a 503 meaning the supplier INTEGRATION is down -
+   * these mean a specific product's sourceability is not established.
+   */
+  /** The supplier has this product (or all its variants) marked unavailable. */
+  | 'RESEARCH_SUPPLIER_UNAVAILABLE'
+  /** Supplier availability has not been verified. Verify before pushing. */
+  | 'RESEARCH_SUPPLIER_UNVERIFIED'
+  /** Supplier availability was verified once but the check is now stale. Re-verify. */
+  | 'RESEARCH_SUPPLIER_STALE'
+  /** Requested variants are unavailable or unverified and the selection was not resolved. */
+  | 'RESEARCH_SUPPLIER_VARIANTS'
   /**
    * A pushed product is in an unsafe state that could not be repaired.
    *
@@ -255,6 +269,12 @@ export function defaultStatusForCode(code: ErrorCode): number {
     case 'RESEARCH_ALREADY_PUSHED':
     // A concurrent operation took the claim over mid-push. Nothing was created.
     case 'PUSH_CLAIM_LOST':
+    // The supplier sourceability gate refused the push. The request was fine; the product
+    // cannot be sourced (or that is unverified) right now.
+    case 'RESEARCH_SUPPLIER_UNAVAILABLE':
+    case 'RESEARCH_SUPPLIER_UNVERIFIED':
+    case 'RESEARCH_SUPPLIER_STALE':
+    case 'RESEARCH_SUPPLIER_VARIANTS':
     case 'INVENTORY_DELTA_TOO_LARGE':
     // Refusing to price is a state conflict, not a bad request: the caller asked
     // for something reasonable and the data is not good enough to do it safely.
@@ -359,6 +379,12 @@ export function defaultRetryableForCode(code: ErrorCode): boolean {
     // Ownership was lost mid-push. The operator must refresh to see who won before
     // retrying; an automatic retry would race the operation that took over.
     case 'PUSH_CLAIM_LOST':
+    // Each needs a human to verify the supplier or resolve variant selection. An
+    // automatic retry would resubmit the same unsourceable decision.
+    case 'RESEARCH_SUPPLIER_UNAVAILABLE':
+    case 'RESEARCH_SUPPLIER_UNVERIFIED':
+    case 'RESEARCH_SUPPLIER_STALE':
+    case 'RESEARCH_SUPPLIER_VARIANTS':
     // A product exists in an unverified state. This needs a person, not a retry.
     case 'RESEARCH_PUSH_SAFETY':
       return false;

@@ -512,6 +512,15 @@ async function recordPushAudit(facts: PushAuditFacts): Promise<void> {
       duplicateMatches: facts.duplicateMatches ?? null,
       duplicateOverridden: facts.duplicateOverridden,
       guardBreachOverridden: facts.guardBreachOverridden,
+      partialVariantsOverridden: facts.partialVariantsOverridden,
+      // Supplier sourceability: the record of WHY this product was believed sourceable.
+      supplierProvider: facts.supplierProvider ?? null,
+      supplierProductId: facts.supplierProductId ?? null,
+      supplierAvailability: facts.supplierAvailability ?? null,
+      supplierAvailabilitySource: facts.supplierAvailabilitySource ?? null,
+      supplierCheckedAt: facts.supplierCheckedAt ?? null,
+      supplierFreshness: facts.supplierFreshness ?? null,
+      supplierVariantCoverage: facts.supplierVariantCoverage ?? null,
     },
     result:
       facts.error !== undefined

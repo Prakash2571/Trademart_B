@@ -57,6 +57,18 @@ import { changedScoreInputs, scoreIsStale } from './candidate.revision';
 import { allowedActions, canTransition, isTerminal } from './candidate.transitions';
 import { computeDecisionHash } from './decision.hash';
 import {
+  computeSourceability,
+  DEFAULT_SOURCEABILITY_CONFIG,
+  type SourceabilityConfig,
+  type SourceabilityResult,
+  type SupplierInfo,
+  type SupplierVariantAvailability,
+} from './sourceability';
+import {
+  validateSupplierVerification,
+  type SupplierVerificationInput,
+} from './supplier.validation';
+import {
   validateCandidateInput as validateCandidateInputRules,
   type CreateCandidateInput as CreateCandidateInputShape,
 } from './candidate.validation';
@@ -111,6 +123,62 @@ function orNull<T>(value: T | null | undefined): T | null {
   return value == null ? null : value;
 }
 
+/** Trims a string, returning null for absent/blank - so a blank input never stores "". */
+function nullableTrim(value: string | null | undefined): string | null {
+  if (value == null) return null;
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
+/**
+ * Maps the stored supplier block, or null when a candidate has never been verified.
+ *
+ * Returns null (not EMPTY_SUPPLIER_INFO) so "never recorded" is distinguishable at the API
+ * from "recorded as UNKNOWN"; computeSourceability treats both as UNKNOWN, but the raw
+ * distinction is preserved for the UI.
+ */
+function toSupplierInfo(row: ProductCandidateDocument['supplier']): SupplierInfo | null {
+  if (row == null) return null;
+  return {
+    provider: (orNull(row.provider) ?? 'UNKNOWN') as SupplierInfo['provider'],
+    supplierProductId: orNull(row.supplierProductId),
+    sourceUrl: orNull(row.sourceUrl),
+    availability: (orNull(row.availability) ?? 'UNKNOWN') as SupplierInfo['availability'],
+    availabilitySource: (orNull(row.availabilitySource) ??
+      'MANUAL') as SupplierInfo['availabilitySource'],
+    checkedAt: orNull(row.checkedAt),
+    observedAt: orNull(row.observedAt),
+    note: orNull(row.note),
+    stockKnown: row.stockKnown ?? false,
+    productAvailable: orNull(row.productAvailable),
+    productCost: orNull(row.productCost),
+    productCurrency: orNull(row.productCurrency),
+    shippingCost: orNull(row.shippingCost),
+    shippingCurrency: orNull(row.shippingCurrency),
+    shippingDays: orNull(row.shippingDays),
+    variants: (row.variants ?? []).map(
+      (variant: NonNullable<ProductCandidateDocument['supplier']>['variants'][number]): SupplierVariantAvailability => ({
+        supplierVariantId: orNull(variant.supplierVariantId),
+        sku: orNull(variant.sku),
+        title: variant.title,
+        optionValues: (variant.optionValues ?? {}) as Record<string, string>,
+        availability: (orNull(variant.availability) ??
+          'UNKNOWN') as SupplierVariantAvailability['availability'],
+        stockKnown: variant.stockKnown ?? false,
+        cost: orNull(variant.cost),
+        currencyCode: orNull(variant.currencyCode),
+        checkedAt: orNull(variant.checkedAt),
+      }),
+    ),
+    evidence: (row.evidence ?? []).map(
+      (entry: NonNullable<ProductCandidateDocument['supplier']>['evidence'][number]) => ({
+        source: entry.source,
+        value: entry.value,
+      }),
+    ),
+  };
+}
+
 function toManualResearch(row: ProductCandidateDocument['manualResearch']): ManualResearchEntry {
   if (row == null) return { ...EMPTY_MANUAL_RESEARCH };
   return {
@@ -160,6 +228,7 @@ function toCandidate(row: ProductCandidateDocument): ProductCandidate {
       costObservedAt: orNull(commercials.costObservedAt),
     },
     manualResearch: toManualResearch(row.manualResearch),
+    supplier: toSupplierInfo(row.supplier),
 
     // Cast rather than re-validated: the schema's enums already constrain these, and
     // re-deriving them here would be a second source of truth for the same union.
@@ -435,6 +504,100 @@ export async function getCandidate(candidateId: string): Promise<ProductCandidat
 }
 
 /* ===========================================================================
+ * Supplier verification
+ * ======================================================================== */
+
+export interface SupplierVerificationResult {
+  candidate: ProductCandidate;
+  sourceability: SourceabilityResult;
+  /** The supplier block before this write, for the audit trail. */
+  previousSupplier: SupplierInfo | null;
+  /** True when the candidate already had a supplier verification (an update, not a first). */
+  wasUpdate: boolean;
+}
+
+/**
+ * Records an operator's supplier (Tradelle) verification onto a candidate.
+ *
+ * This is the ONLY place `checkedAt` is set to now: it stamps the moment a human actually
+ * verified availability, which is what freshness ages from. Opening a page never sets it.
+ *
+ * `availabilitySource` is forced to MANUAL - this endpoint is a human verification, and a
+ * caller cannot claim SHOPIFY_BRIDGE or a (non-existent) DIRECT_API through it. The URL is
+ * stored as evidence and never fetched.
+ */
+export async function recordSupplierVerification(
+  candidateId: string,
+  input: SupplierVerificationInput,
+): Promise<SupplierVerificationResult> {
+  requireDatabase();
+
+  const existing = await getCandidate(candidateId);
+
+  const problems = validateSupplierVerification(input);
+  if (problems.length > 0) {
+    throw new AppError('VALIDATION_ERROR', 'This supplier verification cannot be saved.', {
+      details: { problems },
+    });
+  }
+
+  const now = new Date();
+  const availability = input.availability ?? 'UNKNOWN';
+
+  const supplier: SupplierInfo = {
+    provider: input.provider ?? 'TRADELLE',
+    supplierProductId: nullableTrim(input.supplierProductId),
+    sourceUrl: nullableTrim(input.sourceUrl),
+    availability,
+    // Forced: this endpoint is a human verification, full stop.
+    availabilitySource: 'MANUAL',
+    checkedAt: now.toISOString(),
+    observedAt: nullableTrim(input.observedAt) ?? now.toISOString(),
+    note: nullableTrim(input.note),
+    stockKnown: input.stockKnown ?? availability !== 'UNKNOWN',
+    productAvailable:
+      availability === 'AVAILABLE' ? true : availability === 'UNAVAILABLE' ? false : null,
+    productCost: input.productCost ?? null,
+    productCurrency: nullableTrim(input.productCurrency),
+    shippingCost: input.shippingCost ?? null,
+    shippingCurrency: nullableTrim(input.shippingCurrency),
+    shippingDays: input.shippingDays ?? null,
+    variants: (input.variants ?? []).map(
+      (variant): SupplierVariantAvailability => ({
+        supplierVariantId: nullableTrim(variant.supplierVariantId),
+        sku: nullableTrim(variant.sku),
+        title: variant.title.trim(),
+        optionValues: variant.optionValues ?? {},
+        availability: variant.availability ?? 'UNKNOWN',
+        stockKnown: variant.stockKnown ?? (variant.availability ?? 'UNKNOWN') !== 'UNKNOWN',
+        cost: variant.cost ?? null,
+        currencyCode: nullableTrim(variant.currencyCode),
+        checkedAt: now.toISOString(),
+      }),
+    ),
+    evidence: [
+      { source: 'MANUAL_VERIFICATION', value: 'Operator verified availability in Tradelle' },
+      ...(nullableTrim(input.sourceUrl) === null
+        ? []
+        : [{ source: 'SUPPLIER_URL', value: nullableTrim(input.sourceUrl) as string }]),
+    ],
+  };
+
+  await ProductCandidateModel.updateOne(
+    { shopDomain: shopDomain(), candidateId },
+    { $set: { supplier } },
+  );
+
+  const candidate = await getCandidate(candidateId);
+  return {
+    candidate,
+    sourceability: computeSourceability(supplier, now, sourceabilityConfig()),
+    previousSupplier: existing.supplier,
+    wasUpdate: existing.supplier !== null,
+  };
+}
+
+/* ===========================================================================
  * Store history
  * ======================================================================== */
 
@@ -524,6 +687,8 @@ export interface PreparedAnalysis {
   history: StoreHistorySummary | null;
   /** The policy actually applied, after store settings and any override. */
   policy: PricingPolicy;
+  /** The supplier sourceability verdict, computed with this run's clock. */
+  sourceability: SourceabilityResult;
   /** Binds this exact decision. See decision.hash.ts. */
   decisionHash: string;
   /**
@@ -554,6 +719,8 @@ export interface AnalyzeResult {
   decisionHash: string;
   /** Whether the stored score matches the candidate's current inputs. */
   scoreIsStale: boolean;
+  /** The supplier sourceability verdict at analysis time. */
+  sourceability: SourceabilityResult;
 }
 
 /**
@@ -609,6 +776,11 @@ export async function prepareCandidateAnalysis(
     now,
   });
 
+  // The sourceability verdict, computed once from the stored supplier verification and
+  // this run's clock, then threaded through the gate, the decision hash and the result so
+  // all three describe the same supplier decision.
+  const sourceability = computeSourceability(storedCandidate.supplier, now, sourceabilityConfig());
+
   const freshCandidate = applyAnalysisToCandidate(storedCandidate, analysis, now);
 
   return {
@@ -618,6 +790,7 @@ export async function prepareCandidateAnalysis(
     signals,
     history,
     policy,
+    sourceability,
     /*
      * Prices an arbitrary amount against the same cost model the scenarios used.
      *
@@ -635,9 +808,20 @@ export async function prepareCandidateAnalysis(
       score: analysis.score,
       pricing: analysis.pricing,
       policy,
+      sourceability,
     }),
     now,
   };
+}
+
+/**
+ * The sourceability freshness configuration.
+ *
+ * A function rather than an inlined constant so a future settings-driven threshold has a
+ * single place to plug in. Returns the default today.
+ */
+function sourceabilityConfig(): SourceabilityConfig {
+  return DEFAULT_SOURCEABILITY_CONFIG;
 }
 
 /**
@@ -748,6 +932,7 @@ export async function persistAnalysis(prepared: PreparedAnalysis): Promise<Analy
     ),
     decisionHash: prepared.decisionHash,
     scoreIsStale: scoreIsStale(persisted),
+    sourceability: prepared.sourceability,
   };
 }
 

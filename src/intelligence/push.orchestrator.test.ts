@@ -28,6 +28,7 @@ import {
 import type { ProductCreateRequest } from '../products/product.create';
 import { EMPTY_MANUAL_RESEARCH, type ProductCandidate } from './candidate.types';
 import type { CandidateAnalysis } from './candidate.analysis';
+import type { SourceabilityResult } from './sourceability';
 import { researchIdentityTag } from './push.draft';
 import {
   PUSH_CLAIM_LEASE_MS,
@@ -77,6 +78,7 @@ function candidate(overrides: Partial<ProductCandidate> = {}): ProductCandidate 
       expectedSellingCurrency: 'GBP',
       costObservedAt: NOW_ISO,
     },
+    supplier: null,
     manualResearch: { ...EMPTY_MANUAL_RESEARCH },
     factors: [],
     overallScore: 79,
@@ -144,6 +146,9 @@ function preparedFor(
     freshCandidate: candidateRow,
     analysis,
     policy: pricing.policy,
+    // Default: a fresh, fully-available supplier so existing push tests exercise the happy
+    // path. The supplier-gate tests override `sourceability` with UNAVAILABLE/UNKNOWN/STALE.
+    sourceability: sourceableResult(),
     decisionHash: 'hash-current',
     // The real evaluator, so a hand-typed price faces the SAME floors a scenario does.
     // A stub returning null would make the guard-breach test pass vacuously - it would
@@ -157,6 +162,33 @@ function preparedFor(
         pricing.policy,
         amount,
       ),
+    ...overrides,
+  };
+}
+
+/** A clean, fully-sourceable verdict: AVAILABLE, fresh, full variant coverage. */
+function sourceableResult(overrides: Partial<SourceabilityResult> = {}): SourceabilityResult {
+  return {
+    provider: 'TRADELLE',
+    availability: 'AVAILABLE',
+    availabilitySource: 'MANUAL',
+    checkedAt: NOW.toISOString(),
+    freshness: 'FRESH',
+    current: 'SOURCEABLE',
+    variantCoverage: 'FULL',
+    stockKnown: true,
+    supplierProductId: 'TRD-1',
+    sourceUrl: 'https://tradelle.example/p/1',
+    productCost: 8,
+    productCurrency: 'GBP',
+    shippingCost: 3,
+    shippingCurrency: 'GBP',
+    shippingDays: 8,
+    variants: [],
+    reasons: ['SUPPLIER_AVAILABLE'],
+    pushEligible: true,
+    block: null,
+    confidencePenalty: 0,
     ...overrides,
   };
 }
@@ -225,6 +257,8 @@ function makePorts(config: FakeConfig): {
   costs: CostRequest[];
   createRequests: ProductCreateRequest[];
   intents: PushIntent[];
+  recordIntentTimes: string[];
+  advanceClock: (ms: number) => void;
   world: FakeConfig;
 } {
   const calls: string[] = [];
@@ -232,10 +266,15 @@ function makePorts(config: FakeConfig): {
   const costs: CostRequest[] = [];
   const createRequests: ProductCreateRequest[] = [];
   const intents: PushIntent[] = [];
+  // Timestamps recordIntent was called with, so a test can prove the lease renewal used a
+  // FRESH clock read rather than the operation-start time.
+  const recordIntentTimes: string[] = [];
   // The intent frozen this run; falls back to a preset (a crashed attempt's intent).
   let storedIntent: PushIntent | null = config.pushIntent ?? null;
   let createdCounter = 0;
-  const now = config.now ?? NOW;
+  // A MUTABLE clock, so a test can advance time mid-operation (e.g. during analysis) and
+  // check what timestamp the later steps captured.
+  let clock = config.now ?? NOW;
 
   const failed = new Set<string>();
   function maybeFail(method: string): void {
@@ -258,7 +297,7 @@ function makePorts(config: FakeConfig): {
   let findTagCall = 0;
 
   const ports: PushPorts = {
-    now: () => now,
+    now: () => clock,
 
     candidates: {
       async load(candidateId) {
@@ -324,6 +363,7 @@ function makePorts(config: FakeConfig): {
         if (!owned) return Promise.resolve(false);
         storedIntent = request.intent;
         intents.push(request.intent);
+        recordIntentTimes.push(request.now.toISOString());
         config.row = { ...row, pushClaimedAt: request.now.toISOString() };
         return Promise.resolve(true);
       },
@@ -451,7 +491,19 @@ function makePorts(config: FakeConfig): {
     },
   };
 
-  return { ports, calls, audits, costs, createRequests, intents, world: config };
+  return {
+    ports,
+    calls,
+    audits,
+    costs,
+    createRequests,
+    intents,
+    recordIntentTimes,
+    advanceClock: (ms: number) => {
+      clock = new Date(clock.getTime() + ms);
+    },
+    world: config,
+  };
 }
 
 function input(overrides: Partial<PushAsDraftInput> = {}): PushAsDraftInput {
@@ -1019,6 +1071,12 @@ describe('recovery restores the original decision from the push intent', () => {
       confidenceScore: 61,
       recommendation: 'GOOD_CANDIDATE',
       analyzedInputRevision: 1,
+      supplierProvider: 'TRADELLE',
+      supplierProductId: 'TRD-1',
+      supplierAvailability: 'AVAILABLE',
+      supplierAvailabilitySource: 'MANUAL',
+      supplierAvailabilityCheckedAt: NOW.toISOString(),
+      supplierVariantSnapshot: [],
       createdAt: NOW.toISOString(),
     };
     const fx = makePorts({
@@ -1087,5 +1145,154 @@ describe('a terminal candidate cannot be pushed', () => {
     assert.notEqual(error.code, 'INTERNAL_ERROR');
     assert.equal(count(fx.calls, 'claim'), 0);
     assert.equal(count(fx.calls, 'createProduct'), 0);
+  });
+});
+
+
+/* ===========================================================================
+ * Supplier sourceability gate (Part 11) - nothing reaches Shopify unsourceable
+ * ======================================================================== */
+
+describe('the supplier sourceability gate blocks a push before any Shopify write', () => {
+  it('supplier UNAVAILABLE => RESEARCH_SUPPLIER_UNAVAILABLE, createProduct = 0', async () => {
+    const fx = makePorts({
+      row: candidate(),
+      prepared: preparedFor(candidate(), {
+        sourceability: sourceableResult({
+          availability: 'UNAVAILABLE',
+          current: 'NOT_SOURCEABLE',
+          pushEligible: false,
+          block: 'SUPPLIER_UNAVAILABLE',
+          reasons: ['SUPPLIER_UNAVAILABLE'],
+        }),
+      }),
+    });
+    const error = await expectAppError(pushCandidateAsDraft(fx.ports, 'cand-1', input()));
+    assert.equal(error.code, 'RESEARCH_SUPPLIER_UNAVAILABLE');
+    assert.equal(count(fx.calls, 'createProduct'), 0);
+    // It claimed and prepared, then released cleanly - no product, so the claim is freed.
+    assert.equal(count(fx.calls, 'release'), 1);
+  });
+
+  it('supplier UNKNOWN => RESEARCH_SUPPLIER_UNVERIFIED, createProduct = 0', async () => {
+    const fx = makePorts({
+      row: candidate(),
+      prepared: preparedFor(candidate(), {
+        sourceability: sourceableResult({
+          availability: 'UNKNOWN',
+          current: 'UNVERIFIED',
+          pushEligible: false,
+          block: 'SUPPLIER_AVAILABILITY_UNKNOWN',
+          reasons: ['SUPPLIER_AVAILABILITY_UNKNOWN', 'SUPPLIER_CHECK_REQUIRED'],
+        }),
+      }),
+    });
+    const error = await expectAppError(pushCandidateAsDraft(fx.ports, 'cand-1', input()));
+    assert.equal(error.code, 'RESEARCH_SUPPLIER_UNVERIFIED');
+    assert.equal(count(fx.calls, 'createProduct'), 0);
+  });
+
+  it('supplier AVAILABLE but STALE => RESEARCH_SUPPLIER_STALE, createProduct = 0', async () => {
+    const fx = makePorts({
+      row: candidate(),
+      prepared: preparedFor(candidate(), {
+        sourceability: sourceableResult({
+          availability: 'AVAILABLE',
+          freshness: 'STALE',
+          current: 'NEEDS_RECHECK',
+          pushEligible: false,
+          block: 'SUPPLIER_AVAILABILITY_STALE',
+          reasons: ['SUPPLIER_AVAILABILITY_STALE', 'SUPPLIER_CHECK_REQUIRED'],
+        }),
+      }),
+    });
+    const error = await expectAppError(pushCandidateAsDraft(fx.ports, 'cand-1', input()));
+    assert.equal(error.code, 'RESEARCH_SUPPLIER_STALE');
+    assert.equal(count(fx.calls, 'createProduct'), 0);
+  });
+
+  it('a fresh manual verification lets the push proceed', async () => {
+    const fx = makePorts({ row: candidate() }); // preparedFor defaults to SOURCEABLE
+    const result = await pushCandidateAsDraft(fx.ports, 'cand-1', input());
+    assert.equal(result.outcome, 'CREATED');
+    assert.equal(count(fx.calls, 'createProduct'), 1);
+  });
+});
+
+describe('the variant gate never silently creates unavailable variants', () => {
+  const partial = () =>
+    preparedFor(candidate(), {
+      sourceability: sourceableResult({
+        current: 'PARTIALLY_SOURCEABLE',
+        variantCoverage: 'PARTIAL',
+        reasons: ['SUPPLIER_AVAILABLE', 'SUPPLIER_VARIANTS_PARTIALLY_AVAILABLE'],
+        variants: [
+          { supplierVariantId: 'v1', sku: 'A', title: 'Black / M', optionValues: {}, availability: 'AVAILABLE', stockKnown: true, cost: null, currencyCode: null, checkedAt: NOW.toISOString() },
+          { supplierVariantId: 'v2', sku: 'B', title: 'Black / L', optionValues: {}, availability: 'UNAVAILABLE', stockKnown: true, cost: null, currencyCode: null, checkedAt: NOW.toISOString() },
+        ],
+      }),
+    });
+
+  it('blocks a PARTIAL coverage push until the operator acknowledges it', async () => {
+    const fx = makePorts({ row: candidate(), prepared: partial() });
+    const error = await expectAppError(pushCandidateAsDraft(fx.ports, 'cand-1', input()));
+    assert.equal(error.code, 'RESEARCH_SUPPLIER_VARIANTS');
+    assert.equal(count(fx.calls, 'createProduct'), 0);
+  });
+
+  it('proceeds when partial coverage is explicitly acknowledged', async () => {
+    const fx = makePorts({ row: candidate(), prepared: partial() });
+    const result = await pushCandidateAsDraft(
+      fx.ports,
+      'cand-1',
+      input({ acknowledgePartialVariants: true }),
+    );
+    assert.equal(result.outcome, 'CREATED');
+    assert.equal(count(fx.calls, 'createProduct'), 1);
+    assert.ok(result.warnings.some((warning) => /variant/i.test(warning)));
+  });
+});
+
+describe('supplier state is frozen into the push intent', () => {
+  it('records the supplier snapshot in the intent before the Shopify create', async () => {
+    const fx = makePorts({
+      row: candidate(),
+      prepared: preparedFor(candidate(), {
+        sourceability: sourceableResult({ supplierProductId: 'TRD-777', availability: 'AVAILABLE' }),
+      }),
+    });
+    await pushCandidateAsDraft(fx.ports, 'cand-1', input());
+    assert.equal(fx.intents.length, 1);
+    assert.equal(fx.intents[0]?.supplierProvider, 'TRADELLE');
+    assert.equal(fx.intents[0]?.supplierProductId, 'TRD-777');
+    assert.equal(fx.intents[0]?.supplierAvailability, 'AVAILABLE');
+    assert.equal(fx.intents[0]?.supplierAvailabilitySource, 'MANUAL');
+    // ...and the audit records it too.
+    assert.equal(fx.audits[0]?.supplierAvailability, 'AVAILABLE');
+    assert.equal(fx.audits[0]?.supplierProductId, 'TRD-777');
+  });
+});
+
+/* ===========================================================================
+ * Lease renewal uses a FRESH clock (Part 19)
+ * ======================================================================== */
+
+describe('lease renewal is stamped with the current clock, not operation start', () => {
+  it('recordIntent uses the time it actually runs, even if analysis was slow', async () => {
+    let advance: (ms: number) => void = () => {};
+    const fx = makePorts({
+      row: candidate(),
+      // Simulate analysis taking longer than the lease (2 min): jump 2m05s during prepare.
+      interfereOnce: { prepare: () => advance(125_000) },
+    });
+    advance = fx.advanceClock;
+
+    await pushCandidateAsDraft(fx.ports, 'cand-1', input());
+
+    // The claim was taken at 12:00:00; analysis pushed the clock to 12:02:05; the lease
+    // renewal must be stamped 12:02:05, NOT the operation-start 12:00:00 (the old bug).
+    assert.equal(fx.recordIntentTimes.length, 1);
+    assert.equal(fx.recordIntentTimes[0], new Date(NOW.getTime() + 125_000).toISOString());
+    assert.notEqual(fx.recordIntentTimes[0], NOW.toISOString());
   });
 });

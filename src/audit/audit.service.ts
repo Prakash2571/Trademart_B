@@ -60,6 +60,10 @@ export type AuditAction =
   | 'RESEARCH_ANALYZE'
   | 'RESEARCH_WATCH'
   | 'RESEARCH_REJECT'
+  /** An operator recorded supplier availability for a candidate (Tradelle verification). */
+  | 'RESEARCH_SUPPLIER_VERIFY'
+  /** An operator amended a candidate's existing supplier verification. */
+  | 'RESEARCH_SUPPLIER_UPDATE'
   /**
    * A DRAFT product was created in Shopify from a candidate.
    *

@@ -58,6 +58,7 @@ import type {
   PushPorts,
   ShopifyProductState,
 } from './push.ports';
+import type { SourceabilityResult } from './sourceability';
 
 /**
  * How long a push claim is honoured before another operation may take it over.
@@ -92,6 +93,12 @@ export interface PushAsDraftInput {
    * operator who meant to accept a duplicate also silently accept a loss-making price.
    */
   acknowledgeGuardBreach?: boolean;
+  /**
+   * Proceed despite PARTIAL supplier variant coverage, creating the draft for the
+   * available coverage only. Explicit and separate, like acknowledgeGuardBreach - it is a
+   * different decision, and the unavailable variants are never created regardless.
+   */
+  acknowledgePartialVariants?: boolean;
   /**
    * Identifies this logical push. Sourced from the Idempotency-Key header when present.
    *
@@ -310,6 +317,64 @@ async function pushWithClaim(
     );
   }
 
+  // ---- 6b. supplier sourceability gate ------------------------------------
+  //
+  // A product is not sellable merely because the market looks good; it must be SOURCEABLE.
+  // This gate runs before any Shopify write, so a refusal creates nothing. Tradelle is
+  // MANUAL/SHOPIFY_BRIDGE only - there is no live API to re-poll here - so the gate relies
+  // on the recorded verification and its freshness, exactly as computed into the decision
+  // hash above (a stale or changed verdict already fails the hash check for a reviewing
+  // operator; this gate also catches an internal caller that sent no hash).
+  const sourceability = prepared.sourceability;
+  if (sourceability.block === 'SUPPLIER_UNAVAILABLE') {
+    throw new AppError(
+      'RESEARCH_SUPPLIER_UNAVAILABLE',
+      sourceability.variantCoverage === 'NONE'
+        ? 'The supplier offers this product but none of its variants are available, so nothing was created. It cannot be sourced right now.'
+        : 'The supplier has this product marked as unavailable, so nothing was created. A product that cannot be sourced is never pushed, however strong the market looks.',
+      { details: { candidateId, reasons: sourceability.reasons } },
+    );
+  }
+  if (sourceability.block === 'SUPPLIER_AVAILABILITY_UNKNOWN') {
+    throw new AppError(
+      'RESEARCH_SUPPLIER_UNVERIFIED',
+      'This product has not been verified as sourceable from the supplier, so nothing was created. Record a supplier verification (or confirm availability in Tradelle) before pushing.',
+      { details: { candidateId, reasons: sourceability.reasons } },
+    );
+  }
+  if (sourceability.block === 'SUPPLIER_AVAILABILITY_STALE') {
+    throw new AppError(
+      'RESEARCH_SUPPLIER_STALE',
+      `Supplier availability was verified once but the check is now stale (${sourceability.freshness}), so nothing was created. Re-verify the product is currently available from the supplier before pushing.`,
+      { details: { candidateId, checkedAt: sourceability.checkedAt, reasons: sourceability.reasons } },
+    );
+  }
+  /*
+   * Partial variant coverage never creates unavailable/unknown variants silently. The
+   * draft builder makes a single default variant, so "resolving" the selection here is an
+   * explicit acknowledgement that the operator has chosen to proceed with the available
+   * coverage; without it the push is blocked for review.
+   */
+  if (sourceability.variantCoverage === 'PARTIAL' && input.acknowledgePartialVariants !== true) {
+    throw new AppError(
+      'RESEARCH_SUPPLIER_VARIANTS',
+      'Some of this product\u2019s variants are unavailable or unverified at the supplier, so nothing was created. Review the variant coverage and acknowledge it to proceed with the available variants only.',
+      {
+        details: {
+          candidateId,
+          variantCoverage: sourceability.variantCoverage,
+          variants: sourceability.variants,
+          reasons: sourceability.reasons,
+        },
+      },
+    );
+  }
+  if (sourceability.variantCoverage === 'PARTIAL') {
+    warnings.push(
+      'Some supplier variants are unavailable or unverified. You acknowledged this, and the draft was created for the available coverage only - it does not advertise the unavailable variants.',
+    );
+  }
+
   // ---- 7. duplicates ------------------------------------------------------
   const duplicates = await checkDuplicates(ports, candidate);
   if (duplicates.blocking.length > 0 && input.allowDuplicate !== true) {
@@ -375,11 +440,16 @@ async function pushWithClaim(
   //      returns false. This is the gate that closes the lease-expiry race: operation A,
   //      resuming after B took over, cannot create a product because it no longer owns the
   //      claim.
-  const intent = buildPushIntent(input, candidate, listedPrice, prepared, now);
+  // A FRESH clock read for the lease renewal. Using the operation-start `now` here was a
+  // bug: if the analysis and gates above took longer than the lease, the "renewed" lease
+  // would already be expired the instant it was written. The renewal must be stamped with
+  // the time it actually happens.
+  const renewalNow = ports.now();
+  const intent = buildPushIntent(input, candidate, listedPrice, prepared, renewalNow);
   const stillOwned = await ports.candidates.recordIntent({
     candidateId,
     operationId: input.operationId,
-    now,
+    now: renewalNow,
     leaseMs: PUSH_CLAIM_LEASE_MS,
     intent,
   });
@@ -436,12 +506,17 @@ async function pushWithClaim(
   // would have left a score history entry for a push that then failed.
   await ports.analysis.persist(prepared);
 
+  // A fresh clock read: completion happened now, after the Shopify create and the
+  // bookkeeping, not at operation start. pushedAt should record when the product was
+  // actually finalised.
+  const completionNow = ports.now();
+
   if (safety.incident === null) {
     const owned = await ports.candidates.markSucceeded({
       candidateId,
       operationId: input.operationId,
       shopifyProductId: product.shopifyProductId,
-      now,
+      now: completionNow,
     });
     if (!owned) {
       /*
@@ -462,7 +537,7 @@ async function pushWithClaim(
       operationId: input.operationId,
       shopifyProductId: product.shopifyProductId,
       reason: safety.incident,
-      now,
+      now: completionNow,
     });
   }
 
@@ -485,6 +560,7 @@ async function pushWithClaim(
     shippingCost: candidate.commercials.shippingCost,
     shippingCurrency: candidate.commercials.shippingCurrency,
     duplicateMatches: duplicates.matches.length,
+    ...supplierAuditFacts(sourceability),
     productState: safety.state,
     costRecorded,
     safetyIncident: safety.incident,
@@ -618,6 +694,13 @@ async function reconcileExisting(
     supplierCurrency: intent?.supplierCurrency ?? null,
     shippingCost: intent?.shippingCost ?? null,
     shippingCurrency: intent?.shippingCurrency ?? null,
+    // Supplier facts from the ORIGINAL frozen intent, not recomputed now - recovery must
+    // record why the product was believed sourceable when it was created.
+    supplierProvider: intent?.supplierProvider ?? null,
+    supplierProductId: intent?.supplierProductId ?? null,
+    supplierAvailability: intent?.supplierAvailability ?? null,
+    supplierAvailabilitySource: intent?.supplierAvailabilitySource ?? null,
+    supplierCheckedAt: intent?.supplierAvailabilityCheckedAt ?? null,
     productState: safety.state,
     costRecorded,
     safetyIncident: safety.incident,
@@ -685,6 +768,14 @@ function buildPushIntent(
     confidenceScore: candidate.confidenceScore,
     recommendation: candidate.recommendation,
     analyzedInputRevision: candidate.analyzedInputRevision,
+    // Why Trademart believed this product was sourceable at create time. Frozen so
+    // recovery reports the real basis rather than recomputing a later verdict.
+    supplierProvider: prepared.sourceability.provider,
+    supplierProductId: prepared.sourceability.supplierProductId,
+    supplierAvailability: prepared.sourceability.availability,
+    supplierAvailabilitySource: prepared.sourceability.availabilitySource,
+    supplierAvailabilityCheckedAt: prepared.sourceability.checkedAt,
+    supplierVariantSnapshot: prepared.sourceability.variants,
     createdAt: now.toISOString(),
   };
 }
@@ -987,12 +1078,40 @@ async function recordCost(
 
 function auditDefaults(input: PushAsDraftInput): Pick<
   PushAuditFacts,
-  'selectedScenario' | 'duplicateOverridden' | 'guardBreachOverridden'
+  | 'selectedScenario'
+  | 'duplicateOverridden'
+  | 'guardBreachOverridden'
+  | 'partialVariantsOverridden'
 > {
   return {
     selectedScenario: input.scenario ?? null,
     duplicateOverridden: input.allowDuplicate === true,
     guardBreachOverridden: input.acknowledgeGuardBreach === true,
+    partialVariantsOverridden: input.acknowledgePartialVariants === true,
+  };
+}
+
+/** The supplier facts for the audit trail, from a sourceability verdict. */
+function supplierAuditFacts(
+  sourceability: SourceabilityResult,
+): Pick<
+  PushAuditFacts,
+  | 'supplierProvider'
+  | 'supplierProductId'
+  | 'supplierAvailability'
+  | 'supplierAvailabilitySource'
+  | 'supplierCheckedAt'
+  | 'supplierFreshness'
+  | 'supplierVariantCoverage'
+> {
+  return {
+    supplierProvider: sourceability.provider,
+    supplierProductId: sourceability.supplierProductId,
+    supplierAvailability: sourceability.availability,
+    supplierAvailabilitySource: sourceability.availabilitySource,
+    supplierCheckedAt: sourceability.checkedAt,
+    supplierFreshness: sourceability.freshness,
+    supplierVariantCoverage: sourceability.variantCoverage,
   };
 }
 

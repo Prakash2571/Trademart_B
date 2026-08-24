@@ -29,6 +29,14 @@ import {
   type PricingScenarioName,
 } from '../pricing/recommendation';
 import type { ManualResearchEntry, ProductCandidate, TargetMarket } from './candidate.types';
+import {
+  applySourceabilityGate,
+  computeSourceability,
+  DEFAULT_SOURCEABILITY_CONFIG,
+  type SourceabilityConfig,
+  type SourceabilityResult,
+} from './sourceability';
+// applySourceabilityGate + computeSourceability are used by finalRecommendationOf below.
 import type { ResearchSignals } from './providers/provider.types';
 import { scoreCandidate, type CandidateScore, type ScoringOptions } from './scoring/scoring.service';
 import type { ScoringInput } from './scoring/scoring.types';
@@ -223,6 +231,16 @@ export function applyAnalysisToCandidate(
 ): ProductCandidate {
   const { score } = analysis;
 
+  /*
+   * Stores the OPPORTUNITY recommendation and its raw data confidence, unchanged.
+   *
+   * The sourceability GATE is applied at READ/decision/push time, not baked into the stored
+   * recommendation - see finalRecommendationOf. Keeping the stored value the pure
+   * opportunity verdict means the final recommendation is always computed against the
+   * CURRENT supplier state (which ages between analyses), rather than a snapshot that would
+   * silently go stale, and it keeps overallScore/recommendation meaning exactly what they
+   * meant before this phase.
+   */
   return {
     ...candidate,
     factors: score.factors,
@@ -240,6 +258,43 @@ export function applyAnalysisToCandidate(
     // operator's own decision (WATCHING, REJECTED, PUSHED_TO_SHOPIFY) must never be
     // overwritten by a recalculation.
   };
+}
+
+/**
+ * The FINAL, sourceability-gated recommendation for display and decision.
+ *
+ * Computed from the stored OPPORTUNITY recommendation plus the CURRENT sourceability, so it
+ * always reflects live supplier freshness rather than a snapshot. This is the number the
+ * shortlist, the detail page, the decision endpoint and the push confirmation all show.
+ */
+export function finalRecommendationOf(
+  candidate: Pick<
+    ProductCandidate,
+    'overallScore' | 'confidenceScore' | 'recommendation' | 'supplier'
+  >,
+  now: Date,
+  config: SourceabilityConfig = DEFAULT_SOURCEABILITY_CONFIG,
+): { sourceability: SourceabilityResult; gate: ReturnType<typeof applySourceabilityGate> } {
+  const sourceability = computeSourceability(candidate.supplier, now, config);
+  const gate = applySourceabilityGate(
+    { recommendation: candidate.recommendation, confidenceScore: candidate.confidenceScore ?? 0 },
+    sourceability,
+  );
+  return { sourceability, gate };
+}
+
+/**
+ * The current sourceability verdict for a candidate.
+ *
+ * A thin re-export so callers that only need the verdict (the controller for display, the
+ * push gate) do not each reach into sourceability.ts with the candidate's supplier field.
+ */
+export function sourceabilityOf(
+  candidate: Pick<ProductCandidate, 'supplier'>,
+  now: Date,
+  config: SourceabilityConfig = DEFAULT_SOURCEABILITY_CONFIG,
+): SourceabilityResult {
+  return computeSourceability(candidate.supplier, now, config);
 }
 
 /**

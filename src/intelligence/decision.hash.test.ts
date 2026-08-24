@@ -30,9 +30,34 @@ import {
 } from './decision.hash';
 import { scoreCandidate, type CandidateScore } from './scoring/scoring.service';
 import type { ScoringInput } from './scoring/scoring.types';
+import { computeSourceability, type SupplierInfo } from './sourceability';
 
 const NOW = new Date('2026-06-15T12:00:00.000Z');
 const OBSERVED = '2026-06-14T00:00:00.000Z';
+
+/** A fresh, fully-available manual supplier verification. */
+function availableSupplier(overrides: Partial<SupplierInfo> = {}): SupplierInfo {
+  return {
+    provider: 'TRADELLE',
+    supplierProductId: 'TRD-1',
+    sourceUrl: 'https://tradelle.example/p/1',
+    availability: 'AVAILABLE',
+    availabilitySource: 'MANUAL',
+    checkedAt: NOW.toISOString(),
+    observedAt: NOW.toISOString(),
+    note: null,
+    stockKnown: true,
+    productAvailable: true,
+    productCost: 8,
+    productCurrency: 'GBP',
+    shippingCost: 3,
+    shippingCurrency: 'GBP',
+    shippingDays: 8,
+    variants: [],
+    evidence: [],
+    ...overrides,
+  };
+}
 
 function candidate(overrides: Partial<ProductCandidate> = {}): ProductCandidate {
   return {
@@ -55,6 +80,7 @@ function candidate(overrides: Partial<ProductCandidate> = {}): ProductCandidate 
       expectedSellingCurrency: 'GBP',
       costObservedAt: OBSERVED,
     },
+    supplier: null,
     manualResearch: {
       ...EMPTY_MANUAL_RESEARCH,
       averageMonthlySearches: 12_000,
@@ -147,6 +173,7 @@ function decision(
     score: scoreFor(subject, now),
     pricing: pricingFor(subject, policy),
     policy,
+    sourceability: computeSourceability(subject.supplier, now),
   };
 }
 
@@ -173,6 +200,7 @@ describe('the hash is deterministic', () => {
       pricing: base.pricing,
       score: base.score,
       candidate: base.candidate,
+      sourceability: base.sourceability,
     };
     assert.equal(computeDecisionHash(base), computeDecisionHash(reordered));
   });
@@ -400,6 +428,59 @@ describe('material changes move the hash', () => {
       },
     };
     assert.notEqual(computeDecisionHash(bumped), base);
+  });
+
+  it('supplier availability going from AVAILABLE to UNAVAILABLE', () => {
+    // The heart of Part 17: a candidate the operator approved as sourceable becoming
+    // unsourceable must invalidate the decision, so the push refuses rather than creating
+    // a product on a sourcing assumption that no longer holds.
+    const available = computeDecisionHash(decision(candidate({ supplier: availableSupplier() })));
+    const unavailable = computeDecisionHash(
+      decision(candidate({ supplier: availableSupplier({ availability: 'UNAVAILABLE' }) })),
+    );
+    assert.notEqual(available, unavailable);
+  });
+
+  it('a supplier check going stale between review and push', () => {
+    const fresh = computeDecisionHash(
+      decision(candidate({ supplier: availableSupplier() }), DEFAULT_PRICING_POLICY, NOW),
+    );
+    // Same candidate, same checkedAt, but evaluated 10 days later: the freshness-aware
+    // verdict (current) has moved to NEEDS_RECHECK, which the hash includes.
+    const later = computeDecisionHash(
+      decision(
+        candidate({ supplier: availableSupplier() }),
+        DEFAULT_PRICING_POLICY,
+        new Date(NOW.getTime() + 10 * 24 * 3_600_000),
+      ),
+    );
+    assert.notEqual(fresh, later);
+  });
+
+  it('a supplier variant becoming unavailable', () => {
+    const full = computeDecisionHash(
+      decision(
+        candidate({
+          supplier: availableSupplier({
+            variants: [
+              { supplierVariantId: 'v1', sku: 'A', title: 'Black / M', optionValues: {}, availability: 'AVAILABLE', stockKnown: true, cost: null, currencyCode: null, checkedAt: NOW.toISOString() },
+            ],
+          }),
+        }),
+      ),
+    );
+    const partial = computeDecisionHash(
+      decision(
+        candidate({
+          supplier: availableSupplier({
+            variants: [
+              { supplierVariantId: 'v1', sku: 'A', title: 'Black / M', optionValues: {}, availability: 'UNAVAILABLE', stockKnown: true, cost: null, currencyCode: null, checkedAt: NOW.toISOString() },
+            ],
+          }),
+        }),
+      ),
+    );
+    assert.notEqual(full, partial);
   });
 });
 
