@@ -1,107 +1,514 @@
 /**
- * Push as Draft: a candidate becomes a Shopify DRAFT product.
+ * Wiring the push orchestration to the real world.
  *
- * IT NEVER PUBLISHES. NOT EVEN OPTIONALLY.
- * ---------------------------------------
- * There is no `publish` parameter on this module's surface, and there is no
- * [Auto Publish] anywhere behind it. createProduct() is always called with
- * status DRAFT and publish false, and that is asserted rather than merely intended -
- * see assertDraftOnly(). A research module that could publish would let a scored
- * guess reach customers without a human ever looking at the listing.
+ * The decision sequence lives in push.orchestrator.ts, which takes its outside world as an
+ * argument. This module supplies that world: config, Mongo, Shopify, the audit trail. It
+ * contains no ordering decisions and no refusals of its own, which is deliberate - every
+ * invariant worth testing is in the orchestrator, where a test can substitute these ports
+ * and assert that createProduct was called exactly once.
  *
- * Publishing remains a separate, deliberate action through the existing
- * publications module, performed by an operator who has read the draft.
- *
- * IT REUSES THE EXISTING CREATE PATH
- * ----------------------------------
- * products.create.service.createProduct() is called unchanged. That function already
- * knows how to build a product, attach media, create variants, and - importantly - how
- * to leave a safe DRAFT behind when variant creation fails rather than orphaning a
- * half-built product. Re-implementing product creation here would mean two code paths
- * writing products to Shopify, which is exactly what the brief forbids and exactly how
- * one of them ends up missing a safety check the other has.
- *
- * IT CLOSES THE COST LOOP
+ * IT STILL CANNOT PUBLISH
  * -----------------------
- * The candidate's hand-entered supplier cost is written to the created variant through
- * upsertManualCost(), so the moment the draft exists the order view, the margin
- * calculation and the automation engine all see the same cost the research decision was
- * made on. Without this the operator would have to type the cost in twice, and the two
- * copies would diverge.
+ * The ports it provides are the specific operations the orchestration needs. There is a
+ * `forceHidden` port and there is deliberately NO publish port, so the orchestration
+ * cannot make a product visible even by accident. forceHidden is composed from the
+ * existing hide primitives - set status DRAFT, remove sales-channel publications - and an
+ * emergency unpublish is not a publish capability: the direction of the operation is what
+ * makes that true, not the name.
  */
 
-import { AppError } from '../common/errors';
-import { logger } from '../common/logger';
 import { recordAudit } from '../audit/audit.service';
+import { logger } from '../common/logger';
+import { AppError } from '../common/errors';
 import { config } from '../config';
 import { getDatabaseStatus } from '../database/mongo';
 import { ProductCandidateModel } from '../database/models/ProductCandidate';
-import type { PricingScenarioName } from '../pricing/recommendation';
-import { createProduct, type ProductCreateResult } from '../products/products.create.service';
+import { createProduct } from '../products/products.create.service';
+import { editProduct } from '../products/products.write.service';
+import { getProductVisibility, unpublishProduct } from '../shopify/publications/publications.service';
 import { listProducts } from '../shopify/shopify.service';
 import { upsertManualCost } from '../suppliers/manualCost.service';
-import { canPush, type ProductCandidate } from './candidate.types';
+import type { ProductCandidate } from './candidate.types';
+import type { DuplicateReport, ExistingProductRef } from './duplicate.detection';
 import {
-  detectDuplicates,
-  type DuplicateReport,
-  type ExistingCandidateRef,
-  type ExistingProductRef,
-} from './duplicate.detection';
-import { analyzeCandidate, getCandidate, listCandidates } from './intelligence.service';
+  getCandidate,
+  listCandidates,
+  persistAnalysis,
+  prepareCandidateAnalysis,
+} from './intelligence.service';
+import { detectDuplicates } from './duplicate.detection';
+import { researchIdentityTag } from './push.draft';
+import type {
+  ClaimRequest,
+  CompletionRequest,
+  CostRequest,
+  ExistingResearchProduct,
+  IncidentRequest,
+  PushAuditFacts,
+  PushPorts,
+  ShopifyProductState,
+} from './push.ports';
 import {
-  assertDraftOnly,
-  buildDraftRequest,
-  resolveListingPrice,
-  type ResolvedListingPrice,
-} from './push.draft';
+  pushCandidateAsDraft as orchestratePush,
+  type PushAsDraftInput,
+  type PushAsDraftResult,
+} from './push.orchestrator';
 
-/** Shopify's hard page limit. One page: duplicate detection is advisory, not exhaustive. */
+export type { PushAsDraftInput, PushAsDraftResult } from './push.orchestrator';
+export { PUSH_CLAIM_LEASE_MS } from './push.orchestrator';
+
+/** Shopify's hard page limit. One page: the duplicate check is advisory. */
 const CATALOGUE_PAGE_SIZE = 250;
 
+function shopDomain(): string {
+  return config.shopify.storeDomain;
+}
+
 /* ===========================================================================
- * Duplicate check
+ * The atomic claim
  * ======================================================================== */
 
 /**
- * Checks a candidate for duplicates without pushing anything.
+ * Takes the push claim in ONE conditional write.
  *
- * Exposed separately so the UI can warn BEFORE the operator clicks push. A duplicate
- * warning that only appears after the product exists is useless.
+ * The filter is the mutex. A read-then-write would let two operations both observe IDLE
+ * and both proceed to create a product; because the expected state is in the FILTER,
+ * exactly one findOneAndUpdate can match and the loser gets null.
+ *
+ * Three ways to match, and each is deliberate:
+ *
+ *   IDLE                        the normal case
+ *   IN_PROGRESS, same operation the caller is resuming its own work. The idempotency
+ *                               middleware deletes its key on a 5xx, so a client retrying
+ *                               with the same Idempotency-Key arrives as a fresh request
+ *                               with the same operation id and must not be locked out by
+ *                               its own previous attempt
+ *   IN_PROGRESS, lease expired  the owning process died. Safe ONLY because the
+ *                               orchestration then looks the candidate up in Shopify by
+ *                               its research tag before creating anything
+ *
+ * `pushedShopifyProductId: null` is also in the filter, so a candidate that already has a
+ * product can never be claimed regardless of what pushState says.
+ *
+ * This is the same shape as the webhook queue's lease claim, which is the existing
+ * crash-recoverable claim in this codebase.
  */
-export async function checkForDuplicates(candidateId: string): Promise<DuplicateReport> {
-  const candidate = await getCandidate(candidateId);
-  return duplicateReportFor(candidate);
+async function claimPush(request: ClaimRequest): Promise<ProductCandidate | null> {
+  const leaseCutoff = new Date(request.now.getTime() - request.leaseMs).toISOString();
+
+  const claimed = await ProductCandidateModel.findOneAndUpdate(
+    {
+      shopDomain: shopDomain(),
+      candidateId: request.candidateId,
+      pushedShopifyProductId: null,
+      $or: [
+        { pushState: 'IDLE' },
+        { pushState: { $exists: false } },
+        { pushState: 'IN_PROGRESS', pushOperationId: request.operationId },
+        { pushState: 'IN_PROGRESS', pushClaimedAt: { $lte: leaseCutoff } },
+        { pushState: 'IN_PROGRESS', pushClaimedAt: null },
+      ],
+    },
+    {
+      $set: {
+        pushState: 'IN_PROGRESS',
+        pushOperationId: request.operationId,
+        pushClaimedAt: request.now.toISOString(),
+      },
+    },
+    { new: true },
+  ).lean();
+
+  if (claimed === null) return null;
+
+  logger.info('Research push claim taken.', {
+    candidateId: request.candidateId,
+    operationId: request.operationId,
+  });
+
+  // Re-read through the normal mapping so the orchestration sees the same DTO shape every
+  // other caller does, rather than a raw lean row.
+  return getCandidate(request.candidateId);
 }
 
-async function duplicateReportFor(candidate: ProductCandidate): Promise<DuplicateReport> {
-  let products: ExistingProductRef[] = [];
+/** Releases a claim, only if this operation still owns it. */
+async function releaseClaim(request: {
+  candidateId: string;
+  operationId: string;
+}): Promise<void> {
+  const result = await ProductCandidateModel.updateOne(
+    {
+      shopDomain: shopDomain(),
+      candidateId: request.candidateId,
+      pushState: 'IN_PROGRESS',
+      // Guards against releasing a claim that has since been taken over by a recovery
+      // operation. Releasing someone else's claim would let a third push start.
+      pushOperationId: request.operationId,
+    },
+    { $set: { pushState: 'IDLE', pushOperationId: null, pushClaimedAt: null } },
+  );
 
+  if (result.modifiedCount > 0) {
+    logger.info('Research push claim released.', request);
+  }
+}
+
+async function markSucceeded(request: CompletionRequest): Promise<void> {
+  await ProductCandidateModel.updateOne(
+    { shopDomain: shopDomain(), candidateId: request.candidateId },
+    {
+      $set: {
+        status: 'PUSHED_TO_SHOPIFY',
+        pushState: 'SUCCEEDED',
+        pushOperationId: request.operationId,
+        pushClaimedAt: null,
+        pushedShopifyProductId: request.shopifyProductId,
+        pushedAt: request.now.toISOString(),
+      },
+    },
+  );
+}
+
+/**
+ * Records that a product exists in a state Trademart could not verify as hidden.
+ *
+ * The Shopify product id is written even though this is a failure, because the id is the
+ * only thing that stops a retry creating a second product - and it is what a human needs
+ * to go and fix it.
+ */
+async function markSafetyIncident(request: IncidentRequest): Promise<void> {
+  logger.error('Research push left a product in an unverified visibility state.', {
+    candidateId: request.candidateId,
+    shopifyProductId: request.shopifyProductId,
+    reason: request.reason,
+  });
+
+  await ProductCandidateModel.updateOne(
+    { shopDomain: shopDomain(), candidateId: request.candidateId },
+    {
+      $set: {
+        // Status still records that a product exists, so the candidate cannot be pushed
+        // again or treated as a pre-product candidate.
+        status: 'PUSHED_TO_SHOPIFY',
+        pushState: 'SAFETY_INCIDENT',
+        pushOperationId: request.operationId,
+        pushClaimedAt: null,
+        pushedShopifyProductId: request.shopifyProductId,
+        pushedAt: request.now.toISOString(),
+        pushSafetyReason: request.reason,
+      },
+    },
+  );
+}
+
+/* ===========================================================================
+ * Shopify
+ * ======================================================================== */
+
+/**
+ * Finds a product carrying this candidate's research identity tag.
+ *
+ * An EXACT lookup, in two steps. Shopify's `tag:` search is the fast path, and the tag is
+ * then CONFIRMED against the returned product's own tag list - Shopify's search is a
+ * search, and adopting a product on a near-match would be worse than duplicating one.
+ *
+ * `first: 2` so more than one match is detectable. Two products sharing a candidate's
+ * identity means an earlier duplicate already happened, and silently picking the first
+ * would hide it.
+ */
+async function findByResearchTag(candidateId: string): Promise<ExistingResearchProduct | null> {
+  const tag = researchIdentityTag(candidateId);
+
+  let matches;
   try {
-    const page = await listProducts({ first: CATALOGUE_PAGE_SIZE });
-    products = page.items.map((product) => ({
-      shopifyProductId: product.shopifyProductId,
-      title: product.title,
-      status: product.status,
-      tags: product.tags,
-    }));
+    const page = await listProducts({ first: 2, query: `tag:"${tag}"` });
+    matches = page.items.filter((product) => product.tags.includes(tag));
   } catch (error) {
-    // Degrades to candidate-only checking. Refusing the whole push because the catalogue
-    // could not be read would block legitimate work over an advisory check - but the
-    // reduced coverage is reported, not hidden.
-    logger.warn('Could not read the Shopify catalogue for duplicate detection.', {
+    /*
+     * A failed lookup must NOT be read as "no product exists".
+     *
+     * Continuing would risk creating a duplicate, which is the one outcome this lookup
+     * exists to prevent. Refusing the push is the safe direction: the operator retries and
+     * nothing was created.
+     */
+    throw new AppError(
+      'SHOPIFY_DEGRADED',
+      'Could not check Shopify for an existing draft for this candidate, so nothing was created. Pushing without that check could produce a duplicate product. Retry when Shopify is reachable.',
+      { details: { candidateId, reason: error instanceof Error ? error.message : 'unknown' } },
+    );
+  }
+
+  const first = matches[0];
+  if (first === undefined) return null;
+
+  if (matches.length > 1) {
+    logger.error('More than one Shopify product carries the same research identity.', {
+      candidateId,
+      shopifyProductIds: matches.map((product) => product.shopifyProductId),
+    });
+  }
+
+  const visibility = await getProductVisibility(first.shopifyProductId);
+  return {
+    shopifyProductId: first.shopifyProductId,
+    state: {
+      status: first.status,
+      published: visibility.publishedAnywhere,
+      visibleToCustomers: visibility.visibleToCustomers,
+    },
+  };
+}
+
+/**
+ * Forces a product to a hidden draft, then VERIFIES it.
+ *
+ * Both halves matter, because visibility is the conjunction of two independent facts: an
+ * ACTIVE product with no sales-channel publication is invisible, and a DRAFT that is
+ * somehow published is not visible either. Setting DRAFT alone would leave the publication
+ * in place; unpublishing alone would leave it ACTIVE. So both are done, and then the real
+ * state is read back rather than assumed.
+ *
+ * `expectedStatus` is deliberately omitted from editProduct: this is an emergency, and a
+ * concurrency check that refused the repair with PRODUCT_CHANGED would leave the product
+ * visible.
+ */
+async function forceHidden(shopifyProductId: string): Promise<ShopifyProductState> {
+  try {
+    await editProduct(shopifyProductId, {
+      fields: { status: 'DRAFT' },
+      addTags: [],
+      removeTags: [],
+      variants: [],
+    });
+  } catch (error) {
+    logger.error('Could not set a research product back to DRAFT.', {
+      shopifyProductId,
       reason: error instanceof Error ? error.message : 'unknown',
     });
   }
 
-  const others: ExistingCandidateRef[] = (await listCandidates({ limit: 200 })).map(
-    (other) => ({
-      candidateId: other.id,
-      title: other.title,
-      status: other.status,
-      sourceProductId: other.sourceProductId,
-      pushedShopifyProductId: other.pushedShopifyProductId,
-    }),
-  );
+  try {
+    await unpublishProduct(shopifyProductId);
+  } catch (error) {
+    logger.error('Could not unpublish a research product.', {
+      shopifyProductId,
+      reason: error instanceof Error ? error.message : 'unknown',
+    });
+  }
+
+  // Read the truth back. Both repair attempts above swallow their errors on purpose: what
+  // matters is the VERIFIED end state, not whether either individual call succeeded.
+  const visibility = await getProductVisibility(shopifyProductId);
+  return {
+    status: visibility.status,
+    published: visibility.publishedAnywhere,
+    visibleToCustomers: visibility.visibleToCustomers,
+  };
+}
+
+async function listCatalogue(): Promise<ExistingProductRef[]> {
+  const page = await listProducts({ first: CATALOGUE_PAGE_SIZE });
+  return page.items.map((product) => ({
+    shopifyProductId: product.shopifyProductId,
+    title: product.title,
+    status: product.status,
+    tags: product.tags,
+  }));
+}
+
+/* ===========================================================================
+ * The ports
+ * ======================================================================== */
+
+function realPorts(): PushPorts {
+  return {
+    now: () => new Date(),
+
+    candidates: {
+      load: getCandidate,
+      claim: claimPush,
+      release: releaseClaim,
+      markSucceeded,
+      markSafetyIncident,
+      listForDuplicates: async () =>
+        (await listCandidates({ limit: 200 })).map((other) => ({
+          candidateId: other.id,
+          title: other.title,
+          status: other.status,
+          sourceProductId: other.sourceProductId,
+          pushedShopifyProductId: other.pushedShopifyProductId,
+        })),
+    },
+
+    analysis: {
+      prepare: async (candidateId, options) => prepareCandidateAnalysis(candidateId, options),
+      persist: async (prepared) => {
+        // The orchestration hands back the same object prepareCandidateAnalysis produced,
+        // so this is a straight write of an already-computed analysis.
+        await persistAnalysis(prepared as Parameters<typeof persistAnalysis>[0]);
+      },
+    },
+
+    shopify: {
+      findByResearchTag,
+      listCatalogue,
+      createProduct: async (request) => {
+        const created = await createProduct(request);
+        return {
+          shopifyProductId: created.shopifyProductId,
+          status: created.status,
+          published: created.published,
+          visibleToCustomers: created.visibleToCustomers,
+          variants: created.variants,
+          warnings: created.warnings,
+        };
+      },
+      forceHidden,
+    },
+
+    costs: {
+      record: async (request: CostRequest) => {
+        await upsertManualCost({
+          shopifyProductId: request.shopifyProductId,
+          shopifyVariantId: request.shopifyVariantId,
+          provider: request.provider,
+          supplierProductCost: request.supplierProductCost,
+          supplierShippingCost: request.supplierShippingCost,
+          currencyCode: request.currencyCode,
+          // Marked as an override so it wins over Shopify's empty cost-per-item field,
+          // which is what a brand-new product has.
+          override: true,
+          note: request.note,
+        });
+      },
+    },
+
+    audit: recordPushAudit,
+  };
+}
+
+/**
+ * The push audit entry.
+ *
+ * Records the decision that ACTUALLY produced the draft, including both hashes so a
+ * mismatch is reconstructable, and both override flags so accepting a duplicate or a price
+ * below the configured floors is attributable rather than inferred from a warning string.
+ *
+ * Everything goes through recordAudit's existing sanitisation, so no credential can reach
+ * the collection through here.
+ */
+async function recordPushAudit(facts: PushAuditFacts): Promise<void> {
+  const created = facts.shopifyProductId !== null;
+
+  await recordAudit({
+    action: 'RESEARCH_PUSH_DRAFT',
+    resourceType: 'RESEARCH_CANDIDATE',
+    resourceId: facts.candidateId,
+    ...(facts.error === undefined ? {} : { error: facts.error }),
+    after: {
+      outcome: facts.outcome,
+      shopifyProductId: facts.shopifyProductId,
+      // Recorded explicitly rather than left to be inferred from the absence of a publish
+      // entry: the whole point is that a research push produces a hidden draft.
+      status: facts.productState?.status ?? null,
+      published: facts.productState?.published ?? null,
+      visibleToCustomers: facts.productState?.visibleToCustomers ?? null,
+      listedPrice: facts.listedPrice ?? null,
+      priceSource: facts.priceSource ?? null,
+      currencyCode: facts.currencyCode ?? null,
+      costRecorded: facts.costRecorded ?? null,
+      safetyIncident: facts.safetyIncident ?? null,
+    },
+    metadata: {
+      operationId: facts.operationId,
+      // Both hashes: which decision the operator approved, and which one was current.
+      expectedDecisionHash: facts.expectedDecisionHash,
+      actualDecisionHash: facts.actualDecisionHash,
+      decisionHashMatched:
+        facts.expectedDecisionHash === null || facts.actualDecisionHash === null
+          ? null
+          : facts.expectedDecisionHash === facts.actualDecisionHash,
+      analyzedAt: facts.analyzedAt ?? null,
+      overallScore: facts.overallScore ?? null,
+      confidenceScore: facts.confidenceScore ?? null,
+      recommendation: facts.recommendation ?? null,
+      selectedScenario: facts.selectedScenario,
+      supplierCost: facts.supplierCost ?? null,
+      supplierCurrency: facts.supplierCurrency ?? null,
+      shippingCost: facts.shippingCost ?? null,
+      shippingCurrency: facts.shippingCurrency ?? null,
+      duplicateMatches: facts.duplicateMatches ?? null,
+      duplicateOverridden: facts.duplicateOverridden,
+      guardBreachOverridden: facts.guardBreachOverridden,
+    },
+    result:
+      facts.error !== undefined
+        ? 'FAILURE'
+        : facts.safetyIncident !== null && facts.safetyIncident !== undefined
+          ? 'FAILURE'
+          : facts.outcome === 'RECONCILED' || facts.costRecorded === false
+            ? // A reconciliation created nothing new, and a missing cost leaves the margin
+              // unknown. Neither is a clean success and calling them one would hide the
+              // thing worth reading.
+              'PARTIAL'
+            : created
+              ? 'SUCCESS'
+              : 'FAILURE',
+  });
+}
+
+/* ===========================================================================
+ * Public surface
+ * ======================================================================== */
+
+/**
+ * Creates a DRAFT Shopify product from a candidate.
+ *
+ * A database is required before anything else: the claim cannot be recorded without one,
+ * and creating a product that Trademart then cannot remember is precisely how a retry
+ * produces a second one.
+ */
+export async function pushCandidateAsDraft(
+  candidateId: string,
+  input: PushAsDraftInput,
+): Promise<PushAsDraftResult> {
+  if (getDatabaseStatus().status !== 'connected') {
+    throw new AppError(
+      'DATABASE_UNAVAILABLE',
+      'Pushing a candidate needs MongoDB, so the push can be claimed and recorded. Without it a retry would create a second Shopify product.',
+    );
+  }
+
+  return orchestratePush(realPorts(), candidateId, input);
+}
+
+/**
+ * Checks a candidate for duplicates without pushing anything.
+ *
+ * Exposed separately so the UI can warn BEFORE the operator clicks. A duplicate warning
+ * that only appears after the product exists is useless.
+ */
+export async function checkForDuplicates(candidateId: string): Promise<DuplicateReport> {
+  const candidate = await getCandidate(candidateId);
+
+  let products: ExistingProductRef[] = [];
+  let catalogueRead = true;
+  try {
+    products = await listCatalogue();
+  } catch (error) {
+    logger.warn('Could not read the Shopify catalogue for duplicate detection.', {
+      reason: error instanceof Error ? error.message : 'unknown',
+    });
+    catalogueRead = false;
+  }
+
+  const others = (await listCandidates({ limit: 200 })).map((other) => ({
+    candidateId: other.id,
+    title: other.title,
+    status: other.status,
+    sourceProductId: other.sourceProductId,
+    pushedShopifyProductId: other.pushedShopifyProductId,
+  }));
 
   const report = detectDuplicates({
     subject: {
@@ -114,284 +521,15 @@ async function duplicateReportFor(candidate: ProductCandidate): Promise<Duplicat
     candidates: others,
   });
 
-  if (products.length === 0) {
-    return {
-      ...report,
-      summary: [
-        report.summary,
-        'The Shopify catalogue could not be read, so this check covered other research candidates only. A product with this name may already exist.',
-      ]
-        .filter((part): part is string => part !== null)
-        .join(' '),
-    };
-  }
-
-  return report;
-}
-
-/* ===========================================================================
- * Push
- * ======================================================================== */
-
-export interface PushAsDraftInput {
-  /** Which price scenario to list at. Defaults to the recommended one. */
-  scenario?: PricingScenarioName;
-  /** An explicit price, overriding the scenario entirely. */
-  price?: number;
-  /**
-   * Proceed despite an exact duplicate.
-   *
-   * Required to be explicit. The block exists to catch a mis-click, and a flag the
-   * operator has to set is the difference between a considered decision and an accident.
-   */
-  allowDuplicate?: boolean;
-  now?: Date;
-}
-
-export interface PushAsDraftResult {
-  candidate: ProductCandidate;
-  product: ProductCreateResult;
-  duplicates: DuplicateReport;
-  /** The price the draft was listed at, and where it came from. */
-  listedPrice: ResolvedListingPrice;
-  /** True when the candidate's supplier cost was recorded against the new variant. */
-  costRecorded: boolean;
-  warnings: string[];
-}
-
-/**
- * Creates a DRAFT Shopify product from a candidate.
- *
- * Refusals, in order, because each one is cheaper to hit than the next:
- *   1. no database          - the candidate could not be marked as pushed, so a retry
- *                            would create a second product
- *   2. not pushable         - already pushed, or rejected
- *   3. exact duplicate      - unless explicitly overridden
- *   4. no price             - a product with no price cannot be sold, and guessing one
- *                            is worse than refusing
- */
-export async function pushCandidateAsDraft(
-  candidateId: string,
-  input: PushAsDraftInput = {},
-): Promise<PushAsDraftResult> {
-  if (getDatabaseStatus().status !== 'connected') {
-    // Checked FIRST. Creating the product and then failing to record that it exists
-    // would leave the candidate looking unpushed, and the next click would create a
-    // second draft - the exact duplicate this module is built to prevent.
-    throw new AppError(
-      'DATABASE_UNAVAILABLE',
-      'Pushing a candidate needs MongoDB, so the candidate can be marked as pushed. Without it a retry would create a second Shopify product.',
-    );
-  }
-
-  const now = input.now ?? new Date();
-  const candidate = await getCandidate(candidateId);
-
-  const eligibility = canPush(candidate);
-  if (!eligibility.allowed) {
-    throw new AppError('VALIDATION_ERROR', eligibility.reason ?? 'This candidate cannot be pushed.');
-  }
-
-  // ---- duplicates ---------------------------------------------------------
-  const duplicates = await duplicateReportFor(candidate);
-  if (duplicates.blocking.length > 0 && input.allowDuplicate !== true) {
-    throw new AppError(
-      'VALIDATION_ERROR',
-      `This candidate looks like a duplicate and has not been pushed. ${duplicates.blocking.map((match) => match.reason).join(' ')} Set allowDuplicate to proceed anyway.`,
-      { details: { duplicates: duplicates.blocking } },
-    );
-  }
-
-  // ---- price --------------------------------------------------------------
-  //
-  // Re-analysed rather than read from the stored score, because the stored price was
-  // computed against whatever the settings and costs were at the time. Listing at a
-  // stale price is how a product goes live below the current margin floor.
-  const analysis = await analyzeCandidate(candidateId, { now });
-  const listedPrice = resolveListingPrice(candidate, analysis.pricing, {
-    ...(input.scenario === undefined ? {} : { scenario: input.scenario }),
-    ...(input.price === undefined ? {} : { price: input.price }),
-  });
-
-  const warnings: string[] = [...analysis.warnings];
-
-  const scenario = analysis.pricing.scenarios.find(
-    (entry) => entry.name === (input.scenario ?? analysis.pricing.recommended),
-  );
-  if (scenario !== undefined && !scenario.viable) {
-    // Not a refusal: the operator may have a reason. But it must be recorded, and it
-    // must appear in the audit trail alongside the push.
-    warnings.push(
-      `Listed at a price that breaches your own floors: it ${scenario.guardBreaches.join(' and it ')}. The draft was created because you asked for it, but it is not profitable on your current settings.`,
-    );
-  }
-
-  // ---- create -------------------------------------------------------------
-  const request = buildDraftRequest(candidate, listedPrice.amount);
-  assertDraftOnly(request);
-
-  let product: ProductCreateResult;
-  try {
-    product = await createProduct(request);
-  } catch (error) {
-    await recordAudit({
-      action: 'RESEARCH_PUSH_DRAFT',
-      resourceType: 'RESEARCH_CANDIDATE',
-      resourceId: candidateId,
-      error,
-      metadata: { title: candidate.title, listedPrice: listedPrice.amount },
-    });
-    throw error;
-  }
-
-  // A second, independent check on the way OUT. The create service can leave a product
-  // DRAFT for its own reasons, and a future change to it must not be able to publish
-  // something research pushed.
-  if (product.published || product.visibleToCustomers) {
-    logger.error('A research push resulted in a visible product. This should be impossible.', {
-      shopifyProductId: product.shopifyProductId,
-    });
-    warnings.push(
-      'This product appears to be visible to customers, which a research push must never produce. Check it in Shopify and unpublish it if so.',
-    );
-  }
-
-  warnings.push(...product.warnings);
-
-  // ---- record the cost against the real variant ---------------------------
-  const costRecorded = await recordSupplierCost(
-    candidate,
-    product,
-    listedPrice.currencyCode,
-    warnings,
-  );
-
-  // ---- mark the candidate -------------------------------------------------
-  await ProductCandidateModel.updateOne(
-    { shopDomain: config.shopify.storeDomain, candidateId },
-    {
-      $set: {
-        status: 'PUSHED_TO_SHOPIFY',
-        pushedShopifyProductId: product.shopifyProductId,
-        pushedAt: now.toISOString(),
-      },
-    },
-  );
-
-  await recordAudit({
-    action: 'RESEARCH_PUSH_DRAFT',
-    resourceType: 'RESEARCH_CANDIDATE',
-    resourceId: candidateId,
-    after: {
-      shopifyProductId: product.shopifyProductId,
-      // Recorded explicitly so the trail proves what was created, rather than leaving it
-      // to be inferred from the absence of a publish entry.
-      status: product.status,
-      published: product.published,
-      visibleToCustomers: product.visibleToCustomers,
-      listedPrice: listedPrice.amount,
-      priceSource: listedPrice.source,
-      costRecorded,
-    },
-    result: product.partialSuccess || warnings.length > 0 ? 'PARTIAL' : 'SUCCESS',
-    metadata: {
-      title: candidate.title,
-      overallScore: candidate.overallScore,
-      confidenceScore: candidate.confidenceScore,
-      recommendation: candidate.recommendation,
-      duplicatesFound: duplicates.matches.length,
-      duplicateOverridden: duplicates.blocking.length > 0 && input.allowDuplicate === true,
-    },
-  });
+  if (catalogueRead) return report;
 
   return {
-    candidate: await getCandidate(candidateId),
-    product,
-    duplicates,
-    listedPrice,
-    costRecorded,
-    warnings: dedupe(warnings),
+    ...report,
+    summary: [
+      report.summary,
+      'The Shopify catalogue could not be read, so this check covered other research candidates only. A product with this name may already exist.',
+    ]
+      .filter((part): part is string => part !== null)
+      .join(' '),
   };
-}
-
-/* ===========================================================================
- * Cost
- * ======================================================================== */
-
-/**
- * Writes the candidate's supplier cost against the created variant.
- *
- * Best-effort: a failure here does not undo the product, because the draft is still
- * useful and deleting it would be a worse outcome than a missing cost. But it IS
- * reported, because a draft with no recorded cost will show an unknown margin in the
- * order view - and the operator needs to know to enter it.
- */
-async function recordSupplierCost(
-  candidate: ProductCandidate,
-  product: ProductCreateResult,
-  fallbackCurrency: string | null,
-  warnings: string[],
-): Promise<boolean> {
-  const cost = candidate.commercials.supplierCost;
-  if (cost === null) {
-    warnings.push(
-      'No supplier cost was recorded on this candidate, so the new draft has no cost either. Its margin will show as unknown until you enter one.',
-    );
-    return false;
-  }
-
-  const variant = product.variants[0];
-  if (variant === undefined) {
-    warnings.push(
-      'The draft was created but no variant id came back, so the supplier cost could not be attached. Enter it against the variant in Trademart.',
-    );
-    return false;
-  }
-
-  // A stored cost MUST carry a currency: an amount with no currency is the input that
-  // makes a later margin calculation meaningless, and CURRENCY_MISMATCH detection relies
-  // on every amount being labelled. Falls back to the price's currency, then refuses.
-  const currencyCode = candidate.commercials.supplierCurrency ?? fallbackCurrency;
-  if (currencyCode === null) {
-    warnings.push(
-      'The supplier cost has no currency recorded, so it was NOT saved against the draft - an unlabelled amount cannot be used in a margin calculation. Set the cost currency on the candidate and enter it against the variant.',
-    );
-    return false;
-  }
-
-  try {
-    await upsertManualCost({
-      shopifyProductId: product.shopifyProductId,
-      shopifyVariantId: variant.shopifyVariantId,
-      provider: candidate.source === 'TRADELLE' ? 'TRADELLE' : 'OTHER',
-      supplierProductCost: cost,
-      supplierShippingCost: candidate.commercials.shippingCost,
-      currencyCode,
-      // Marked as an override so it wins over Shopify's empty cost-per-item field, which
-      // is what a brand-new product has.
-      override: true,
-      note: `Recorded from Trademart research candidate ${candidate.id} on push.`,
-    });
-    return true;
-  } catch (error) {
-    logger.warn('Could not record the supplier cost for a pushed candidate.', {
-      shopifyProductId: product.shopifyProductId,
-      reason: error instanceof Error ? error.message : 'unknown',
-    });
-    warnings.push(
-      'The draft was created but its supplier cost could not be saved. Enter it in Trademart, or the margin will show as unknown.',
-    );
-    return false;
-  }
-}
-
-function dedupe(values: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const value of values) {
-    if (seen.has(value)) continue;
-    seen.add(value);
-    out.push(value);
-  }
-  return out;
 }

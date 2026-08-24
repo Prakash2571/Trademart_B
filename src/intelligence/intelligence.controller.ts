@@ -2,6 +2,7 @@
  * GET /api/intelligence/capabilities        - what research can and cannot measure
  * GET /api/intelligence/candidates          - the research shortlist
  * GET /api/intelligence/candidates/:id      - one candidate with its full score
+ * GET /api/intelligence/candidates/:id/decision   - the current decision + its hash
  * GET /api/intelligence/candidates/:id/duplicates - duplicate check before a push
  *
  * READ-ONLY. Every write - create, analyse, watch, reject, push - lives on
@@ -20,7 +21,12 @@ import { asyncHandler, sendSuccess } from '../common/http';
 import { parseIntParam, parseStringParam } from '../common/validate';
 import { AppError } from '../common/errors';
 import { scoreIsStale } from './candidate.revision';
-import { getCandidate, listCandidates } from './intelligence.service';
+import { allowedActions } from './candidate.transitions';
+import {
+  getCandidate,
+  listCandidates,
+  prepareCandidateAnalysis,
+} from './intelligence.service';
 import { describeResearchSupport } from './providers/registry';
 import { TRADELLE_DOCUMENTATION, TRADELLE_MODES, tradelleResearchMode } from './providers/tradelle.provider';
 import {
@@ -109,6 +115,24 @@ intelligenceRouter.get(
 
     sendSuccess(res, candidates, {
       count: candidates.length,
+      /*
+       * What may be done to each candidate, computed from the backend's own transition
+       * table and keyed by candidate id.
+       *
+       * Sent so the UI does not keep a second copy of the rules. A copy would drift, and
+       * the visible symptom of drift is an enabled button that the route then refuses -
+       * or worse, a Push button offered on a candidate whose push is already running.
+       * The routes remain authoritative; this only decides what is offered.
+       */
+      actions: Object.fromEntries(
+        candidates.map((candidate) => [candidate.id, allowedActions(candidate)]),
+      ),
+      // Surfaced at list level because these are the two states an operator needs to see
+      // without opening each row.
+      pushing: candidates.filter((candidate) => candidate.pushState === 'IN_PROGRESS').length,
+      needsSafetyReview: candidates.filter(
+        (candidate) => candidate.pushState === 'SAFETY_INCIDENT',
+      ).length,
       // Counted here so a list header can show it without a second request, and so
       // "3 of 12 have never been scored" is visible rather than having to be inferred
       // from a null.
@@ -143,11 +167,72 @@ intelligenceRouter.get(
       scoreIsStale: scoreIsStale(candidate),
       inputRevision: candidate.inputRevision,
       analyzedInputRevision: candidate.analyzedInputRevision,
+      // See the list route: one source of truth for what may be done.
+      actions: allowedActions(candidate),
       note:
         candidate.analyzedAt === null
           ? 'This candidate has never been analysed, so it has no score. That is not a low score.'
           : null,
+      /*
+       * SAFETY_INCIDENT is the one state that needs a human, so the reason travels with
+       * the read rather than living only in the audit log.
+       */
+      pushSafetyReason: candidate.pushSafetyReason,
     });
+  }),
+);
+
+/**
+ * The decision as it stands RIGHT NOW, and the hash that binds it.
+ *
+ * Read immediately before a push. It computes a full analysis - store history, providers,
+ * pricing, scoring - and PERSISTS NOTHING, so opening a confirmation dialog cannot move
+ * the stored score out from under the operator.
+ *
+ * Why it is a separate route rather than part of GET /:id: this is the expensive read. The
+ * list would run it N times, and a page that merely displays a candidate does not need
+ * live Shopify history. Why it is not simply POST /analyze: analyse WRITES, and the last
+ * thing a confirmation dialog should do is change the row it is asking about.
+ *
+ * The summary and the hash come from the same prepared analysis, so the numbers the
+ * operator confirms are provably the numbers the hash covers. Showing a summary fetched
+ * separately from the hash would recreate the exact bug the hash exists to close.
+ */
+intelligenceRouter.get(
+  '/intelligence/candidates/:id/decision',
+  asyncHandler(async (req, res) => {
+    const prepared = await prepareCandidateAnalysis(req.params.id ?? '');
+    const { score } = prepared.analysis;
+
+    sendSuccess(
+      res,
+      {
+        decisionHash: prepared.decisionHash,
+        // The post-analysis candidate, never the stored one: the stored row may carry an
+        // older score, and confirming against it is what Part 3 forbids.
+        candidate: prepared.freshCandidate,
+        recommendation: score.recommendation,
+        overallScore: score.overallScore,
+        confidenceScore: score.confidenceScore,
+        recommendationDowngraded: score.recommendationDowngraded,
+        pricing: prepared.analysis.pricing,
+        policy: prepared.policy,
+        warnings: prepared.analysis.warnings,
+        actions: allowedActions(prepared.freshCandidate),
+      },
+      {
+        /*
+         * Whether the stored score differs from this one. If it does, the screen the
+         * operator was reading is already out of date and the dialog must show these
+         * numbers, not the ones behind it.
+         */
+        storedScoreDiffers:
+          prepared.storedCandidate.overallScore !== prepared.freshCandidate.overallScore ||
+          prepared.storedCandidate.recommendation !== prepared.freshCandidate.recommendation,
+        persisted: false,
+        note: 'Nothing was saved by this read. Send decisionHash back with the push - if the numbers have moved by then the push is refused rather than created on a decision nobody approved.',
+      },
+    );
   }),
 );
 

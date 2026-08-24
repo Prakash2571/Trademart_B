@@ -1,0 +1,811 @@
+/**
+ * The push orchestration, tested by CALL COUNT AND ORDER.
+ *
+ * This is the file the whole PushPorts seam exists for. The dangerous facts about a push
+ * are not "did it return the right shape" - they are "how many times did it call
+ * createProduct", "did any Shopify write happen before the refusal", "did forceHidden run
+ * when the product came back visible". None of those can be asserted against a value; they
+ * can only be asserted against a recorded log of the side effects, which is what a
+ * substitutable port gives you and what testing push.service directly (it imports config,
+ * which calls process.exit at import) never could.
+ *
+ * Every test drives the REAL pushCandidateAsDraft through a fake PushPorts whose claim is
+ * genuinely atomic - it check-and-sets shared state with no await in between - so two
+ * pushes racing through Promise.all exercise the same serialisation the Mongo claim
+ * provides in production.
+ */
+
+import assert from 'node:assert/strict';
+import { beforeEach, describe, it } from 'node:test';
+
+import { AppError } from '../common/errors';
+import {
+  DEFAULT_PRICING_POLICY,
+  evaluatePriceAgainstPolicy,
+  recommendPrice,
+  type PriceRecommendation,
+} from '../pricing/recommendation';
+import type { ProductCreateRequest } from '../products/product.create';
+import { EMPTY_MANUAL_RESEARCH, type ProductCandidate } from './candidate.types';
+import type { CandidateAnalysis } from './candidate.analysis';
+import { researchIdentityTag } from './push.draft';
+import {
+  PUSH_CLAIM_LEASE_MS,
+  pushCandidateAsDraft,
+  type PushAsDraftInput,
+} from './push.orchestrator';
+import type {
+  ClaimRequest,
+  CompletionRequest,
+  CostRequest,
+  CreatedProduct,
+  ExistingResearchProduct,
+  IncidentRequest,
+  PreparedAnalysis,
+  PushAuditFacts,
+  PushPorts,
+  ShopifyProductState,
+} from './push.ports';
+
+const NOW = new Date('2026-06-15T12:00:00.000Z');
+const NOW_ISO = NOW.toISOString();
+
+/* ===========================================================================
+ * Fixtures
+ * ======================================================================== */
+
+function candidate(overrides: Partial<ProductCandidate> = {}): ProductCandidate {
+  return {
+    id: 'cand-1',
+    source: 'MANUAL',
+    sourceProductId: 'TRD-9931',
+    sourceUrl: null,
+    title: 'Portable Neck Fan',
+    category: 'Home',
+    imageUrl: null,
+    keywords: ['neck fan'],
+    market: { countryCode: 'GB', region: null, horizonDays: 30 },
+    commercials: {
+      supplierCost: 10,
+      supplierCurrency: 'GBP',
+      shippingCost: 2,
+      shippingCurrency: 'GBP',
+      shippingDays: 8,
+      expectedSellingPrice: null,
+      expectedSellingCurrency: 'GBP',
+      costObservedAt: NOW_ISO,
+    },
+    manualResearch: { ...EMPTY_MANUAL_RESEARCH },
+    factors: [],
+    overallScore: 79,
+    confidenceScore: 61,
+    recommendation: 'GOOD_CANDIDATE',
+    seasonState: 'RISING',
+    reasons: [],
+    risks: [],
+    evidence: [],
+    freshness: 'FRESH',
+    status: 'ANALYZED',
+    pushState: 'IDLE',
+    pushOperationId: null,
+    pushClaimedAt: null,
+    pushSafetyReason: null,
+    pushedShopifyProductId: null,
+    watchUntil: null,
+    scoreHistory: [],
+    notes: null,
+    createdAt: NOW_ISO,
+    analyzedAt: NOW_ISO,
+    updatedAt: NOW_ISO,
+    inputRevision: 1,
+    analyzedInputRevision: 1,
+    ...overrides,
+  };
+}
+
+function pricingFor(candidateRow: ProductCandidate): PriceRecommendation {
+  return recommendPrice({
+    supplierCost: candidateRow.commercials.supplierCost,
+    supplierCurrency: candidateRow.commercials.supplierCurrency,
+    shippingCost: candidateRow.commercials.shippingCost,
+    shippingCurrency: candidateRow.commercials.shippingCurrency,
+    sellingCurrency: candidateRow.commercials.expectedSellingCurrency,
+    policy: { ...DEFAULT_PRICING_POLICY },
+  });
+}
+
+/**
+ * A minimal but STRUCTURALLY REAL analysis.
+ *
+ * The pricing comes from the real engine so the scenarios, the recommended one and the
+ * guard breaches are the ones the code would actually see. Only the score is stubbed,
+ * because the orchestration never inspects the factor internals - it reads the price, the
+ * decision hash and the fresh candidate.
+ */
+function preparedFor(
+  candidateRow: ProductCandidate,
+  overrides: Partial<PreparedAnalysis> = {},
+): PreparedAnalysis {
+  const pricing = pricingFor(candidateRow);
+  const analysis = {
+    score: {
+      overallScore: candidateRow.overallScore,
+      confidenceScore: candidateRow.confidenceScore,
+      recommendation: candidateRow.recommendation,
+    },
+    pricing,
+    warnings: [],
+  } as unknown as CandidateAnalysis;
+
+  return {
+    storedCandidate: candidateRow,
+    freshCandidate: candidateRow,
+    analysis,
+    policy: pricing.policy,
+    decisionHash: 'hash-current',
+    // The real evaluator, so a hand-typed price faces the SAME floors a scenario does.
+    // A stub returning null would make the guard-breach test pass vacuously - it would
+    // report "nothing to check" for exactly the price most likely to breach.
+    evaluatePrice: (amount: number) =>
+      evaluatePriceAgainstPolicy(
+        {
+          supplierCost: candidateRow.commercials.supplierCost,
+          shippingCost: candidateRow.commercials.shippingCost,
+        },
+        pricing.policy,
+        amount,
+      ),
+    ...overrides,
+  };
+}
+
+const hiddenState: ShopifyProductState = {
+  status: 'DRAFT',
+  published: false,
+  visibleToCustomers: false,
+};
+
+const visibleState: ShopifyProductState = {
+  status: 'ACTIVE',
+  published: true,
+  visibleToCustomers: true,
+};
+
+/* ===========================================================================
+ * The fake world
+ * ======================================================================== */
+
+interface FakeConfig {
+  /** The candidate row as Mongo would hold it. Mutated by claim/markSucceeded/etc. */
+  row: ProductCandidate;
+  /** Prepared analysis returned by analysis.prepare. */
+  prepared?: PreparedAnalysis;
+  /** A product already in Shopify carrying the identity tag (the reconcile case). */
+  existingResearchProduct?: ExistingResearchProduct | null;
+  /** State createProduct reports back. Default hidden. */
+  createdState?: ShopifyProductState;
+  /** State forceHidden reports back. Default hidden (a successful repair). */
+  forceHiddenState?: ShopifyProductState;
+  /** Catalogue for the advisory duplicate check. */
+  catalogue?: { shopifyProductId: string; title: string; status: string; tags: string[] }[];
+  /** Other research candidates for the duplicate check. */
+  otherCandidates?: ProductCandidate[];
+  /** Injected failures, keyed by the port method that should throw once. */
+  failOnce?: Partial<Record<string, () => never>>;
+  now?: Date;
+}
+
+/**
+ * Builds a PushPorts that records every call, in order, and keeps a shared candidate row
+ * so the atomic claim actually serialises.
+ */
+function makePorts(config: FakeConfig): {
+  ports: PushPorts;
+  calls: string[];
+  audits: PushAuditFacts[];
+  costs: CostRequest[];
+  createRequests: ProductCreateRequest[];
+  world: FakeConfig;
+} {
+  const calls: string[] = [];
+  const audits: PushAuditFacts[] = [];
+  const costs: CostRequest[] = [];
+  const createRequests: ProductCreateRequest[] = [];
+  let createdCounter = 0;
+  const now = config.now ?? NOW;
+
+  const failed = new Set<string>();
+  function maybeFail(method: string): void {
+    const thrower = config.failOnce?.[method];
+    if (thrower !== undefined && !failed.has(method)) {
+      failed.add(method);
+      thrower();
+    }
+  }
+
+  const ports: PushPorts = {
+    now: () => now,
+
+    candidates: {
+      async load(candidateId) {
+        calls.push('load');
+        maybeFail('load');
+        return { ...config.row, id: candidateId };
+      },
+
+      /*
+       * ATOMIC. The check and the mutation happen with NO await between them, so two
+       * concurrent callers cannot both observe an IDLE row. This mirrors the Mongo
+       * findOneAndUpdate $or filter: own operationId, expired lease, or genuinely idle,
+       * AND no product id yet.
+       */
+      claim(request: ClaimRequest) {
+        calls.push('claim');
+        const row = config.row;
+        const leaseCutoff = request.now.getTime() - request.leaseMs;
+        const claimedAt =
+          row.pushClaimedAt === null ? null : new Date(row.pushClaimedAt).getTime();
+        const grantable =
+          row.pushedShopifyProductId === null &&
+          (row.pushState === 'IDLE' ||
+            (row.pushState === 'IN_PROGRESS' && row.pushOperationId === request.operationId) ||
+            (row.pushState === 'IN_PROGRESS' && claimedAt !== null && claimedAt <= leaseCutoff) ||
+            (row.pushState === 'IN_PROGRESS' && row.pushClaimedAt === null));
+
+        if (!grantable) return Promise.resolve(null);
+
+        config.row = {
+          ...row,
+          pushState: 'IN_PROGRESS',
+          pushOperationId: request.operationId,
+          pushClaimedAt: request.now.toISOString(),
+        };
+        return Promise.resolve({ ...config.row });
+      },
+
+      async release(request) {
+        calls.push('release');
+        if (config.row.pushOperationId === request.operationId) {
+          config.row = {
+            ...config.row,
+            pushState: 'IDLE',
+            pushOperationId: null,
+            pushClaimedAt: null,
+          };
+        }
+      },
+
+      async markSucceeded(request: CompletionRequest) {
+        calls.push('markSucceeded');
+        maybeFail('markSucceeded');
+        config.row = {
+          ...config.row,
+          pushState: 'SUCCEEDED',
+          status: 'PUSHED_TO_SHOPIFY',
+          pushedShopifyProductId: request.shopifyProductId,
+          pushClaimedAt: null,
+        };
+      },
+
+      async markSafetyIncident(request: IncidentRequest) {
+        calls.push('markSafetyIncident');
+        config.row = {
+          ...config.row,
+          pushState: 'SAFETY_INCIDENT',
+          pushedShopifyProductId: request.shopifyProductId,
+          pushSafetyReason: request.reason,
+          pushClaimedAt: null,
+        };
+      },
+
+      async listForDuplicates() {
+        calls.push('listForDuplicates');
+        return (config.otherCandidates ?? []).map((other) => ({
+          candidateId: other.id,
+          title: other.title,
+          status: other.status,
+          sourceProductId: other.sourceProductId,
+          pushedShopifyProductId: other.pushedShopifyProductId,
+        }));
+      },
+    },
+
+    analysis: {
+      async prepare(candidateId, options) {
+        calls.push('prepare');
+        maybeFail('prepare');
+        void options;
+        return config.prepared ?? preparedFor({ ...config.row, id: candidateId });
+      },
+      async persist() {
+        calls.push('persist');
+        maybeFail('persist');
+      },
+    },
+
+    shopify: {
+      async findByResearchTag(candidateId) {
+        calls.push('findByResearchTag');
+        maybeFail('findByResearchTag');
+        void candidateId;
+        return config.existingResearchProduct ?? null;
+      },
+
+      async listCatalogue() {
+        calls.push('listCatalogue');
+        maybeFail('listCatalogue');
+        return (config.catalogue ?? []).map((entry) => ({ ...entry }));
+      },
+
+      async createProduct(request) {
+        calls.push('createProduct');
+        createRequests.push(request);
+        maybeFail('createProduct');
+        createdCounter += 1;
+        const state = config.createdState ?? hiddenState;
+        const created: CreatedProduct = {
+          shopifyProductId: `gid://shopify/Product/${createdCounter}`,
+          variants: [{ shopifyVariantId: `gid://shopify/ProductVariant/${createdCounter}` }],
+          warnings: [],
+          ...state,
+        };
+        return created;
+      },
+
+      async forceHidden(shopifyProductId) {
+        calls.push('forceHidden');
+        maybeFail('forceHidden');
+        void shopifyProductId;
+        return config.forceHiddenState ?? hiddenState;
+      },
+    },
+
+    costs: {
+      async record(request) {
+        calls.push('costs.record');
+        maybeFail('costs.record');
+        costs.push(request);
+      },
+    },
+
+    async audit(facts) {
+      calls.push('audit');
+      audits.push(facts);
+    },
+  };
+
+  return { ports, calls, audits, costs, createRequests, world: config };
+}
+
+function input(overrides: Partial<PushAsDraftInput> = {}): PushAsDraftInput {
+  return {
+    expectedDecisionHash: 'hash-current',
+    operationId: 'op-1',
+    ...overrides,
+  };
+}
+
+async function expectAppError(promise: Promise<unknown>): Promise<AppError> {
+  try {
+    await promise;
+  } catch (error) {
+    if (!(error instanceof AppError)) throw error;
+    return error;
+  }
+  throw new Error('expected the push to be refused, but it resolved');
+}
+
+function count(calls: string[], method: string): number {
+  return calls.filter((call) => call === method).length;
+}
+
+/* ===========================================================================
+ * The happy path - order is the assertion
+ * ======================================================================== */
+
+describe('a clean push', () => {
+  let fx: ReturnType<typeof makePorts>;
+
+  beforeEach(() => {
+    fx = makePorts({ row: candidate() });
+  });
+
+  it('creates exactly one product, and only after every refusal gate has passed', async () => {
+    const result = await pushCandidateAsDraft(fx.ports, 'cand-1', input());
+
+    assert.equal(result.outcome, 'CREATED');
+    assert.equal(count(fx.calls, 'createProduct'), 1);
+
+    // The reconcile lookup and the fresh analysis and the hash check all precede the one
+    // createProduct. This ordering IS the zero-writes-on-failure guarantee.
+    const createAt = fx.calls.indexOf('createProduct');
+    for (const gate of ['claim', 'findByResearchTag', 'prepare', 'listCatalogue']) {
+      assert.ok(
+        fx.calls.indexOf(gate) < createAt,
+        `${gate} must run before createProduct, so a refusal there writes nothing to Shopify`,
+      );
+    }
+  });
+
+  it('records the cost, persists the analysis and marks success AFTER the create', async () => {
+    await pushCandidateAsDraft(fx.ports, 'cand-1', input());
+    const createAt = fx.calls.indexOf('createProduct');
+    for (const after of ['costs.record', 'persist', 'markSucceeded', 'audit']) {
+      assert.ok(fx.calls.indexOf(after) > createAt, `${after} must run after createProduct`);
+    }
+    assert.equal(count(fx.calls, 'markSucceeded'), 1);
+    assert.equal(count(fx.calls, 'markSafetyIncident'), 0);
+  });
+
+  it('files the supplier cost against the id the create returned, in its own currency', async () => {
+    await pushCandidateAsDraft(fx.ports, 'cand-1', input());
+    assert.equal(fx.costs.length, 1);
+    assert.equal(fx.costs[0]?.shopifyProductId, 'gid://shopify/Product/1');
+    // NOT relabelled to the selling currency - the supplier currency as stored.
+    assert.equal(fx.costs[0]?.currencyCode, 'GBP');
+  });
+
+  it('tags the created product with the per-candidate identity tag', async () => {
+    await pushCandidateAsDraft(fx.ports, 'cand-1', input());
+    assert.ok(fx.createRequests[0]?.tags?.includes(researchIdentityTag('cand-1')));
+  });
+
+  it('writes exactly one audit entry, recording the decision hash it acted on', async () => {
+    await pushCandidateAsDraft(fx.ports, 'cand-1', input());
+    assert.equal(fx.audits.length, 1);
+    assert.equal(fx.audits[0]?.outcome, 'CREATED');
+    assert.equal(fx.audits[0]?.actualDecisionHash, 'hash-current');
+    assert.equal(fx.audits[0]?.expectedDecisionHash, 'hash-current');
+  });
+});
+
+/* ===========================================================================
+ * Refusals that must write NOTHING to Shopify
+ * ======================================================================== */
+
+describe('refusals never reach Shopify', () => {
+  it('an unlabelled supplier currency blocks with zero Shopify calls and no claim', async () => {
+    const fx = makePorts({
+      row: candidate({
+        commercials: {
+          supplierCost: 10,
+          supplierCurrency: null, // present amount, no currency
+          shippingCost: 2,
+          shippingCurrency: 'GBP',
+          shippingDays: 8,
+          expectedSellingPrice: null,
+          expectedSellingCurrency: 'GBP',
+          costObservedAt: NOW_ISO,
+        },
+      }),
+    });
+
+    const error = await expectAppError(pushCandidateAsDraft(fx.ports, 'cand-1', input()));
+    assert.equal(error.code, 'CURRENCY_MISMATCH');
+    assert.equal(count(fx.calls, 'createProduct'), 0);
+    // Refused before the claim: currency can never become labelled by waiting.
+    assert.equal(count(fx.calls, 'claim'), 0);
+  });
+
+  it('a stale decision hash blocks with RECOMMENDATION_CHANGED and no product', async () => {
+    const fx = makePorts({ row: candidate() });
+    const error = await expectAppError(
+      pushCandidateAsDraft(fx.ports, 'cand-1', input({ expectedDecisionHash: 'hash-the-operator-saw' })),
+    );
+    assert.equal(error.code, 'RECOMMENDATION_CHANGED');
+    assert.equal(count(fx.calls, 'createProduct'), 0);
+    // It claimed first (so it computed a fresh analysis), then released on the way out.
+    assert.equal(count(fx.calls, 'claim'), 1);
+    assert.equal(count(fx.calls, 'release'), 1);
+    assert.equal(count(fx.calls, 'markSucceeded'), 0);
+    // The refusal is still audited - a blocked push is often the interesting entry.
+    assert.equal(fx.audits.length, 1);
+    assert.equal(fx.audits[0]?.outcome, null);
+  });
+
+  it('an exact duplicate blocks unless allowDuplicate is exactly true', async () => {
+    const world = {
+      row: candidate(),
+      catalogue: [
+        {
+          shopifyProductId: 'gid://shopify/Product/existing',
+          title: 'Portable Neck Fan',
+          status: 'ACTIVE',
+          tags: [],
+        },
+      ],
+    };
+
+    const blocked = makePorts({ ...world });
+    const error = await expectAppError(pushCandidateAsDraft(blocked.ports, 'cand-1', input()));
+    assert.equal(error.code, 'VALIDATION_ERROR');
+    assert.equal(count(blocked.calls, 'createProduct'), 0);
+
+    const overridden = makePorts({ ...world, row: candidate() });
+    const result = await pushCandidateAsDraft(
+      overridden.ports,
+      'cand-1',
+      input({ allowDuplicate: true }),
+    );
+    assert.equal(result.outcome, 'CREATED');
+    assert.equal(count(overridden.calls, 'createProduct'), 1);
+  });
+
+  it('a guard-breaching price blocks unless acknowledgeGuardBreach is exactly true', async () => {
+    // A break-even selling price: below every margin floor, so the scenarios breach.
+    const breaching = candidate({
+      commercials: {
+        supplierCost: 100,
+        supplierCurrency: 'GBP',
+        shippingCost: 0,
+        shippingCurrency: 'GBP',
+        shippingDays: 8,
+        expectedSellingPrice: null,
+        expectedSellingCurrency: 'GBP',
+        costObservedAt: NOW_ISO,
+      },
+    });
+
+    const blocked = makePorts({ row: breaching });
+    const error = await expectAppError(
+      pushCandidateAsDraft(blocked.ports, 'cand-1', input({ price: 100 })),
+    );
+    assert.equal(error.code, 'VALIDATION_ERROR');
+    assert.match(error.message, /floor/i);
+    assert.equal(count(blocked.calls, 'createProduct'), 0);
+
+    const overridden = makePorts({ row: breaching });
+    const result = await pushCandidateAsDraft(
+      overridden.ports,
+      'cand-1',
+      input({ price: 100, acknowledgeGuardBreach: true }),
+    );
+    assert.equal(result.outcome, 'CREATED');
+    assert.equal(count(overridden.calls, 'createProduct'), 1);
+    // The accepted breach is warned about and recorded, not silently swallowed.
+    assert.ok(result.warnings.some((warning) => /breach/i.test(warning)));
+  });
+
+  it('an already-pushed candidate is refused before it even claims', async () => {
+    const fx = makePorts({
+      row: candidate({
+        status: 'PUSHED_TO_SHOPIFY',
+        pushState: 'SUCCEEDED',
+        pushedShopifyProductId: 'gid://shopify/Product/9',
+      }),
+    });
+    const error = await expectAppError(pushCandidateAsDraft(fx.ports, 'cand-1', input()));
+    assert.equal(error.code, 'RESEARCH_ALREADY_PUSHED');
+    assert.equal(count(fx.calls, 'claim'), 0);
+    assert.equal(count(fx.calls, 'createProduct'), 0);
+  });
+
+  it('a candidate left in a safety incident is refused, and stays that way', async () => {
+    const fx = makePorts({
+      row: candidate({ pushState: 'SAFETY_INCIDENT', pushSafetyReason: 'was visible' }),
+    });
+    const error = await expectAppError(pushCandidateAsDraft(fx.ports, 'cand-1', input()));
+    assert.equal(error.code, 'RESEARCH_PUSH_SAFETY');
+    assert.equal(count(fx.calls, 'claim'), 0);
+    assert.equal(count(fx.calls, 'createProduct'), 0);
+  });
+});
+
+/* ===========================================================================
+ * Concurrency and idempotency - the point of the atomic claim
+ * ======================================================================== */
+
+describe('two pushes cannot both create a product', () => {
+  it('two DIFFERENT operations racing produce exactly one createProduct', async () => {
+    const fx = makePorts({ row: candidate() });
+
+    const [a, b] = await Promise.allSettled([
+      pushCandidateAsDraft(fx.ports, 'cand-1', input({ operationId: 'op-A' })),
+      pushCandidateAsDraft(fx.ports, 'cand-1', input({ operationId: 'op-B' })),
+    ]);
+
+    // Exactly one product, no matter how the two interleaved.
+    assert.equal(count(fx.calls, 'createProduct'), 1);
+
+    const outcomes = [a, b];
+    const fulfilled = outcomes.filter((o) => o.status === 'fulfilled');
+    const rejected = outcomes.filter((o) => o.status === 'rejected');
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+
+    const refusal = (rejected[0] as PromiseRejectedResult).reason;
+    assert.ok(refusal instanceof AppError);
+    // The loser is told a push is running, not that something broke.
+    assert.equal((refusal as AppError).code, 'RESEARCH_PUSH_IN_PROGRESS');
+  });
+
+  it('the loser makes no Shopify call of any kind', async () => {
+    const fx = makePorts({ row: candidate() });
+    await Promise.allSettled([
+      pushCandidateAsDraft(fx.ports, 'cand-1', input({ operationId: 'op-A' })),
+      pushCandidateAsDraft(fx.ports, 'cand-1', input({ operationId: 'op-B' })),
+    ]);
+    // One create, one findByResearchTag (the winner's reconcile lookup). The loser never
+    // reached either.
+    assert.equal(count(fx.calls, 'createProduct'), 1);
+    assert.equal(count(fx.calls, 'findByResearchTag'), 1);
+  });
+});
+
+/* ===========================================================================
+ * Crash recovery - a claim alone is not enough, the identity tag is
+ * ======================================================================== */
+
+describe('recovery after a create that never finished recording', () => {
+  it('a retry with the same operation reconciles instead of creating a second product', async () => {
+    /*
+     * The exact crash window: createProduct succeeds, then the Mongo write fails and the
+     * process dies. The candidate is left IN_PROGRESS with this operation's id, and a
+     * product exists in Shopify carrying the identity tag - but Mongo never learned its id.
+     */
+    const fx = makePorts({
+      row: candidate(),
+      failOnce: {
+        markSucceeded: () => {
+          throw new Error('mongo write failed after the product was created');
+        },
+      },
+    });
+
+    // First attempt: creates the product, then the mark fails and the error propagates.
+    let firstThrew = false;
+    try {
+      await pushCandidateAsDraft(fx.ports, 'cand-1', input({ operationId: 'op-retry' }));
+    } catch {
+      firstThrew = true;
+    }
+    assert.ok(firstThrew, 'the first attempt must surface the failed write, not swallow it');
+    assert.equal(count(fx.calls, 'createProduct'), 1);
+    // The claim was NOT released, because a product exists - a naive retry must not race.
+    assert.equal(count(fx.calls, 'release'), 0);
+    // A refused/failed push is still audited.
+    assert.ok(fx.audits.length >= 1);
+
+    // The orphaned product is now discoverable by its identity tag.
+    fx.world.existingResearchProduct = {
+      shopifyProductId: 'gid://shopify/Product/1',
+      state: hiddenState,
+    };
+
+    // Retry, SAME operation id. It owns the claim, so step 1 lets it through to reconcile.
+    const result = await pushCandidateAsDraft(
+      fx.ports,
+      'cand-1',
+      input({ operationId: 'op-retry' }),
+    );
+
+    assert.equal(result.outcome, 'RECONCILED');
+    // STILL exactly one create across both attempts. This is the whole guarantee.
+    assert.equal(count(fx.calls, 'createProduct'), 1);
+  });
+
+  it('an expired lease lets a new operation reconcile the orphaned product', async () => {
+    const claimedLongAgo = new Date(NOW.getTime() - PUSH_CLAIM_LEASE_MS - 1_000).toISOString();
+    const fx = makePorts({
+      row: candidate({
+        pushState: 'IN_PROGRESS',
+        pushOperationId: 'op-dead',
+        pushClaimedAt: claimedLongAgo,
+      }),
+      existingResearchProduct: {
+        shopifyProductId: 'gid://shopify/Product/orphan',
+        state: hiddenState,
+      },
+    });
+
+    const result = await pushCandidateAsDraft(
+      fx.ports,
+      'cand-1',
+      input({ operationId: 'op-fresh' }),
+    );
+
+    assert.equal(result.outcome, 'RECONCILED');
+    assert.equal(result.shopifyProductId, 'gid://shopify/Product/orphan');
+    // Reconciliation, so nothing new was created.
+    assert.equal(count(fx.calls, 'createProduct'), 0);
+  });
+
+  it('a live lease held by another operation is NOT recoverable', async () => {
+    const claimedJustNow = new Date(NOW.getTime() - 1_000).toISOString();
+    const fx = makePorts({
+      row: candidate({
+        pushState: 'IN_PROGRESS',
+        pushOperationId: 'op-active',
+        pushClaimedAt: claimedJustNow,
+      }),
+    });
+    const error = await expectAppError(
+      pushCandidateAsDraft(fx.ports, 'cand-1', input({ operationId: 'op-intruder' })),
+    );
+    assert.equal(error.code, 'RESEARCH_PUSH_IN_PROGRESS');
+    assert.equal(count(fx.calls, 'createProduct'), 0);
+    assert.equal(count(fx.calls, 'claim'), 0);
+  });
+});
+
+/* ===========================================================================
+ * The draft-only postcondition
+ * ======================================================================== */
+
+describe('a product that comes back visible is forced hidden, never reported as success', () => {
+  it('runs forceHidden and succeeds quietly when the repair works', async () => {
+    const fx = makePorts({
+      row: candidate(),
+      createdState: visibleState,
+      forceHiddenState: hiddenState,
+    });
+
+    const result = await pushCandidateAsDraft(fx.ports, 'cand-1', input());
+    assert.equal(count(fx.calls, 'forceHidden'), 1);
+    assert.ok(fx.calls.indexOf('forceHidden') > fx.calls.indexOf('createProduct'));
+    // Repaired, so it is an ordinary success - but it says so through the verified state.
+    assert.equal(result.productState.visibleToCustomers, false);
+    assert.equal(result.safetyIncident, null);
+    assert.equal(count(fx.calls, 'markSucceeded'), 1);
+    assert.equal(count(fx.calls, 'markSafetyIncident'), 0);
+  });
+
+  it('raises RESEARCH_PUSH_SAFETY and marks an incident when the product stays visible', async () => {
+    const fx = makePorts({
+      row: candidate(),
+      createdState: visibleState,
+      forceHiddenState: visibleState, // the repair did not take
+    });
+
+    const error = await expectAppError(pushCandidateAsDraft(fx.ports, 'cand-1', input()));
+    assert.equal(error.code, 'RESEARCH_PUSH_SAFETY');
+    // The product was created, so its id survives for a human to find.
+    assert.match(String((error.details as { shopifyProductId?: string })?.shopifyProductId), /Product/);
+    assert.equal(count(fx.calls, 'forceHidden'), 1);
+    assert.equal(count(fx.calls, 'markSafetyIncident'), 1);
+    assert.equal(count(fx.calls, 'markSucceeded'), 0);
+    // The claim is NOT released - the candidate stays in SAFETY_INCIDENT so no retry races.
+    assert.equal(count(fx.calls, 'release'), 0);
+  });
+
+  it('escalates when forceHidden itself throws', async () => {
+    const fx = makePorts({
+      row: candidate(),
+      createdState: visibleState,
+      failOnce: {
+        forceHidden: () => {
+          throw new Error('shopify unreachable');
+        },
+      },
+    });
+
+    const error = await expectAppError(pushCandidateAsDraft(fx.ports, 'cand-1', input()));
+    assert.equal(error.code, 'RESEARCH_PUSH_SAFETY');
+    assert.equal(count(fx.calls, 'markSafetyIncident'), 1);
+    assert.equal(count(fx.calls, 'createProduct'), 1);
+  });
+});
+
+/* ===========================================================================
+ * Reconciliation specifics
+ * ======================================================================== */
+
+describe('reconcile adopts an existing product without re-pricing it', () => {
+  it('creates nothing, records no cost, and reports RECONCILED', async () => {
+    const fx = makePorts({
+      row: candidate(),
+      existingResearchProduct: {
+        shopifyProductId: 'gid://shopify/Product/already',
+        state: hiddenState,
+      },
+    });
+
+    const result = await pushCandidateAsDraft(fx.ports, 'cand-1', input());
+    assert.equal(result.outcome, 'RECONCILED');
+    assert.equal(count(fx.calls, 'createProduct'), 0);
+    assert.equal(count(fx.calls, 'prepare'), 0); // no re-analysis needed to adopt
+    assert.equal(fx.costs.length, 0);
+    assert.equal(count(fx.calls, 'markSucceeded'), 1);
+    assert.equal(fx.audits[0]?.outcome, 'RECONCILED');
+  });
+});

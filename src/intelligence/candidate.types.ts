@@ -88,6 +88,23 @@ export type Recommendation =
   | 'WEAK'
   | 'REJECT';
 
+/**
+ * Where a candidate is in the PUSH lifecycle.
+ *
+ * Deliberately ORTHOGONAL to CandidateStatus. Status records an operator's commercial
+ * decision ("I am watching this", "I rejected this"); pushState records the mechanical
+ * state of one Shopify write. Folding them together was the original design and it could
+ * not express the state that actually matters: "a Shopify product may exist but we have
+ * not confirmed it", which is neither a decision nor a success.
+ *
+ *   IDLE             no push has been attempted, or the last one released cleanly
+ *   IN_PROGRESS      a claim is held. Exactly one operation owns it at a time
+ *   SUCCEEDED        a Shopify DRAFT exists and was verified hidden
+ *   SAFETY_INCIDENT  a Shopify product exists in a state Trademart could not verify as
+ *                    hidden. NOT a success, and never reported as one
+ */
+export type PushState = 'IDLE' | 'IN_PROGRESS' | 'SUCCEEDED' | 'SAFETY_INCIDENT';
+
 export type CandidateStatus =
   /** Created, never scored. */
   | 'NEW'
@@ -381,6 +398,29 @@ export interface ProductCandidate {
   freshness: Freshness;
 
   status: CandidateStatus;
+  /**
+   * The push lifecycle, orthogonal to `status`. See PushState.
+   *
+   * Read this, not `status`, to decide whether a Shopify write may begin.
+   */
+  pushState: PushState;
+  /** The operation that owns (or last owned) the push claim. Null when IDLE. */
+  pushOperationId: string | null;
+  /**
+   * When the claim was taken. Null when IDLE.
+   *
+   * The lease clock: a claim older than the lease is recoverable, which is how a crashed
+   * process stops blocking the candidate forever without needing a sweeper job.
+   */
+  pushClaimedAt: string | null;
+  /**
+   * Why the last push ended in SAFETY_INCIDENT. Null in every other state.
+   *
+   * Surfaced to the operator, because SAFETY_INCIDENT means a Shopify product may be
+   * visible and only a human can confirm it is not. A state with no explanation is a state
+   * nobody can clear.
+   */
+  pushSafetyReason: string | null;
   /** Set once a DRAFT exists in Shopify. Never implies it is published. */
   pushedShopifyProductId: string | null;
   /** When a watch expires, so a watchlist does not grow forever. */
@@ -410,41 +450,23 @@ export interface ProductCandidate {
   analyzedInputRevision: number | null;
 }
 
-/** Statuses from which a candidate may still be pushed to Shopify. */
-export const PUSHABLE_STATUSES: readonly CandidateStatus[] = Object.freeze([
-  'NEW',
-  // The normal path: analyse, read the score, push. Omitting this would refuse the one
-  // sequence the module is designed around.
-  'ANALYZED',
-  'WATCHING',
-  'SELECTED',
-]);
-
-/**
- * Whether a candidate can be pushed, and why not.
+/*
+ * PUSHABLE_STATUSES and canPush() moved to candidate.transitions.ts.
  *
- * REJECTED is blocked because pushing a rejected candidate is almost always a
- * mis-click, and PUSHED_TO_SHOPIFY is blocked because a second push would create a
- * duplicate product - the thing PART 21 exists to prevent.
+ * They were removed rather than kept alongside the new policy, because canPush() looked
+ * only at `status` and `pushedShopifyProductId`. It could not see `pushState`, so it
+ * happily approved a push for a candidate whose push was already running. Two functions
+ * answering "may I push?" with different amounts of information is exactly how the
+ * permissive one gets called.
+ *
+ * candidate.transitions.ts now owns every "may I?" question - status transitions, push
+ * eligibility and the actions the UI may offer - so they cannot drift apart.
  */
-export function canPush(candidate: Pick<ProductCandidate, 'status' | 'pushedShopifyProductId'>): {
-  allowed: boolean;
-  reason: string | null;
-} {
-  if (candidate.pushedShopifyProductId !== null) {
-    return {
-      allowed: false,
-      reason: `This candidate has already been pushed to Shopify as ${candidate.pushedShopifyProductId}. Pushing again would create a duplicate product; edit the existing draft instead.`,
-    };
-  }
-  if (!PUSHABLE_STATUSES.includes(candidate.status)) {
-    return {
-      allowed: false,
-      reason:
-        candidate.status === 'REJECTED'
-          ? 'This candidate was rejected. Re-open it before pushing, so the decision is deliberate.'
-          : `A candidate with status ${candidate.status} cannot be pushed.`,
-    };
-  }
-  return { allowed: true, reason: null };
-}
+export {
+  PUSHABLE_STATUSES,
+  canPushCandidate,
+  canTransition,
+  allowedActions,
+  isTerminal,
+} from './candidate.transitions';
+export type { ActionDecision, AllowedActions, ResearchAction } from './candidate.transitions';

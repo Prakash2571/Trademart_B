@@ -95,6 +95,27 @@ export function resolveListingPrice(
  */
 export const RESEARCH_PUSH_TAG = 'trademart-research';
 
+/** Prefix of the per-candidate identity tag. Separated so the lookup cannot typo it. */
+export const RESEARCH_IDENTITY_PREFIX = 'trademart-research-candidate';
+
+/**
+ * The deterministic Shopify identity of a research push.
+ *
+ * THIS IS WHAT MAKES CRASH RECOVERY POSSIBLE.
+ *
+ * An atomic Mongo claim cannot cover the window between Shopify creating the product and
+ * Trademart recording its id: if the process dies there, Mongo knows a push was running
+ * and does not know what it made. Retrying would create a second product.
+ *
+ * So every pushed draft carries a tag derived from the candidate id, and a retry looks the
+ * candidate up in Shopify by that exact tag before creating anything. Recovery therefore
+ * depends on an EXACT match on a value Trademart controls - not on a title comparison,
+ * not on the first 250 products, and not on the operator noticing.
+ */
+export function researchIdentityTag(candidateId: string): string {
+  return `${RESEARCH_IDENTITY_PREFIX}:${candidateId}`;
+}
+
 /**
  * Builds the create request.
  *
@@ -106,7 +127,13 @@ export function buildDraftRequest(
   candidate: ProductCandidate,
   price: number,
 ): ProductCreateRequest {
-  const tags = [RESEARCH_PUSH_TAG];
+  const tags = [
+    RESEARCH_PUSH_TAG,
+    // The per-candidate identity. Load-bearing: this is what a retry looks up to discover
+    // that a product already exists, rather than creating a duplicate. See
+    // researchIdentityTag.
+    researchIdentityTag(candidate.id),
+  ];
   if (candidate.recommendation !== null) {
     // So an operator can find everything research pushed AND see what it thought at the
     // time, without opening each one.

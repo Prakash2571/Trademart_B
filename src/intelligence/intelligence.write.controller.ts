@@ -21,7 +21,10 @@
 
 import { Router } from 'express';
 
+import { randomUUID } from 'node:crypto';
+
 import { recordAudit } from '../audit/audit.service';
+import { IDEMPOTENCY_HEADER, idempotent } from '../common/idempotency';
 import { AppError } from '../common/errors';
 import { asyncHandler, sendSuccess } from '../common/http';
 import type { PricingScenarioName } from '../pricing/recommendation';
@@ -254,9 +257,17 @@ intelligenceWriteRouter.post(
  * Named `push` and not `publish`, and it cannot publish: see push.draft.ts, where DRAFT and
  * publish false are hard-coded and asserted. The response says so explicitly rather than
  * leaving the UI to infer it.
+ *
+ * IDEMPOTENT. Wrapped in the EXISTING idempotency middleware rather than a second
+ * mechanism of its own: a repeated Idempotency-Key replays the stored response instead of
+ * creating a second product, which is what makes an accidental double-click or a transport
+ * retry safe. The middleware is opt-in by header, so the operation id falls back to a
+ * generated one when no key is supplied - the atomic claim inside the service is what
+ * protects against two DIFFERENT operations, and it does not depend on the header.
  */
 intelligenceWriteRouter.post(
   '/intelligence/candidates/:id/push',
+  idempotent('POST /api/intelligence/candidates/:id/push'),
   asyncHandler(async (req, res) => {
     const id = requireId(req.params.id);
     const payload = body(req);
@@ -271,24 +282,66 @@ intelligenceWriteRouter.post(
       throw new AppError('VALIDATION_ERROR', 'price must be a number when supplied.');
     }
 
-    // Must be exactly true. A truthy string from a form would otherwise silently override
-    // a duplicate block, and the whole point of the flag is that overriding is deliberate.
+    /*
+     * The decision the operator approved.
+     *
+     * REQUIRED. Optional at the service's type level so an internal caller can push
+     * without one, but a request arriving over HTTP without it would mean the operator
+     * clicked Push on a screen whose numbers nobody compared against the current ones -
+     * which is the entire failure this gate exists to prevent.
+     */
+    const expectedDecisionHash = payload['expectedDecisionHash'];
+    if (typeof expectedDecisionHash !== 'string' || expectedDecisionHash.trim() === '') {
+      throw new AppError(
+        'VALIDATION_ERROR',
+        'expectedDecisionHash is required. Read the candidate or run an analysis to obtain it, and send back the hash of the decision you actually reviewed - it is what proves the recommendation and price have not moved since you looked.',
+      );
+    }
+
+    /*
+     * Both overrides must be EXACTLY true.
+     *
+     * A truthy string from a form would otherwise silently accept a duplicate or a
+     * loss-making price. They are separate flags on purpose: accepting a duplicate and
+     * accepting a price below your own floors are different decisions, and one checkbox
+     * covering both would let an operator agree to something they never saw.
+     */
     const allowDuplicate = payload['allowDuplicate'] === true;
+    const acknowledgeGuardBreach = payload['acknowledgeGuardBreach'] === true;
+
+    /*
+     * One operation id per logical push.
+     *
+     * The Idempotency-Key when the client sent one, so a transport retry resumes the same
+     * operation rather than being locked out by its own claim. A generated id otherwise -
+     * the claim still serialises concurrent pushes, it just cannot recognise a retry as
+     * the same attempt.
+     */
+    const operationId = req.header(IDEMPOTENCY_HEADER)?.trim() ?? `push-${randomUUID()}`;
 
     const result = await pushCandidateAsDraft(id, {
       ...(scenario === undefined ? {} : { scenario: scenario as PricingScenarioName }),
       ...(price === undefined ? {} : { price: price as number }),
+      expectedDecisionHash: expectedDecisionHash.trim(),
       allowDuplicate,
+      acknowledgeGuardBreach,
+      operationId,
     });
 
-    // The audit entry is written inside pushCandidateAsDraft, where the failure paths are,
-    // so a refused push is recorded too - an attempt that was blocked is often the more
+    // The audit entry is written inside the orchestration, where the failure paths are, so
+    // a refused push is recorded too - an attempt that was blocked is often the more
     // interesting entry.
     res.status(201);
     sendSuccess(res, result, {
-      published: false,
-      visibleToCustomers: result.product.visibleToCustomers,
-      note: 'A DRAFT was created. Nothing has been published - review the listing in Shopify and publish it there when you are ready.',
+      // Stated, never inferred. `visibleToCustomers` is the only field that means a
+      // customer could see it, and it is read back from Shopify rather than assumed.
+      published: result.productState.published,
+      visibleToCustomers: result.productState.visibleToCustomers,
+      outcome: result.outcome,
+      note:
+        result.outcome === 'RECONCILED'
+          ? 'A Shopify draft for this candidate already existed, so nothing new was created. The candidate has been reconciled with it.'
+          : 'A DRAFT was created. Nothing has been published - review the listing in Shopify and publish it there when you are ready.',
     });
   }),
 );

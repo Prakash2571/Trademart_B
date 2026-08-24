@@ -32,11 +32,19 @@ import {
   type ProductCandidateDocument,
 } from '../database/models/ProductCandidate';
 import { pricingPolicyFrom } from '../dropshipping/dropshipping.pricing';
-import { resolveSettings } from '../dropshipping/dropshipping.service';
+import { evaluatePriceAgainstPolicy } from '../pricing/recommendation';
+import type { PricingResult } from '../pricing/pricing.service';
+import type { ShippingSla } from '../dropshipping/dropshipping.types';
+import { loadSettings } from '../dropshipping/dropshipping.service';
 import type { PricingPolicy, PricingScenarioName } from '../pricing/recommendation';
 import { listOrders, listProducts } from '../shopify/shopify.service';
 import type { OrderDto, ProductDto } from '../shopify/shopify.types';
-import { analyseCandidate, researchRequestFor } from './candidate.analysis';
+import {
+  analyseCandidate,
+  applyAnalysisToCandidate,
+  researchRequestFor,
+  type CandidateAnalysis,
+} from './candidate.analysis';
 import {
   EMPTY_MANUAL_RESEARCH,
   type CandidateSource,
@@ -45,12 +53,14 @@ import {
   type ProductCandidate,
   type TargetMarket,
 } from './candidate.types';
-import { changedScoreInputs } from './candidate.revision';
+import { changedScoreInputs, scoreIsStale } from './candidate.revision';
+import { allowedActions, canTransition, isTerminal } from './candidate.transitions';
+import { computeDecisionHash } from './decision.hash';
 import {
   validateCandidateInput as validateCandidateInputRules,
   type CreateCandidateInput as CreateCandidateInputShape,
 } from './candidate.validation';
-import { gatherSignals } from './providers/provider.types';
+import { gatherSignals, type ResearchSignals } from './providers/provider.types';
 import { describeResearchSupport, researchProvidersFor } from './providers/registry';
 import {
   createShopifyPerformanceProvider,
@@ -165,6 +175,13 @@ function toCandidate(row: ProductCandidateDocument): ProductCandidate {
     freshness: (orNull(row.freshness) ?? 'UNKNOWN') as ProductCandidate['freshness'],
 
     status: row.status as CandidateStatus,
+    // Defaults matter for rows written before these fields existed. IDLE is the safe
+    // reading: it lets a claim be taken, and the Shopify tag lookup inside the push is
+    // what prevents a duplicate if one somehow already exists.
+    pushState: (orNull(row.pushState) ?? 'IDLE') as ProductCandidate['pushState'],
+    pushOperationId: orNull(row.pushOperationId),
+    pushClaimedAt: orNull(row.pushClaimedAt),
+    pushSafetyReason: orNull(row.pushSafetyReason),
     pushedShopifyProductId: orNull(row.pushedShopifyProductId),
     watchUntil: orNull(row.watchUntil),
 
@@ -429,6 +446,7 @@ export async function getCandidate(candidateId: string): Promise<ProductCandidat
 async function loadStoreHistory(
   category: string | null,
   market: TargetMarket,
+  sla: ShippingSla,
   now: Date,
 ): Promise<StoreHistorySummary | null> {
   if (category === null || category.trim() === '') return null;
@@ -458,7 +476,12 @@ async function loadStoreHistory(
     category,
     market,
     truncated,
-    sla: resolveSettings().sla,
+    // The operator's STORED SLA, passed in rather than read from config here.
+    //
+    // resolveSettings() is config-only, so measuring "late" for research used thresholds
+    // the settings screen could not change while the dropshipping order view used ones it
+    // could. Two definitions of late in one product is worse than either definition.
+    sla,
     now,
   });
 }
@@ -473,17 +496,145 @@ export interface AnalyzeOptions {
   now?: Date;
 }
 
+/**
+ * A complete analysis that has NOT been written anywhere.
+ *
+ * The split exists because Push must know the current decision BEFORE it touches
+ * Shopify, and must not have persisted anything if it then refuses. Persisting first and
+ * rolling back on refusal would leave the score history full of analyses nobody asked
+ * for; refusing first and persisting nothing leaves the candidate exactly as the operator
+ * last saw it.
+ */
+export interface PreparedAnalysis {
+  /** The row as loaded, BEFORE the fresh score is applied. */
+  storedCandidate: ProductCandidate;
+  /**
+   * The candidate as it stands after this analysis.
+   *
+   * This is what every downstream consumer must use. See applyAnalysisToCandidate: the
+   * old push path built its Shopify draft from the PRE-analysis object, so a fresh
+   * GOOD_CANDIDATE / 82 could be listed with a description and tag reading WATCH / 61.
+   */
+  freshCandidate: ProductCandidate;
+  analysis: CandidateAnalysis;
+  signals: ResearchSignals;
+  history: StoreHistorySummary | null;
+  /** The policy actually applied, after store settings and any override. */
+  policy: PricingPolicy;
+  /** Binds this exact decision. See decision.hash.ts. */
+  decisionHash: string;
+  /**
+   * Prices an arbitrary amount against the same cost model, so a hand-typed price faces
+   * the same commercial floors as a scenario price. Null when nothing could be priced.
+   */
+  evaluatePrice: (amount: number) => PricingResult | null;
+  now: Date;
+}
+
 export interface AnalyzeResult {
   candidate: ProductCandidate;
   /** The three price scenarios, so the UI need not ask again. */
-  pricing: ReturnType<typeof analyseCandidate>['pricing'];
+  pricing: CandidateAnalysis['pricing'];
   /** Which provider answered for what, and who declined. */
-  provenance: ReturnType<typeof gatherSignals>['provenance'];
+  provenance: ResearchSignals['provenance'];
   /** What could not be measured at all. */
-  unavailable: ReturnType<typeof gatherSignals>['unavailable'];
+  unavailable: ResearchSignals['unavailable'];
   warnings: string[];
   /** Honest statement of what the module can and cannot measure. */
   capabilities: ReturnType<typeof describeResearchSupport>;
+  /**
+   * The hash the client must send back with a Push.
+   *
+   * Holding it is how an operator proves they are approving the decision they were
+   * shown rather than whatever the numbers happen to be by the time they click.
+   */
+  decisionHash: string;
+  /** Whether the stored score matches the candidate's current inputs. */
+  scoreIsStale: boolean;
+}
+
+/**
+ * Computes a candidate's current analysis WITHOUT persisting it.
+ *
+ * Everything expensive and everything external happens here - the Shopify history read,
+ * the provider gather, the pricing, the scoring - and nothing is written. Both the
+ * explicit Analyse action and Push call this; Analyse then persists, Push then compares
+ * the hash and only proceeds to Shopify if it matches.
+ */
+export async function prepareCandidateAnalysis(
+  candidateId: string,
+  options: AnalyzeOptions = {},
+): Promise<PreparedAnalysis> {
+  requireDatabase();
+
+  const now = options.now ?? new Date();
+  const storedCandidate = await getCandidate(candidateId);
+
+  // Settings first: the SLA feeds the fulfillment measurement inside the store-history
+  // read, and the cost config feeds the pricing policy. One read, used for both.
+  const settings = await loadSettings();
+
+  const history = await loadStoreHistory(
+    storedCandidate.category,
+    storedCandidate.market,
+    settings.sla,
+    now,
+  );
+  const providers = researchProvidersFor(
+    history === null ? null : createShopifyPerformanceProvider(history),
+  );
+
+  const request = researchRequestFor(
+    storedCandidate,
+    storedCandidate.manualResearch,
+    now,
+  );
+  const signals = gatherSignals(providers, request);
+
+  // Store settings drive the price, so Research and the dashboard cannot disagree about
+  // what a thin margin is. Echoed on the result, because the policy is part of the
+  // decision hash and a caller has to be able to see what was applied.
+  const policy = pricingPolicyFrom(settings.cost, options.policyOverride ?? null);
+
+  const analysis = analyseCandidate({
+    candidate: storedCandidate,
+    signals,
+    policy,
+    ...(options.pricingScenario === undefined
+      ? {}
+      : { pricingScenario: options.pricingScenario }),
+    now,
+  });
+
+  const freshCandidate = applyAnalysisToCandidate(storedCandidate, analysis, now);
+
+  return {
+    storedCandidate,
+    freshCandidate,
+    analysis,
+    signals,
+    history,
+    policy,
+    /*
+     * Prices an arbitrary amount against the same cost model the scenarios used.
+     *
+     * Exists so an operator's hand-typed price faces the SAME commercial floors as a
+     * scenario price. Previously a custom price bypassed the guards completely, which made
+     * them advisory for exactly the case most likely to breach them.
+     *
+     * Null when the analysis could not be priced at all, so a caller cannot mistake
+     * "no cost model" for "no breaches".
+     */
+    evaluatePrice: (amount: number) =>
+      evaluateCandidatePrice(storedCandidate.commercials, policy, amount),
+    decisionHash: computeDecisionHash({
+      candidate: freshCandidate,
+      score: analysis.score,
+      pricing: analysis.pricing,
+      policy,
+    }),
+    now,
+  };
 }
 
 /**
@@ -497,33 +648,43 @@ export async function analyzeCandidate(
   candidateId: string,
   options: AnalyzeOptions = {},
 ): Promise<AnalyzeResult> {
-  requireDatabase();
+  const prepared = await prepareCandidateAnalysis(candidateId, options);
+  return persistAnalysis(prepared);
+}
 
-  const now = options.now ?? new Date();
-  const candidate = await getCandidate(candidateId);
-
-  const history = await loadStoreHistory(candidate.category, candidate.market, now);
-  const providers = researchProvidersFor(
-    history === null ? null : createShopifyPerformanceProvider(history),
-  );
-
-  const request = researchRequestFor(candidate, candidate.manualResearch, now);
-  const signals = gatherSignals(providers, request);
-
-  const analysis = analyseCandidate({
-    candidate,
-    signals,
-    // Store settings drive the price, so Research and the dashboard cannot disagree
-    // about what a thin margin is.
-    policy: pricingPolicyFrom(resolveSettings().cost),
-    policyOverride: options.policyOverride ?? null,
-    ...(options.pricingScenario === undefined
-      ? {}
-      : { pricingScenario: options.pricingScenario }),
-    now,
-  });
-
+/**
+ * Writes a prepared analysis.
+ *
+ * Separate from prepareCandidateAnalysis so Push can prepare without writing. Kept
+ * internal-but-exported because the orchestration tests drive it directly.
+ */
+export async function persistAnalysis(prepared: PreparedAnalysis): Promise<AnalyzeResult> {
+  const { storedCandidate, freshCandidate, analysis, signals, history, now } = prepared;
   const { score } = analysis;
+
+  /*
+   * A closed candidate's stored numbers must not move.
+   *
+   * Analysis is read-only with respect to the operator's decision, but it is emphatically
+   * not read-only with respect to the row: it writes score, recommendation, factors and
+   * analyzedAt. Re-scoring a REJECTED candidate would leave a rejection sitting next to
+   * figures nobody saw when they rejected it, and re-scoring a PUSHED one would move the
+   * numbers away from the draft that was created from them.
+   *
+   * Enforced here, at the write, rather than only in allowedActions - a disabled button is
+   * a courtesy, not a control. A push is unaffected: it prepares and persists while the
+   * candidate is still pushable, and only then moves the status to PUSHED_TO_SHOPIFY.
+   */
+  if (isTerminal(storedCandidate.status)) {
+    throw new AppError(
+      storedCandidate.status === 'PUSHED_TO_SHOPIFY'
+        ? 'RESEARCH_ALREADY_PUSHED'
+        : 'VALIDATION_ERROR',
+      allowedActions(storedCandidate).analyze.reason ??
+        `A candidate with status ${storedCandidate.status} cannot be re-analysed.`,
+      { details: { candidateId: storedCandidate.id, status: storedCandidate.status } },
+    );
+  }
 
   // Only a real score joins the history. A null overall score is "not enough data", and
   // writing it as a history point would draw a line through the middle of the chart.
@@ -541,39 +702,40 @@ export async function analyzeCandidate(
         };
 
   await ProductCandidateModel.updateOne(
-    { shopDomain: shopDomain(), candidateId },
+    { shopDomain: shopDomain(), candidateId: storedCandidate.id },
     {
       $set: {
-        factors: score.factors,
-        overallScore: score.overallScore,
-        confidenceScore: score.confidenceScore,
-        recommendation: score.recommendation,
-        seasonState: score.seasonState,
-        reasons: score.reasons,
-        risks: score.risks,
-        evidence: score.evidence,
-        freshness: score.freshness,
-        analyzedAt: now.toISOString(),
+        factors: freshCandidate.factors,
+        overallScore: freshCandidate.overallScore,
+        confidenceScore: freshCandidate.confidenceScore,
+        recommendation: freshCandidate.recommendation,
+        seasonState: freshCandidate.seasonState,
+        reasons: freshCandidate.reasons,
+        risks: freshCandidate.risks,
+        evidence: freshCandidate.evidence,
+        freshness: freshCandidate.freshness,
+        analyzedAt: freshCandidate.analyzedAt,
         /*
          * Records WHICH revision of the inputs this score was computed from.
          *
-         * Read from the candidate loaded at the top of this function, so if an operator
-         * edits an input while the analysis is running, the stored revision is the one
-         * actually scored and the score correctly reports itself stale afterwards.
-         * Writing the current revision here instead would claim the score covers an edit
-         * it never saw.
+         * Taken from the candidate that was actually scored, so if an operator edits an
+         * input while the analysis is running, the stored revision is the one scored and
+         * the score correctly reports itself stale afterwards. Writing the CURRENT
+         * revision would claim the score covers an edit it never saw.
          */
-        analyzedInputRevision: candidate.inputRevision,
+        analyzedInputRevision: freshCandidate.analyzedInputRevision,
         // NEW -> ANALYZED. A deliberate operator decision (WATCHING, SELECTED,
-        // REJECTED) is never overwritten by re-running an analysis.
-        ...(candidate.status === 'NEW' ? { status: 'ANALYZED' } : {}),
+        // REJECTED, PUSHED_TO_SHOPIFY) is never overwritten by re-running an analysis.
+        ...(storedCandidate.status === 'NEW' ? { status: 'ANALYZED' } : {}),
       },
       ...(historyEntry === null ? {} : { $push: { scoreHistory: historyEntry } }),
     },
   );
 
+  const persisted = await getCandidate(storedCandidate.id);
+
   return {
-    candidate: await getCandidate(candidateId),
+    candidate: persisted,
     pricing: analysis.pricing,
     provenance: signals.provenance,
     unavailable: signals.unavailable,
@@ -581,7 +743,27 @@ export async function analyzeCandidate(
     capabilities: describeResearchSupport(
       history === null ? null : createShopifyPerformanceProvider(history),
     ),
+    decisionHash: prepared.decisionHash,
+    scoreIsStale: scoreIsStale(persisted),
   };
+}
+
+/**
+ * Prices one amount against a candidate's costs and the effective policy.
+ *
+ * A thin adapter over the pricing engine so the orchestration can guard a hand-typed
+ * price with the same rules a scenario price gets.
+ */
+function evaluateCandidatePrice(
+  commercials: ProductCandidate['commercials'],
+  policy: PricingPolicy,
+  amount: number,
+): ReturnType<typeof evaluatePriceAgainstPolicy> {
+  return evaluatePriceAgainstPolicy(
+    { supplierCost: commercials.supplierCost, shippingCost: commercials.shippingCost },
+    policy,
+    amount,
+  );
 }
 
 /* ===========================================================================
@@ -601,7 +783,36 @@ export async function setCandidateStatus(
   options: { watchUntil?: string | null; note?: string | null } = {},
 ): Promise<ProductCandidate> {
   requireDatabase();
-  await getCandidate(candidateId);
+  const existing = await getCandidate(candidateId);
+
+  /*
+   * BOTH ends of the transition are validated.
+   *
+   * This used to check nothing at all: the target status was a valid value, so the write
+   * went through. A candidate that already had a Shopify draft could therefore be set back
+   * to WATCHING, after which every list and every button treated it as an ordinary
+   * pre-product candidate - one click from a second product. A REJECTED candidate could
+   * quietly become WATCHING again with no record of anyone reopening it.
+   *
+   * Terminality is a property of the CURRENT state, which a target-only check cannot see.
+   */
+  const transition = canTransition(existing.status, status, {
+    pushedShopifyProductId: existing.pushedShopifyProductId,
+  });
+  if (!transition.allowed) {
+    throw new AppError(
+      existing.status === 'PUSHED_TO_SHOPIFY' ? 'RESEARCH_ALREADY_PUSHED' : 'VALIDATION_ERROR',
+      transition.reason ?? `A candidate with status ${existing.status} cannot become ${status}.`,
+      {
+        details: {
+          candidateId,
+          from: existing.status,
+          to: status,
+          pushedShopifyProductId: existing.pushedShopifyProductId,
+        },
+      },
+    );
+  }
 
   const $set: Record<string, unknown> = { status };
   if (options.watchUntil !== undefined) $set.watchUntil = options.watchUntil;
@@ -610,10 +821,26 @@ export async function setCandidateStatus(
   // watchlist query return things nobody is watching.
   if (status !== 'WATCHING' && options.watchUntil === undefined) $set.watchUntil = null;
 
-  await ProductCandidateModel.updateOne(
-    { shopDomain: shopDomain(), candidateId },
+  /*
+   * The current status is in the FILTER as well.
+   *
+   * The check above read the candidate; this makes the write conditional on it not having
+   * moved since. Without it, a push completing between the read and the write would be
+   * overwritten by a WATCHING that was legal when it was decided and is not any more.
+   */
+  const result = await ProductCandidateModel.updateOne(
+    { shopDomain: shopDomain(), candidateId, status: existing.status },
     { $set },
   );
+
+  if (result.matchedCount === 0) {
+    const current = await getCandidate(candidateId);
+    throw new AppError(
+      'RESEARCH_ALREADY_PUSHED',
+      `This candidate changed while the request was in flight - it is now ${current.status}. Nothing was written. Re-read it and decide again.`,
+      { details: { candidateId, expected: existing.status, actual: current.status } },
+    );
+  }
 
   return getCandidate(candidateId);
 }

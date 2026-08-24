@@ -220,6 +220,41 @@ const productCandidateSchema = new Schema(
      */
     pushedShopifyProductId: { type: String, default: null },
     pushedAt: { type: String, default: null },
+
+    /**
+     * The push lifecycle, ORTHOGONAL to `status`. See PushState in candidate.types.ts.
+     *
+     * This is the field a conditional claim filters on, so exactly one operation can own
+     * a candidate's push at a time. `status` cannot serve that purpose: it records an
+     * operator's commercial decision, and overloading it could not express "a Shopify
+     * product may exist but we have not confirmed it".
+     */
+    pushState: {
+      type: String,
+      required: true,
+      enum: ['IDLE', 'IN_PROGRESS', 'SUCCEEDED', 'SAFETY_INCIDENT'],
+      default: 'IDLE',
+    },
+    /** The operation holding the claim. Compared so a replay recognises its own claim. */
+    pushOperationId: { type: String, default: null },
+    /**
+     * When the claim was taken - the lease clock.
+     *
+     * A claim older than the lease is recoverable, which is how a process that died
+     * mid-push stops blocking the candidate forever without a sweeper job. Recovery is
+     * only safe because the Shopify-side research tag makes a duplicate impossible.
+     */
+    pushClaimedAt: { type: String, default: null },
+    /**
+     * Why the push ended in SAFETY_INCIDENT, in the words a human needs to act on it.
+     *
+     * DECLARED, not implied. The schema is strict, so a field written by the service but
+     * missing here is dropped without error - which would have left a candidate sitting in
+     * SAFETY_INCIDENT with no record of what the incident was, i.e. the one row where the
+     * explanation matters most would have been the one that lost it.
+     */
+    pushSafetyReason: { type: String, default: null },
+
     watchUntil: { type: String, default: null },
 
     scoreHistory: { type: [scoreHistoryEntrySchema], default: [] },

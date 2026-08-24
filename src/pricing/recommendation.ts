@@ -781,3 +781,33 @@ function clampMargin(requested: number, policy: PricingPolicy): number {
 function roundTo2(value: number): number {
   return Math.round(value * 100) / 100;
 }
+
+
+/**
+ * Prices a SPECIFIC amount against a policy's cost model.
+ *
+ * The scenarios answer "what should this cost?". This answers "what happens if I charge
+ * exactly this?", which is the question an operator asks when they type their own price
+ * into the push dialog.
+ *
+ * It exists because a hand-typed price used to bypass the commercial floors entirely - the
+ * guards were checked against scenario prices only, so they were advisory for precisely
+ * the case most likely to breach them.
+ *
+ * Returns null when there is no usable cost model, so a caller cannot read "nothing to
+ * check" as "nothing wrong". Uses the same evaluateAt path the scenarios do, so the two
+ * cannot disagree about what a price yields.
+ */
+export function evaluatePriceAgainstPolicy(
+  input: {
+    supplierCost: number | null;
+    shippingCost: number | null;
+  },
+  policy: PricingPolicy,
+  price: number,
+): PricingResult | null {
+  if (input.supplierCost === null || !Number.isFinite(input.supplierCost)) return null;
+  if (!Number.isFinite(price) || price <= 0) return null;
+
+  return evaluateAt(price, input.supplierCost, input.shippingCost, policy);
+}

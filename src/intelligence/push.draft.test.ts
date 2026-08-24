@@ -21,10 +21,12 @@ import type { ProductCreateRequest } from '../products/product.create';
 import type { ProductCandidate } from './candidate.types';
 import { EMPTY_MANUAL_RESEARCH } from './candidate.types';
 import {
+  RESEARCH_IDENTITY_PREFIX,
   RESEARCH_PUSH_TAG,
   assertDraftOnly,
   buildDraftRequest,
   describeCandidate,
+  researchIdentityTag,
   resolveListingPrice,
 } from './push.draft';
 
@@ -62,6 +64,10 @@ function candidate(overrides: Partial<ProductCandidate> = {}): ProductCandidate 
     evidence: [],
     freshness: 'FRESH',
     status: 'ANALYZED',
+    pushState: 'IDLE',
+    pushOperationId: null,
+    pushClaimedAt: null,
+    pushSafetyReason: null,
     pushedShopifyProductId: null,
     watchUntil: null,
     scoreHistory: [],
@@ -165,9 +171,27 @@ describe('buildDraftRequest', () => {
     assert.ok(request.tags.includes('research-good-candidate'));
   });
 
+  it('carries a per-candidate identity tag, which is what makes reconciliation exact', () => {
+    /*
+     * The reason this tag exists: a push can crash between the Shopify create and the
+     * Mongo write, and the only thing that can find the orphan afterwards is an exact
+     * lookup. A shared 'trademart-research' tag cannot - it matches every push ever made.
+     * Scanning titles cannot either, because two candidates may share a title.
+     */
+    const request = buildDraftRequest(candidate({ id: 'cand-77' }), 22.99);
+    assert.ok(request.tags.includes(researchIdentityTag('cand-77')));
+    assert.equal(researchIdentityTag('cand-77'), 'trademart-research-candidate:cand-77');
+    // Exactly one, so a tag: query can never match two products for one candidate.
+    assert.equal(
+      request.tags.filter((tag) => tag.startsWith(RESEARCH_IDENTITY_PREFIX)).length,
+      1,
+    );
+  });
+
   it('omits the recommendation tag when there is no recommendation', () => {
     const request = buildDraftRequest(candidate({ recommendation: null }), 22.99);
-    assert.deepEqual(request.tags, [RESEARCH_PUSH_TAG]);
+    // The generic tag and the identity tag remain - they are not about the recommendation.
+    assert.deepEqual(request.tags, [RESEARCH_PUSH_TAG, researchIdentityTag('cand-1')]);
   });
 
   it('maps the category to productType, and omits it when absent', () => {

@@ -27,7 +27,26 @@ const WRITE = readFileSync(
   'utf8',
 );
 const PUSH = readFileSync(join(process.cwd(), 'src', 'intelligence', 'push.draft.ts'), 'utf8');
+const PORTS = readFileSync(join(process.cwd(), 'src', 'intelligence', 'push.ports.ts'), 'utf8');
+const ORCHESTRATOR = readFileSync(
+  join(process.cwd(), 'src', 'intelligence', 'push.orchestrator.ts'),
+  'utf8',
+);
+const SERVICE = readFileSync(
+  join(process.cwd(), 'src', 'intelligence', 'push.service.ts'),
+  'utf8',
+);
 const APP = readFileSync(join(process.cwd(), 'src', 'app.ts'), 'utf8');
+
+/** Every source file the research module ships, by name, for the publish invariant. */
+const RESEARCH_SOURCES: readonly [string, string][] = [
+  ['intelligence.controller.ts', READ],
+  ['intelligence.write.controller.ts', WRITE],
+  ['push.draft.ts', PUSH],
+  ['push.ports.ts', PORTS],
+  ['push.orchestrator.ts', ORCHESTRATOR],
+  ['push.service.ts', SERVICE],
+];
 
 function routes(source: string, router: string): { method: string; path: string }[] {
   const found: { method: string; path: string }[] = [];
@@ -58,6 +77,7 @@ describe('research routes are relative to the /api mount', () => {
         'GET /intelligence/capabilities',
         'GET /intelligence/candidates',
         'GET /intelligence/candidates/:id',
+        'GET /intelligence/candidates/:id/decision',
         'GET /intelligence/candidates/:id/duplicates',
         'POST /intelligence/candidates',
         'PATCH /intelligence/candidates/:id',
@@ -161,19 +181,80 @@ describe('research can never publish', () => {
     );
   });
 
-  it('does not import the publication service anywhere in research', () => {
-    // An import would mean this module had grown the ability to publish, which is the
-    // thing the boundary exists to prevent.
-    for (const source of [READ, WRITE, PUSH]) {
-      assert.ok(
-        !/publications\.service/.test(source),
-        'the research module must not import the publication service',
-      );
+  it('calls no publish operation anywhere in the research module', () => {
+    /*
+     * The invariant is about the OPERATION, not the import.
+     *
+     * The earlier version of this test forbade importing publications.service at all.
+     * That was the wrong line to draw: the emergency safety path has to be able to HIDE a
+     * product it accidentally created visible, and unpublishProduct/getProductVisibility
+     * live in that module. Banning the import would have forced either a duplicate
+     * Shopify call of our own or leaving a visible product visible.
+     *
+     * So the rule is direction, not proximity. Research may call the operations that
+     * REMOVE visibility or READ it. It may never call the one that GRANTS it.
+     */
+    const forbidden: readonly [string, RegExp][] = [
+      // Anchored on a non-letter so unpublishProduct( does not match publishProduct(.
+      ['publishProduct(', /(?<![A-Za-z])publishProduct\s*\(/],
+      ['publishablePublish', /publishablePublish/],
+      ['publishableId', /publishableId/],
+    ];
+    for (const [name, source] of RESEARCH_SOURCES) {
+      for (const [label, pattern] of forbidden) {
+        assert.ok(
+          !pattern.test(source),
+          `${name} contains "${label}". Research may never call a publish operation - publishing stays in the publications module, performed by an operator who has read the listing.`,
+        );
+      }
     }
   });
 
-  it('tells the caller plainly that nothing was published', () => {
-    assert.match(WRITE, /published: false/);
+  it('the only publications calls in research are read-only or hide-only', () => {
+    // Named explicitly so adding a third one is a deliberate act with a test to change.
+    const allowed = new Set(['unpublishProduct', 'getProductVisibility']);
+    for (const [name, source] of RESEARCH_SOURCES) {
+      for (const match of source.matchAll(/\b(\w*[Pp]ublish\w*)\s*\(/g)) {
+        const called = match[1];
+        if (called === undefined) continue;
+        assert.ok(
+          allowed.has(called),
+          `${name} calls "${called}()". Only ${[...allowed].join(' and ')} are permitted in research: one removes visibility, the other reads it. Nothing here may grant it.`,
+        );
+      }
+    }
+  });
+
+  it('the port surface the orchestration is given has no publish capability', () => {
+    /*
+     * The orchestration cannot reach Shopify directly - it only has PushPorts. So the
+     * strongest form of "it cannot publish" is that no such port exists to call. This
+     * asserts the shape of the seam rather than the behaviour of one code path, which is
+     * what makes it hold for code nobody has written yet.
+     */
+    const shopifyPort = /shopify:\s*\{([\s\S]*?)\n {2}\};/.exec(PORTS);
+    if (shopifyPort === null) throw new Error('the shopify port block was not found');
+    const members = [...shopifyPort[1]!.matchAll(/^\s{4}(\w+)\s*[(:]/gm)].map((m) => m[1]);
+    assert.deepEqual(
+      new Set(members),
+      new Set([
+        'findByResearchTag',
+        'listCatalogue',
+        'createProduct',
+        'forceHidden',
+      ]),
+      'The shopify port surface changed. createProduct makes a DRAFT and forceHidden only removes visibility; a port that could publish must never be added here.',
+    );
+  });
+
+  it('states the visibility it read back rather than asserting a constant', () => {
+    /*
+     * The response used to hard-code `published: false`, which is a claim rather than a
+     * fact: if Shopify had returned a visible product the API would have said false
+     * anyway. It now reports what was READ BACK from Shopify.
+     */
+    assert.match(WRITE, /published:\s*result\.productState\.published/);
+    assert.match(WRITE, /visibleToCustomers:\s*result\.productState\.visibleToCustomers/);
     assert.ok(WRITE.includes('Nothing has been published'));
   });
 });

@@ -4,7 +4,6 @@
  * These two helpers carry most of the module's safety:
  *
  *   bandFor  refuses to call something a STRONG_CANDIDATE on data nobody observed
- *   canPush  refuses a second push, which would duplicate a Shopify product
  *
  * Both are pure, so they are tested directly rather than through a service.
  */
@@ -12,7 +11,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { RECOMMENDATION_BANDS, bandFor, canPush } from './candidate.types';
+import { RECOMMENDATION_BANDS, bandFor } from './candidate.types';
 
 describe('bandFor maps score to recommendation', () => {
   it('uses the published bands when confidence is adequate', () => {
@@ -82,38 +81,11 @@ describe('bandFor downgrades a good score built on thin data', () => {
   });
 });
 
-describe('canPush', () => {
-  it('allows a new, watching or selected candidate', () => {
-    for (const status of ['NEW', 'WATCHING', 'SELECTED'] as const) {
-      const result = canPush({ status, pushedShopifyProductId: null });
-      assert.equal(result.allowed, true, `${status} should be pushable`);
-      assert.equal(result.reason, null);
-    }
-  });
-
-  it('REFUSES a second push - it would duplicate the Shopify product', () => {
-    const result = canPush({
-      status: 'PUSHED_TO_SHOPIFY',
-      pushedShopifyProductId: 'gid://shopify/Product/1',
-    });
-    assert.equal(result.allowed, false);
-    assert.match(result.reason ?? '', /already been pushed/);
-    assert.match(result.reason ?? '', /duplicate/);
-    // The remedy is named, not just the refusal.
-    assert.match(result.reason ?? '', /edit the existing draft/);
-  });
-
-  it('refuses a rejected candidate, and says to re-open it deliberately', () => {
-    const result = canPush({ status: 'REJECTED', pushedShopifyProductId: null });
-    assert.equal(result.allowed, false);
-    assert.match(result.reason ?? '', /rejected/);
-    assert.match(result.reason ?? '', /Re-open/);
-  });
-
-  it('checks the pushed id even when the status disagrees', () => {
-    // A stale status must not open a path to a duplicate product.
-    const result = canPush({ status: 'NEW', pushedShopifyProductId: 'gid://shopify/Product/1' });
-    assert.equal(result.allowed, false);
-    assert.match(result.reason ?? '', /already been pushed/);
-  });
-});
+/*
+ * The canPush tests moved to candidate.transitions.test.ts along with the function.
+ *
+ * canPush() could only see `status` and `pushedShopifyProductId`, so it approved a push
+ * for a candidate whose push was already running. candidate.transitions.ts now owns every
+ * "may I?" question and can see `pushState` too, and its tests cover the cases these did
+ * plus the concurrency ones these could not express.
+ */

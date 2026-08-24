@@ -194,6 +194,54 @@ export function analyseCandidate(input: AnalyseCandidateInput): CandidateAnalysi
   };
 }
 
+/* ===========================================================================
+ * Applying a fresh analysis to a candidate
+ * ======================================================================== */
+
+/**
+ * The candidate as it stands AFTER an analysis, without persisting anything.
+ *
+ * THE BUG THIS EXISTS TO KILL
+ * --------------------------
+ * push.service used to read the candidate, then re-analyse, then build the Shopify draft
+ * from the candidate it had read BEFORE the analysis. So a fresh analysis of
+ * GOOD_CANDIDATE / 82 could produce a draft whose description and tag said WATCH / 61 -
+ * the previous run's numbers - and the operator would find a product in Shopify tagged
+ * with a recommendation the system no longer held.
+ *
+ * Rather than remembering to use the right variable at six call sites, the fresh
+ * candidate is constructed once, here, and the push path has no reason to touch the
+ * pre-analysis object at all.
+ *
+ * `analyzedInputRevision` is set from the candidate that was actually scored, so a score
+ * never claims to cover an edit it did not see.
+ */
+export function applyAnalysisToCandidate(
+  candidate: ProductCandidate,
+  analysis: CandidateAnalysis,
+  now: Date,
+): ProductCandidate {
+  const { score } = analysis;
+
+  return {
+    ...candidate,
+    factors: score.factors,
+    overallScore: score.overallScore,
+    confidenceScore: score.confidenceScore,
+    recommendation: score.recommendation,
+    seasonState: score.seasonState,
+    reasons: score.reasons,
+    risks: score.risks,
+    evidence: score.evidence,
+    freshness: score.freshness,
+    analyzedAt: now.toISOString(),
+    analyzedInputRevision: candidate.inputRevision,
+    // Status is NOT touched here. NEW -> ANALYZED is a persistence decision, and an
+    // operator's own decision (WATCHING, REJECTED, PUSHED_TO_SHOPIFY) must never be
+    // overwritten by a recalculation.
+  };
+}
+
 /**
  * A candidate's cost confidence.
  *
