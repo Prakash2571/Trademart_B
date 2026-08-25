@@ -27,6 +27,7 @@ import {
   apiKeyMatches,
   hashPassword,
   parsePasswordHash,
+  plaintextPasswordMatches,
   verifyPassword,
 } from './password';
 import {
@@ -126,6 +127,25 @@ describe('apiKeyMatches', () => {
   it('never treats empty as a match', () => {
     assert.equal(apiKeyMatches('', ''), false);
     assert.equal(apiKeyMatches('', 'key'), false);
+  });
+});
+
+describe('plaintextPasswordMatches', () => {
+  it('accepts the correct password', () => {
+    assert.equal(plaintextPasswordMatches('correct horse', 'correct horse'), true);
+  });
+
+  it('rejects a wrong password', () => {
+    assert.equal(plaintextPasswordMatches('wrong horse', 'correct horse'), false);
+  });
+
+  it('handles differing lengths without leaking via an early return', () => {
+    // Both sides are hashed to 32 bytes first, so the compare is always equal-length.
+    assert.equal(plaintextPasswordMatches('short', 'a-much-longer-password'), false);
+  });
+
+  it('never treats an empty configured password as a match', () => {
+    assert.equal(plaintextPasswordMatches('anything', ''), false);
   });
 });
 

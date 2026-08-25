@@ -31,7 +31,7 @@ import {
 } from './cookies';
 import { createCsrfToken } from './csrf';
 import { resolveOperator } from './operator.middleware';
-import { verifyPassword } from './password';
+import { plaintextPasswordMatches, verifyPassword } from './password';
 import { createSessionToken } from './session';
 
 export const operatorRouter = Router();
@@ -98,7 +98,7 @@ operatorRouter.post(
     if (!isOperatorPasswordLoginConfigured()) {
       throw new AppError(
         'OPERATOR_NOT_CONFIGURED',
-        'Password login is not configured. Set OPERATOR_PASSWORD_HASH (npm run operator:hash) and SESSION_SECRET, then restart.',
+        'Password login is not configured. Set OPERATOR_PASSWORD (plaintext) or OPERATOR_PASSWORD_HASH (npm run operator:hash) - a session secret is derived from OPERATOR_PASSWORD when SESSION_SECRET is unset - then restart.',
       );
     }
 
@@ -110,13 +110,18 @@ operatorRouter.post(
       throw new AppError('LOGIN_FAILED', 'Username and password are required.');
     }
 
-    // Non-null: isOperatorPasswordLoginConfigured() proved both are set.
     const expectedUser = config.operator.username;
-    const passwordHash = config.operator.passwordHash as string;
 
     // The password is verified even when the username is wrong, so both failures
-    // take the same time and neither reveals which one was incorrect.
-    const passwordOk = await verifyPassword(password, passwordHash);
+    // take the same time and neither reveals which one was incorrect. The hashed path
+    // (scrypt) is preferred; the plaintext OPERATOR_PASSWORD path is the convenience
+    // fallback. isOperatorPasswordLoginConfigured() proved one of them is set.
+    const passwordOk =
+      config.operator.passwordHash !== null
+        ? await verifyPassword(password, config.operator.passwordHash)
+        : config.operator.password !== null
+          ? plaintextPasswordMatches(password, config.operator.password)
+          : false;
     const usernameOk = username === expectedUser;
 
     if (!usernameOk || !passwordOk) {

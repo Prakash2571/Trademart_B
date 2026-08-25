@@ -573,6 +573,61 @@ describe('validateEnv - operator authentication', () => {
     assert.ok(result.errors.some((e) => e.includes('OPERATOR_USERNAME')));
   });
 
+  it('accepts a plaintext OPERATOR_PASSWORD alone and derives a stable session secret', () => {
+    // The "just username + password" path: no hash, no session secret required.
+    const result = validateEnv({
+      ...VALID,
+      OPERATOR_USERNAME: 'ops@example.com',
+      OPERATOR_PASSWORD: 'a-good-password',
+    });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.operator.password, 'a-good-password');
+    assert.equal(result.config?.operator.passwordHash, null);
+    // A stable secret was derived, so a login can actually be issued.
+    assert.ok((result.config?.operator.sessionSecret ?? '').length >= 32);
+    // No "nobody can sign in" / "locked" warning, because a login now exists.
+    assert.ok(!result.warnings.some((w) => w.includes('management endpoints')));
+  });
+
+  it('derives the SAME session secret for the same username+password (survives restarts)', () => {
+    const a = validateEnv({ ...VALID, OPERATOR_PASSWORD: 'a-good-password' });
+    const b = validateEnv({ ...VALID, OPERATOR_PASSWORD: 'a-good-password' });
+    assert.equal(a.config?.operator.sessionSecret, b.config?.operator.sessionSecret);
+    // ...and a different password yields a different secret (rotating logs sessions out).
+    const c = validateEnv({ ...VALID, OPERATOR_PASSWORD: 'a-different-password' });
+    assert.notEqual(a.config?.operator.sessionSecret, c.config?.operator.sessionSecret);
+  });
+
+  it('honours an explicit SESSION_SECRET over the derived one', () => {
+    const result = validateEnv({
+      ...VALID,
+      OPERATOR_PASSWORD: 'a-good-password',
+      SESSION_SECRET: SECRET,
+    });
+    assert.equal(result.config?.operator.sessionSecret, SECRET);
+  });
+
+  it('rejects a plaintext password shorter than 8 characters', () => {
+    const result = validateEnv({ ...VALID, OPERATOR_PASSWORD: 'short' });
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((e) => e.includes('OPERATOR_PASSWORD')));
+  });
+
+  it('lets the hash take precedence when both a hash and a plaintext password are set', () => {
+    const result = validateEnv({
+      ...VALID,
+      OPERATOR_PASSWORD_HASH: HASH,
+      OPERATOR_PASSWORD: 'a-good-password',
+      SESSION_SECRET: SECRET,
+    });
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.operator.passwordHash, HASH);
+    // Plaintext is dropped so the two can never disagree about which verifies.
+    assert.equal(result.config?.operator.password, null);
+    assert.ok(result.warnings.some((w) => w.includes('takes precedence')));
+  });
+
   it('validates SESSION_TTL_HOURS bounds', () => {
     assert.ok(
       validateEnv({ ...VALID, SESSION_TTL_HOURS: '0' }).errors.some((e) =>

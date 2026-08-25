@@ -129,6 +129,10 @@ services:
       # Generate: npm run operator:hash / openssl rand -base64 48.
       OPERATOR_USERNAME: ${OPERATOR_USERNAME:-operator}
       OPERATOR_PASSWORD_HASH: ${OPERATOR_PASSWORD_HASH:-}
+      # Plaintext alternative to OPERATOR_PASSWORD_HASH: set OPERATOR_USERNAME +
+      # OPERATOR_PASSWORD and skip the hash step. When SESSION_SECRET is unset a stable one
+      # is derived from OPERATOR_PASSWORD, so username + password is all that is required.
+      OPERATOR_PASSWORD: ${OPERATOR_PASSWORD:-}
       SESSION_SECRET: ${SESSION_SECRET:-}
       OPERATOR_API_KEY: ${OPERATOR_API_KEY:-}
       SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}

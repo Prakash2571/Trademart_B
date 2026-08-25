@@ -18,6 +18,8 @@
  * list here — which is exactly the drift that made the old default list wrong.
  */
 
+import { createHash } from 'node:crypto';
+
 import { REQUIRED_SCOPES } from '../shopify/capabilities';
 
 export type NodeEnv = 'development' | 'test' | 'production';
@@ -150,8 +152,21 @@ export interface RetentionConfig {
 
 export interface OperatorConfig {
   username: string;
-  /** scrypt$N$r$p$salt$hash. Null when no password login is configured. */
+  /** scrypt$N$r$p$salt$hash. Null when no hashed password login is configured. */
   passwordHash: string | null;
+  /**
+   * A PLAINTEXT operator password, read straight from the environment.
+   *
+   * A convenience for self-hosted single-operator deployments: set OPERATOR_PASSWORD
+   * (and a username) and skip generating a scrypt hash. It is verified in constant time.
+   * OPERATOR_PASSWORD_HASH takes precedence when both are set. Null when not used.
+   *
+   * Trade-off, stated plainly: the password lives in the environment in clear text. That
+   * is the same trust level as every other secret in this .env (Shopify secret, session
+   * key), but a pre-hashed OPERATOR_PASSWORD_HASH is still preferable when you can generate
+   * one.
+   */
+  password: string | null;
   /** HMAC key for session cookies. Null disables cookie sessions entirely. */
   sessionSecret: string | null;
   /**
@@ -618,6 +633,18 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     );
   }
 
+  // A plaintext password alternative, so a single-operator deployment can set a username
+  // and password directly and skip the hash step entirely.
+  const operatorPassword = read(env, 'OPERATOR_PASSWORD');
+  if (operatorPassword !== null && operatorPassword.length < 8) {
+    errors.push('OPERATOR_PASSWORD must be at least 8 characters.');
+  }
+  if (operatorPasswordHash !== null && operatorPassword !== null) {
+    warnings.push(
+      'Both OPERATOR_PASSWORD_HASH and OPERATOR_PASSWORD are set; the hash takes precedence and the plaintext password is ignored.',
+    );
+  }
+
   const sessionSecret = read(env, 'SESSION_SECRET');
   // 32 chars is the shortest value that is unreasonable to brute force; a short
   // secret here forges sessions, so it is an error rather than a warning.
@@ -689,15 +716,35 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     }
   }
 
-  // A usable login needs BOTH a password hash and a session secret. Half of the
-  // pair is always a mistake, never a deliberate state.
-  const hasPasswordLogin = operatorPasswordHash !== null && sessionSecret !== null;
-  if (operatorPasswordHash !== null && sessionSecret === null) {
+  // A password login (hashed or plaintext) needs a session-signing secret. When only a
+  // plaintext OPERATOR_PASSWORD is given and SESSION_SECRET is not, derive a STABLE secret
+  // from the credential so "username + password" is genuinely all that is required. It is
+  // deterministic (survives restarts) and changes when the password changes, which simply
+  // means rotating the password logs existing sessions out - an acceptable, understandable
+  // coupling for a single-operator console. A hashed password cannot derive one (there is
+  // no plaintext to derive from), so it still requires an explicit SESSION_SECRET.
+  const hasAnyPassword = operatorPasswordHash !== null || operatorPassword !== null;
+  let effectiveSessionSecret = sessionSecret;
+  if (effectiveSessionSecret === null && operatorPassword !== null && operatorPasswordHash === null) {
+    effectiveSessionSecret = createHash('sha256')
+      .update(`trademart-session|${operatorUsername}|${operatorPassword}`)
+      .digest('base64');
+    warnings.push(
+      'SESSION_SECRET is not set, so a stable session-signing key was derived from OPERATOR_PASSWORD. Changing the password invalidates existing sessions. Set SESSION_SECRET explicitly to decouple them.',
+    );
+  }
+
+  const hasPasswordLogin = hasAnyPassword && effectiveSessionSecret !== null;
+  if (operatorPasswordHash !== null && effectiveSessionSecret === null) {
     errors.push('SESSION_SECRET is required when OPERATOR_PASSWORD_HASH is set.');
   }
-  if (sessionSecret !== null && operatorPasswordHash === null && operatorApiKey === null) {
+  if (
+    effectiveSessionSecret !== null &&
+    !hasAnyPassword &&
+    operatorApiKey === null
+  ) {
     warnings.push(
-      'SESSION_SECRET is set but OPERATOR_PASSWORD_HASH is not, so nobody can sign in. Generate a hash with: npm run operator:hash',
+      'SESSION_SECRET is set but no operator password is, so nobody can sign in. Set OPERATOR_PASSWORD (plaintext) or OPERATOR_PASSWORD_HASH (npm run operator:hash).',
     );
   }
 
@@ -767,7 +814,9 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
       operator: {
         username: operatorUsername,
         passwordHash: operatorPasswordHash,
-        sessionSecret,
+        // Ignored when a hash is present (the hash takes precedence in verification).
+        password: operatorPasswordHash === null ? operatorPassword : null,
+        sessionSecret: effectiveSessionSecret,
         apiKey: operatorApiKey,
         sessionTtlMs: sessionTtlHours * 60 * 60 * 1000,
         protectReads,
