@@ -206,6 +206,7 @@ describe('secrets never reach the frontend', () => {
       'SESSION_SECRET',
       'OPERATOR_API_KEY',
       'OPERATOR_PASSWORD_HASH',
+      'OPERATOR_PASSWORD',
       'MONGODB_URI',
     ];
 

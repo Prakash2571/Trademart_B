@@ -19,7 +19,7 @@
  * database.
  */
 
-import { randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
 
 import { AppError } from '../../common/errors';
 
@@ -165,6 +165,21 @@ export async function verifyPassword(
 
   if (derived.length !== parsed.hash.length) return false;
   return timingSafeEqual(derived, parsed.hash);
+}
+
+/**
+ * Verifies a submitted password against a configured PLAINTEXT password.
+ *
+ * For the OPERATOR_PASSWORD convenience path (no hash). Both sides are hashed to a fixed
+ * 32-byte digest first, so the comparison is constant time AND does not leak the password
+ * length through an early length-mismatch return. This is weaker than the scrypt path
+ * (which is why the hash takes precedence), but it never short-circuits on the secret.
+ */
+export function plaintextPasswordMatches(supplied: string, expected: string): boolean {
+  if (expected.length === 0) return false;
+  const a = createHash('sha256').update(supplied, 'utf8').digest();
+  const b = createHash('sha256').update(expected, 'utf8').digest();
+  return timingSafeEqual(a, b);
 }
 
 /**
