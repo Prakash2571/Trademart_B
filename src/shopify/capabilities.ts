@@ -181,6 +181,35 @@ export const SHOPIFY_FEATURES: readonly FeatureDefinition[] = Object.freeze([
       'GET /api/shopify/products/:id/publications',
     ],
   },
+  // Its own group rather than more `publications` actions: the catalogue requires
+  // key === `${group}.${action}`, so a second publications/read entry would collide.
+  // A separate group is also the more honest shape - the console surfaces headless
+  // storefront operations as their own concern.
+  {
+    key: 'headless.read',
+    group: 'headless',
+    action: 'read',
+    title: 'Report headless storefront channel readiness and per-channel visibility',
+    requiredScopes: ['read_publications'],
+    implemented: true,
+    operations: ['query TrademartPublications', 'query TrademartProductPublications'],
+    routes: [
+      'GET /api/shopify/publications/headless',
+      'GET /api/shopify/products/:id/headless-visibility',
+    ],
+    note: 'A custom headless storefront is its own publication. Online Store publication does NOT make a product visible there, and status ACTIVE alone never does. Requires SHOPIFY_HEADLESS_PUBLICATION_ID or SHOPIFY_HEADLESS_CHANNEL_NAME; with neither set, headless publication is reported as UNKNOWN rather than assumed.',
+  },
+  {
+    key: 'headless.publish',
+    group: 'headless',
+    action: 'publish',
+    title: 'Publish a product to the headless storefront channel',
+    requiredScopes: ['write_publications'],
+    implemented: true,
+    operations: ['mutation TrademartPublishablePublish'],
+    routes: ['POST /api/shopify/products/:id/publish-headless'],
+    note: 'Operator-only, and the target channel comes from configuration rather than the request body, so the call cannot be aimed at another storefront. Refuses instead of falling back to the Online Store when no headless channel is configured. The write is verified by read-back before it is reported as done.',
+  },
   {
     key: 'inventory.read',
     group: 'inventory',

@@ -43,13 +43,51 @@ function routePaths(): string[] {
 describe('publications routes are relative to the /api/shopify mount', () => {
   const paths = routePaths();
 
-  it('declares the four expected routes', () => {
+  it('declares the seven expected routes', () => {
     assert.deepEqual(new Set(paths), new Set([
       '/publications',
+      '/publications/headless',
       '/products/:id/publications',
+      '/products/:id/headless-visibility',
       '/products/:id/publish',
+      '/products/:id/publish-headless',
       '/products/:id/unpublish',
     ]));
+  });
+
+  it('registers /publications/headless before any /products/:id route', () => {
+    // Express matches in declaration order. A literal path is only safe from being
+    // shadowed if it is declared before a parameterised sibling that could also
+    // match it - pinned here because the failure is a confusing 404 on a route the
+    // console depends on.
+    const literal = paths.indexOf('/publications/headless');
+    const firstParam = paths.findIndex((path) => path.includes(':id'));
+    assert.ok(literal !== -1, '/publications/headless must exist');
+    assert.ok(
+      literal < firstParam,
+      '/publications/headless must be declared before the /products/:id routes',
+    );
+  });
+
+  it('the headless publish route is on the WRITE router, not the read router', () => {
+    // Publishing to a customer-facing channel is a mutation. Landing on the read
+    // router would put it behind requireOperatorForReads, which defaults to open.
+    assert.match(
+      SOURCE,
+      /publicationsWriteRouter\.post\(\s*'\/products\/:id\/publish-headless'/,
+      'publish-headless must be registered on publicationsWriteRouter',
+    );
+  });
+
+  it('the headless publish route takes no publicationIds from the request', () => {
+    // The target channel comes from configuration. If a caller could pass ids, this
+    // route would be a way to publish to an arbitrary storefront.
+    const handler = SOURCE.slice(SOURCE.indexOf("'/products/:id/publish-headless'"));
+    const body = handler.slice(0, handler.indexOf('sendSuccess'));
+    assert.ok(
+      !body.includes('readPublicationIds'),
+      'publish-headless must not read publicationIds from the request body',
+    );
   });
 
   it('no route string carries a /shopify prefix (the mount already provides it)', () => {
@@ -76,5 +114,8 @@ describe('publications routes are relative to the /api/shopify mount', () => {
     assert.ok(external.includes('/api/shopify/products/:id/publish'));
     assert.ok(external.includes('/api/shopify/products/:id/unpublish'));
     assert.ok(external.includes('/api/shopify/products/:id/publications'));
+    assert.ok(external.includes('/api/shopify/publications/headless'));
+    assert.ok(external.includes('/api/shopify/products/:id/headless-visibility'));
+    assert.ok(external.includes('/api/shopify/products/:id/publish-headless'));
   });
 });

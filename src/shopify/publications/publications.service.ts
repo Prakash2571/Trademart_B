@@ -19,6 +19,11 @@ import {
   PUBLISHABLE_UNPUBLISH_MUTATION,
 } from './publication.queries';
 import { config } from '../../config';
+import { impliedScopes } from '../capabilities';
+import {
+  resolveHeadlessChannelStatus,
+  type HeadlessChannelStatus,
+} from './headless.status';
 import { verifyPublicationState } from './publication.verify';
 import type {
   Publication,
@@ -44,6 +49,7 @@ export type {
   SalesChannelSelector,
 } from './publications.types';
 export type { ProductVisibility, HeadlessVisibility } from './visibility';
+export type { HeadlessChannelStatus } from './headless.status';
 
 export interface PublishResult {
   shopifyProductId: string;
@@ -176,6 +182,40 @@ export async function findHeadlessPublication(): Promise<Publication | null> {
     publications.find((publication) => publication.name.trim().toLowerCase().includes(name)) ??
     null
   );
+}
+
+/**
+ * Operational readiness of the headless channel, for the operator console.
+ *
+ * `granted` is the app's scope list, or null when the token strategy does not report
+ * scopes (static tokens do not). Null is treated as "assume the scope is present"
+ * ONLY for reporting: a real Shopify call still fails loudly if it is not, and
+ * reporting SCOPE_MISSING on a working deployment would be the worse lie.
+ */
+export async function getHeadlessChannelStatus(
+  granted: readonly string[] | null,
+): Promise<HeadlessChannelStatus> {
+  const selector = headlessChannelSelector();
+
+  const has = (scope: string): boolean =>
+    granted === null ? true : impliedScopes(granted).has(scope);
+  const canReadPublications = has('read_publications');
+  const canPublish = has('write_publications');
+
+  // Only ask Shopify when the answer could be meaningful. An unconfigured channel
+  // or a missing read scope makes the lookup pointless, and a failed lookup here
+  // would be reported as "not found", which is a different and misleading problem.
+  let resolved: Publication | null = null;
+  if (selector !== null && canReadPublications) {
+    resolved = await findHeadlessPublication();
+  }
+
+  return resolveHeadlessChannelStatus({
+    selector,
+    resolved,
+    canReadPublications,
+    canPublish,
+  });
 }
 
 /**
