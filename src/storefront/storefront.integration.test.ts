@@ -556,7 +556,7 @@ describe('2. sellability gate fails closed - unknown/absent facts yield UNAVAILA
     const sourceability = computeSourceability(null, NOW);
     const result = evaluateStorefrontSellability({
       productStatus: 'ACTIVE',
-      publishedToOnlineStore: true,
+      channelPublication: 'PUBLISHED',
       sourceability,
       mapping: VARIANT_MAPPING,
       shopifyVariantAvailableForSale: true,
@@ -575,7 +575,7 @@ describe('2. sellability gate fails closed - unknown/absent facts yield UNAVAILA
     );
     const result = evaluateStorefrontSellability({
       productStatus: 'ACTIVE',
-      publishedToOnlineStore: true,
+      channelPublication: 'PUBLISHED',
       sourceability,
       mapping: VARIANT_MAPPING,
       shopifyVariantAvailableForSale: true,
@@ -590,7 +590,7 @@ describe('2. sellability gate fails closed - unknown/absent facts yield UNAVAILA
     const sourceability = computeSourceability(supplierInfo(), NOW);
     const result = evaluateStorefrontSellability({
       productStatus: null,
-      publishedToOnlineStore: true,
+      channelPublication: 'PUBLISHED',
       sourceability,
       mapping: VARIANT_MAPPING,
       shopifyVariantAvailableForSale: true,
@@ -605,7 +605,7 @@ describe('2. sellability gate fails closed - unknown/absent facts yield UNAVAILA
     const sourceability = computeSourceability(supplierInfo(), NOW);
     const result = evaluateStorefrontSellability({
       productStatus: 'ACTIVE',
-      publishedToOnlineStore: true,
+      channelPublication: 'PUBLISHED',
       sourceability,
       mapping: VARIANT_MAPPING,
       shopifyVariantAvailableForSale: null,
@@ -630,7 +630,7 @@ describe('3. unavailable supplier refusal - supplier UNAVAILABLE makes product n
     );
     const result = evaluateStorefrontSellability({
       productStatus: 'ACTIVE',
-      publishedToOnlineStore: true,
+      channelPublication: 'PUBLISHED',
       sourceability,
       mapping: VARIANT_MAPPING,
       shopifyVariantAvailableForSale: true,
@@ -666,7 +666,7 @@ describe('4. stale sourceability refusal - stale supplier variant evidence refus
     );
     const result = evaluateStorefrontSellability({
       productStatus: 'ACTIVE',
-      publishedToOnlineStore: true,
+      channelPublication: 'PUBLISHED',
       sourceability,
       mapping: VARIANT_MAPPING,
       shopifyVariantAvailableForSale: true,
@@ -695,7 +695,7 @@ describe('4. stale sourceability refusal - stale supplier variant evidence refus
     const sourceability = computeSourceability(supplier, NOW);
     const result = evaluateStorefrontSellability({
       productStatus: 'ACTIVE',
-      publishedToOnlineStore: true,
+      channelPublication: 'PUBLISHED',
       sourceability,
       mapping: VARIANT_MAPPING,
       shopifyVariantAvailableForSale: true,
@@ -746,7 +746,7 @@ describe('5. exact variant availability - unavailable supplier variant never pub
     // But the specific variant sv-1 is UNAVAILABLE
     const result = evaluateStorefrontSellability({
       productStatus: 'ACTIVE',
-      publishedToOnlineStore: true,
+      channelPublication: 'PUBLISHED',
       sourceability,
       mapping: VARIANT_MAPPING, // maps to sv-1
       shopifyVariantAvailableForSale: true,
@@ -778,7 +778,7 @@ describe('5. exact variant availability - unavailable supplier variant never pub
     // Mapping references sv-1 but variants only contain sv-different
     const result = evaluateStorefrontSellability({
       productStatus: 'ACTIVE',
-      publishedToOnlineStore: true,
+      channelPublication: 'PUBLISHED',
       sourceability,
       mapping: VARIANT_MAPPING,
       shopifyVariantAvailableForSale: true,
@@ -800,7 +800,7 @@ describe('6. INR-only pricing - non-INR shop currency fails closed with PRICE_NO
     const sourceability = computeSourceability(supplierInfo(), NOW);
     const result = evaluateStorefrontSellability({
       productStatus: 'ACTIVE',
-      publishedToOnlineStore: true,
+      channelPublication: 'PUBLISHED',
       sourceability,
       mapping: VARIANT_MAPPING,
       shopifyVariantAvailableForSale: true,
@@ -817,7 +817,7 @@ describe('6. INR-only pricing - non-INR shop currency fails closed with PRICE_NO
     const sourceability = computeSourceability(supplierInfo(), NOW);
     const result = evaluateStorefrontSellability({
       productStatus: 'ACTIVE',
-      publishedToOnlineStore: true,
+      channelPublication: 'PUBLISHED',
       sourceability,
       mapping: VARIANT_MAPPING,
       shopifyVariantAvailableForSale: true,

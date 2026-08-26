@@ -649,3 +649,88 @@ describe('validateEnv - operator authentication', () => {
     );
   });
 });
+
+
+/**
+ * The headless sales channel is OPTIONAL, and its absence must be an explicit
+ * "unknown" rather than a silent fallback to the Online Store. Publishing a product
+ * to the wrong storefront is worse than refusing to publish at all.
+ */
+describe('headless sales channel configuration', () => {
+  const VALID_HEADLESS = {
+    SHOPIFY_STORE_DOMAIN: 'teststoremart-uk8mmby.myshopify.com',
+    SHOPIFY_CLIENT_ID: 'client-id-example',
+    SHOPIFY_CLIENT_SECRET: 'client-secret-example',
+    MONGODB_URI: 'mongodb://127.0.0.1:27017/trademart',
+    FRONTEND_URL: 'http://localhost:3000',
+  } as const;
+
+  it('is absent by default, so no channel is assumed', () => {
+    const result = validateEnv(VALID_HEADLESS);
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.shopify.headlessPublicationId, null);
+    assert.equal(result.config?.shopify.headlessChannelName, null);
+  });
+
+  it('accepts a publication GID', () => {
+    const result = validateEnv({
+      ...VALID_HEADLESS,
+      SHOPIFY_HEADLESS_PUBLICATION_ID: 'gid://shopify/Publication/123456',
+    });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(
+      result.config?.shopify.headlessPublicationId,
+      'gid://shopify/Publication/123456',
+    );
+  });
+
+  it('rejects a bare numeric id rather than silently building a wrong GID', () => {
+    const result = validateEnv({
+      ...VALID_HEADLESS,
+      SHOPIFY_HEADLESS_PUBLICATION_ID: '123456',
+    });
+
+    assert.equal(result.config, null);
+    assert.ok(
+      result.errors.some((error) => error.includes('SHOPIFY_HEADLESS_PUBLICATION_ID')),
+      'a malformed publication id must be a startup error, not a runtime surprise',
+    );
+  });
+
+  it('rejects a GID for the wrong resource type', () => {
+    const result = validateEnv({
+      ...VALID_HEADLESS,
+      SHOPIFY_HEADLESS_PUBLICATION_ID: 'gid://shopify/Product/123456',
+    });
+
+    assert.equal(result.config, null);
+    assert.ok(result.errors.some((error) => error.includes('SHOPIFY_HEADLESS_PUBLICATION_ID')));
+  });
+
+  it('accepts a channel name as the fallback identity', () => {
+    const result = validateEnv({
+      ...VALID_HEADLESS,
+      SHOPIFY_HEADLESS_CHANNEL_NAME: 'Kanay Headless',
+    });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.shopify.headlessChannelName, 'Kanay Headless');
+    assert.equal(result.config?.shopify.headlessPublicationId, null);
+  });
+
+  it('warns, but does not fail, when both are set - the GID wins', () => {
+    const result = validateEnv({
+      ...VALID_HEADLESS,
+      SHOPIFY_HEADLESS_PUBLICATION_ID: 'gid://shopify/Publication/123456',
+      SHOPIFY_HEADLESS_CHANNEL_NAME: 'Kanay Headless',
+    });
+
+    assert.deepEqual(result.errors, []);
+    assert.ok(
+      result.warnings.some((warning) => warning.includes('publication id wins')),
+      'an operator setting both should be told which one takes effect',
+    );
+  });
+});

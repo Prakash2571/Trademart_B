@@ -18,16 +18,32 @@ import {
   PUBLISHABLE_PUBLISH_MUTATION,
   PUBLISHABLE_UNPUBLISH_MUTATION,
 } from './publication.queries';
-import type { Publication, ProductPublicationState } from './publications.types';
-import { resolveCustomerVisibility, type ProductVisibility } from './visibility';
+import { config } from '../../config';
+import { verifyPublicationState } from './publication.verify';
+import type {
+  Publication,
+  ProductPublicationState,
+  SalesChannelSelector,
+} from './publications.types';
+import {
+  resolveCustomerVisibility,
+  resolveHeadlessVisibility,
+  type ProductVisibility,
+  type HeadlessVisibility,
+} from './visibility';
 
 type UserErrors = { field?: string[] | null; message?: string }[];
 
 // Re-exported so existing importers of these types from this module keep working;
 // they now live in publications.types.ts so the pure visibility module can use them
 // without importing the Shopify client (and therefore the config singleton).
-export type { Publication, ProductPublicationState } from './publications.types';
-export type { ProductVisibility } from './visibility';
+export type {
+  Publication,
+  ProductPublicationState,
+  ChannelPublicationStatus,
+  SalesChannelSelector,
+} from './publications.types';
+export type { ProductVisibility, HeadlessVisibility } from './visibility';
 
 export interface PublishResult {
   shopifyProductId: string;
@@ -116,6 +132,70 @@ export async function getProductVisibility(
   });
 }
 
+/* ===========================================================================
+ * HEADLESS SALES CHANNEL
+ *
+ * The custom storefront is a separate publication from the themed Online Store.
+ * Nothing here falls back to the Online Store: publishing to the wrong channel is
+ * worse than refusing, because it silently exposes a product on a storefront the
+ * operator did not choose.
+ * =========================================================================== */
+
+/** The configured headless channel identity, or null when none is configured. */
+export function headlessChannelSelector(): SalesChannelSelector | null {
+  const publicationId = config.shopify.headlessPublicationId;
+  const name = config.shopify.headlessChannelName;
+  if (publicationId === null && name === null) return null;
+  return { publicationId, name };
+}
+
+/** True when an operator has told Trademart which channel is the custom storefront. */
+export const isHeadlessChannelConfigured = (): boolean => headlessChannelSelector() !== null;
+
+/**
+ * The configured headless publication as Shopify reports it, or null.
+ *
+ * Resolved against the live publication list so a stale or wrong id surfaces as
+ * "not found" here rather than as a confusing userError from the mutation.
+ */
+export async function findHeadlessPublication(): Promise<Publication | null> {
+  const selector = headlessChannelSelector();
+  if (selector === null) return null;
+
+  const publications = await listPublications();
+
+  const id = selector.publicationId?.trim();
+  if (id !== undefined && id !== '') {
+    return publications.find((publication) => publication.id === id) ?? null;
+  }
+
+  const name = selector.name?.trim().toLowerCase();
+  if (name === undefined || name === '') return null;
+  return (
+    publications.find((publication) => publication.name.trim().toLowerCase() === name) ??
+    publications.find((publication) => publication.name.trim().toLowerCase().includes(name)) ??
+    null
+  );
+}
+
+/**
+ * "Can a customer buy this on the custom headless storefront?"
+ *
+ * Requires ACTIVE status AND confirmed publication to the headless channel. With no
+ * headless channel configured the answer is an explicit UNKNOWN, never a hopeful yes.
+ */
+export async function getHeadlessVisibility(
+  shopifyProductId: string,
+): Promise<HeadlessVisibility> {
+  const product = await fetchProductPublications(shopifyProductId);
+  return resolveHeadlessVisibility({
+    shopifyProductId,
+    status: product?.status ?? null,
+    publications: toState(product),
+    headlessChannel: headlessChannelSelector() ?? {},
+  });
+}
+
 /**
  * Publishes a product to the given publications, or to the Online Store when
  * none are specified.
@@ -163,16 +243,67 @@ export async function publishProduct(
   const error = mapUserErrors(result.data.publishablePublish?.userErrors);
   if (error !== null) throw error;
 
-  logger.info('Published product to publications.', {
+  // READ-BACK VERIFICATION.
+  //
+  // An empty userErrors array means Shopify accepted the mutation, NOT that the
+  // product is now published. The state was already being re-fetched here and then
+  // returned unexamined, so a write that silently did not take effect was reported
+  // to the operator as a success - and a product believed published but absent from
+  // the channel is exactly the failure this module exists to prevent.
+  const state = await getProductPublications(shopifyProductId);
+  assertPublicationState(shopifyProductId, targets, state, 'published');
+
+  logger.info('Published product to publications, verified by read-back.', {
     shopifyProductId,
     publications: targets.map((publication) => publication.name),
   });
 
-  return {
-    shopifyProductId,
-    published: targets,
-    state: await getProductPublications(shopifyProductId),
-  };
+  return { shopifyProductId, published: targets, state };
+}
+
+/** Confirms the post-write state matches intent, or throws. Rule lives in publication.verify.ts. */
+function assertPublicationState(
+  shopifyProductId: string,
+  targets: Publication[],
+  state: ProductPublicationState[],
+  expected: 'published' | 'unpublished',
+): void {
+  const failures = verifyPublicationState({ targets, state, expected });
+  if (failures.length === 0) return;
+
+  throw new AppError(
+    'SHOPIFY_GRAPHQL_ERROR',
+    `Shopify accepted the ${expected === 'published' ? 'publish' : 'unpublish'} but the read-back did not confirm it for product ${shopifyProductId}: ${failures.join('; ')}. The channel state is NOT what was requested; do not treat this product as ${expected}.`,
+  );
+}
+
+/**
+ * Publishes to the configured headless channel, verified by read-back.
+ *
+ * Refuses rather than defaulting to the Online Store when no headless channel is
+ * configured or the configured one cannot be found.
+ */
+export async function publishProductToHeadless(
+  shopifyProductId: string,
+): Promise<PublishResult> {
+  const selector = headlessChannelSelector();
+  if (selector === null) {
+    throw new AppError(
+      'VALIDATION_ERROR',
+      'No headless sales channel is configured, so there is no custom storefront to publish to. Set SHOPIFY_HEADLESS_PUBLICATION_ID (preferred) or SHOPIFY_HEADLESS_CHANNEL_NAME.',
+    );
+  }
+
+  const headless = await findHeadlessPublication();
+  if (headless === null) {
+    const available = (await listPublications()).map((p) => p.name).join(', ') || 'none';
+    throw new AppError(
+      'SHOPIFY_GRAPHQL_ERROR',
+      `The configured headless sales channel (${selector.publicationId ?? selector.name}) is not visible to this app, so publishing would target the wrong storefront. Available publications: ${available}.`,
+    );
+  }
+
+  return publishProduct(shopifyProductId, [headless.id]);
 }
 
 /** Removes a product from the given publications (or the Online Store). */
@@ -216,14 +347,16 @@ export async function unpublishProduct(
   const error = mapUserErrors(result.data.publishableUnpublish?.userErrors);
   if (error !== null) throw error;
 
-  logger.info('Unpublished product from publications.', {
+  // Verified for the same reason as publishing: "Shopify accepted it" is not
+  // "the product is off the channel". An unpublish believed done but not done
+  // leaves a product buyable that the operator thinks they withdrew.
+  const state = await getProductPublications(shopifyProductId);
+  assertPublicationState(shopifyProductId, targets, state, 'unpublished');
+
+  logger.info('Unpublished product from publications, verified by read-back.', {
     shopifyProductId,
     publications: targets.map((publication) => publication.name),
   });
 
-  return {
-    shopifyProductId,
-    published: targets,
-    state: await getProductPublications(shopifyProductId),
-  };
+  return { shopifyProductId, published: targets, state };
 }

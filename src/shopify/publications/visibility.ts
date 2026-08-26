@@ -33,7 +33,11 @@
  * (should automation SET this product ACTIVE or DRAFT?).
  */
 
-import type { ProductPublicationState } from './publications.types';
+import type {
+  ChannelPublicationStatus,
+  ProductPublicationState,
+  SalesChannelSelector,
+} from './publications.types';
 
 export interface ProductVisibility {
   shopifyProductId: string;
@@ -109,4 +113,176 @@ export function resolveCustomerVisibility(input: {
     visibleToCustomers,
     reason,
   };
+}
+
+
+/* ===========================================================================
+ * CHANNEL-AWARE PUBLICATION
+ *
+ * resolveCustomerVisibility above answers one specific question: "can a customer
+ * browsing the THEMED ONLINE STORE find this product?". A custom headless
+ * storefront is a DIFFERENT sales channel with its own publication record, so that
+ * function cannot answer for it, and widening it to mean "visible somewhere" would
+ * destroy the distinction it exists to protect.
+ *
+ * What follows resolves publication per channel, three-valued, so "ACTIVE and on
+ * the Online Store" and "ACTIVE and on the headless channel" stay separate facts.
+ * ACTIVE is never redefined as customer-visible anywhere in here.
+ * =========================================================================== */
+
+/** Matches a channel by GID when given one, otherwise by exact then substring name. */
+function findChannel(
+  publications: ProductPublicationState[],
+  selector: SalesChannelSelector,
+): ProductPublicationState | null {
+  const id = selector.publicationId?.trim();
+  if (id !== undefined && id !== '') {
+    return publications.find((entry) => entry.publicationId === id) ?? null;
+  }
+
+  const name = selector.name?.trim().toLowerCase();
+  if (name === undefined || name === '') return null;
+
+  return (
+    publications.find((entry) => entry.name.trim().toLowerCase() === name) ??
+    publications.find((entry) => entry.name.trim().toLowerCase().includes(name)) ??
+    null
+  );
+}
+
+/** True when the selector carries no usable channel identity at all. */
+function selectorIsEmpty(selector: SalesChannelSelector): boolean {
+  const id = selector.publicationId?.trim() ?? '';
+  const name = selector.name?.trim() ?? '';
+  return id === '' && name === '';
+}
+
+export interface ChannelPublication {
+  status: ChannelPublicationStatus;
+  /** The matched entry, or null when the app could not see the channel. */
+  entry: ProductPublicationState | null;
+  /** Why the status is what it is. Always populated. */
+  reason: string;
+}
+
+/**
+ * Publication state for one channel.
+ *
+ * A channel the app cannot see is UNKNOWN, never UNPUBLISHED. Shopify returning no
+ * publications at all - the shape when read_publications was not granted - is also
+ * UNKNOWN. Inferring "not published" from silence would let a missing scope look
+ * like a deliberate merchant decision.
+ */
+export function resolveChannelPublication(
+  publications: ProductPublicationState[],
+  selector: SalesChannelSelector,
+): ChannelPublication {
+  if (selectorIsEmpty(selector)) {
+    return {
+      status: 'UNKNOWN',
+      entry: null,
+      reason:
+        'No sales channel was configured to check, so publication cannot be confirmed. Set the channel id or name.',
+    };
+  }
+
+  if (publications.length === 0) {
+    return {
+      status: 'UNKNOWN',
+      entry: null,
+      reason:
+        'Shopify returned no publications for this product, so publication cannot be confirmed. read_publications is required.',
+    };
+  }
+
+  const entry = findChannel(publications, selector);
+  if (entry === null) {
+    const label = selector.publicationId?.trim() || selector.name?.trim() || 'the channel';
+    return {
+      status: 'UNKNOWN',
+      entry: null,
+      reason: `No publication matching ${label} is visible to this app, so publication cannot be confirmed. Check the channel exists on this shop and that read_publications is granted.`,
+    };
+  }
+
+  return entry.isPublished
+    ? { status: 'PUBLISHED', entry, reason: `Published to ${entry.name}.` }
+    : { status: 'UNPUBLISHED', entry, reason: `Not published to ${entry.name}.` };
+}
+
+export interface HeadlessVisibility {
+  shopifyProductId: string;
+  /** DRAFT | ACTIVE | ARCHIVED, or null when Shopify withheld it. */
+  status: string | null;
+  /** Whether the product's own status permits selling. Not sufficient alone. */
+  isActive: boolean;
+  /** Publication on the themed Online Store - reported, never conflated. */
+  onlineStore: ChannelPublicationStatus;
+  /** Publication on the custom headless channel. */
+  headless: ChannelPublicationStatus;
+  /**
+   * The conjunction, and the only field a caller should gate a sale on:
+   * status === 'ACTIVE' AND Shopify confirmed headless publication.
+   */
+  sellableOnHeadlessStorefront: boolean;
+  reason: string;
+}
+
+/**
+ * "Can a customer buy this on the CUSTOM headless storefront?"
+ *
+ * Both halves are required and neither implies the other:
+ *   - A DRAFT product published to the headless channel is not sellable.
+ *   - An ACTIVE product absent from the headless channel is not sellable, even
+ *     though it may be perfectly visible on the themed Online Store.
+ *
+ * UNKNOWN headless publication is not sellable. That is the whole point: the store
+ * fails closed when Shopify has not confirmed publication, rather than showing a
+ * product a customer cannot actually purchase.
+ */
+export function resolveHeadlessVisibility(input: {
+  shopifyProductId: string;
+  status: string | null;
+  publications: ProductPublicationState[];
+  headlessChannel: SalesChannelSelector;
+  onlineStoreChannel?: SalesChannelSelector;
+}): HeadlessVisibility {
+  const { shopifyProductId, status, publications, headlessChannel } = input;
+
+  const headless = resolveChannelPublication(publications, headlessChannel);
+  const onlineStore = resolveChannelPublication(
+    publications,
+    input.onlineStoreChannel ?? { name: 'online store' },
+  );
+
+  const isActive = status === 'ACTIVE';
+  const sellableOnHeadlessStorefront = isActive && headless.status === 'PUBLISHED';
+
+  let reason: string;
+  if (sellableOnHeadlessStorefront) {
+    reason = `Status is ACTIVE and Shopify confirmed publication to ${headless.entry?.name ?? 'the headless channel'}.`;
+  } else if (status === null) {
+    reason =
+      'Shopify did not return the product status, so headless sellability cannot be determined. read_products is required.';
+  } else if (!isActive && headless.status === 'PUBLISHED') {
+    reason = `The product is published to the headless channel but its status is ${status}, so it is not sellable. Setting it ACTIVE would make it sellable immediately.`;
+  } else if (!isActive) {
+    reason = `Status is ${status} and ${lowerFirst(headless.reason)}`;
+  } else {
+    reason = `Status is ACTIVE but ${lowerFirst(headless.reason)}`;
+  }
+
+  return {
+    shopifyProductId,
+    status,
+    isActive,
+    onlineStore: onlineStore.status,
+    headless: headless.status,
+    sellableOnHeadlessStorefront,
+    reason,
+  };
+}
+
+function lowerFirst(value: string): string {
+  return value.length === 0 ? value : value[0]!.toLowerCase() + value.slice(1);
 }

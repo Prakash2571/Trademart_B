@@ -70,6 +70,23 @@ export interface ShopifyConfig {
    * accident.
    */
   allowLiveStoreWrites: boolean;
+  /**
+   * Identity of the CUSTOM HEADLESS sales channel, when one is in use.
+   *
+   * A headless storefront is its own Shopify publication, distinct from the themed
+   * Online Store. Trademart needs to know which channel is "the custom store" in
+   * order to report and control publication for it.
+   *
+   * Both null means no headless channel is configured: headless publication then
+   * resolves to UNKNOWN and nothing is reported as sellable on a custom store.
+   * That is the correct default - guessing a channel would risk publishing a
+   * product to the wrong storefront.
+   *
+   * `publicationId` is preferred; a merchant can rename a channel, but the GID is
+   * stable. `channelName` is the fallback for operators who only know the name.
+   */
+  headlessPublicationId: string | null;
+  headlessChannelName: string | null;
   /** Scopes requested by the OAuth redirect flow, in Shopify's comma form. */
   scopes: string[];
   /** Fully-qualified GraphQL Admin API endpoint. */
@@ -239,6 +256,8 @@ export const WEBHOOK_RECEIVER_PATH = '/api/webhooks/shopify';
 const NODE_ENVS: readonly NodeEnv[] = ['development', 'test', 'production'];
 const AUTH_MODES: readonly ShopifyAuthMode[] = ['auto', 'oauth'];
 export const MYSHOPIFY_DOMAIN = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/;
+/** Shopify publication GIDs, e.g. gid://shopify/Publication/123456. */
+export const PUBLICATION_GID = /^gid:\/\/shopify\/Publication\/\d+$/;
 const API_VERSION = /^\d{4}-\d{2}$/;
 /** Shopify scope names are lowercase snake_case, e.g. read_products. */
 const SCOPE_NAME = /^[a-z][a-z0-9_]*$/;
@@ -491,6 +510,29 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
   } else if (explicitWebhookSecret === null) {
     warnings.push(
       'SHOPIFY_WEBHOOK_SECRET not set - verifying webhooks with SHOPIFY_CLIENT_SECRET, which is what Shopify signs app webhook deliveries with. Set it explicitly only for webhooks created by hand in the Shopify admin.',
+    );
+  }
+
+  // ---- Headless sales channel -------------------------------------------
+  //
+  // Optional. Absent means "no custom storefront channel configured", which makes
+  // headless publication UNKNOWN rather than assuming the Online Store.
+  const rawHeadlessPublicationId = read(env, 'SHOPIFY_HEADLESS_PUBLICATION_ID');
+  let headlessPublicationId: string | null = null;
+  if (rawHeadlessPublicationId !== null) {
+    if (PUBLICATION_GID.test(rawHeadlessPublicationId)) {
+      headlessPublicationId = rawHeadlessPublicationId;
+    } else {
+      errors.push(
+        `SHOPIFY_HEADLESS_PUBLICATION_ID must be a publication GID like gid://shopify/Publication/123456 (received "${rawHeadlessPublicationId}"). List valid ids with GET /api/shopify/publications.`,
+      );
+    }
+  }
+
+  const headlessChannelName = read(env, 'SHOPIFY_HEADLESS_CHANNEL_NAME');
+  if (headlessPublicationId !== null && headlessChannelName !== null) {
+    warnings.push(
+      'Both SHOPIFY_HEADLESS_PUBLICATION_ID and SHOPIFY_HEADLESS_CHANNEL_NAME are set - the publication id wins, because a channel can be renamed but its GID cannot.',
     );
   }
 
@@ -901,6 +943,8 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
         authMode,
         storeMode,
         allowLiveStoreWrites,
+        headlessPublicationId,
+        headlessChannelName,
         scopes,
         graphqlEndpoint: `https://${storeDomain}/admin/api/${apiVersion}/graphql.json`,
         tokenEndpoint: `https://${storeDomain}/admin/oauth/access_token`,

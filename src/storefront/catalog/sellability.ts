@@ -7,11 +7,13 @@ import type {
 } from '../../intelligence/sourceability';
 import { DEFAULT_SOURCEABILITY_CONFIG } from '../../intelligence/sourceability';
 import type { PushedVariantMapping } from '../../intelligence/variant.mapping';
+import type { ChannelPublicationStatus } from '../../shopify/publications/publications.types';
 import type { StorefrontAvailability } from './types';
 
 export type SellabilityBlockReason =
   | 'SHOPIFY_NOT_ACTIVE'
   | 'SHOPIFY_NOT_PUBLISHED'
+  | 'SHOPIFY_PUBLICATION_UNKNOWN'
   | 'SOURCEABILITY_BLOCKED'
   | 'VARIANT_MAPPING_MISSING'
   | 'SUPPLIER_VARIANT_MISSING'
@@ -24,7 +26,19 @@ export type SellabilityBlockReason =
 
 export interface StorefrontSellabilityInput {
   productStatus: string | null;
-  publishedToOnlineStore: boolean;
+  /**
+   * Publication on the channel THIS storefront sells through - three-valued.
+   *
+   * Was a `publishedToOnlineStore: boolean`, which could not distinguish "Shopify
+   * says unpublished" from "the app could not see the channel", and hardcoded the
+   * assumption that the themed Online Store is the selling channel. A headless
+   * storefront is a different publication, so the caller now names the channel it
+   * means and passes the resolved status.
+   *
+   * UNKNOWN blocks the sale exactly as UNPUBLISHED does; they are distinguished
+   * only so the operator is told which problem they actually have.
+   */
+  channelPublication: ChannelPublicationStatus;
   sourceability: SourceabilityResult;
   mapping: PushedVariantMapping | null;
   shopifyVariantAvailableForSale: boolean | null;
@@ -49,8 +63,14 @@ export interface StorefrontSellabilityResult {
 export function evaluateStorefrontSellability(
   input: StorefrontSellabilityInput,
 ): StorefrontSellabilityResult {
+  // Both halves are required and neither implies the other: a DRAFT product
+  // published to the channel is not sellable, and an ACTIVE product absent from the
+  // channel is not sellable either.
   if (input.productStatus !== 'ACTIVE') return unavailable('SHOPIFY_NOT_ACTIVE');
-  if (!input.publishedToOnlineStore) return unavailable('SHOPIFY_NOT_PUBLISHED');
+  if (input.channelPublication === 'UNKNOWN') {
+    return unavailable('SHOPIFY_PUBLICATION_UNKNOWN');
+  }
+  if (input.channelPublication !== 'PUBLISHED') return unavailable('SHOPIFY_NOT_PUBLISHED');
   if (
     input.sourceability.current !== 'SOURCEABLE' &&
     input.sourceability.current !== 'PARTIALLY_SOURCEABLE'
