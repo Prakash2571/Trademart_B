@@ -1,5 +1,13 @@
-import { getOrder } from '../../shopify/shopify.service';
-import type { OrderDto } from '../../shopify/shopify.types';
+/**
+ * Public order tracking, as a pure port-driven service.
+ *
+ * Deliberately imports NOTHING that reaches the config singleton: the Shopify
+ * implementation of OrderTrackingPort lives in shopify-tracking.adapter.ts. See
+ * the comment there - config/index.ts calls process.exit(1) on invalid env, so a
+ * Shopify import here would kill any test process that merely wanted to exercise
+ * this class with a fake port.
+ */
+
 import type { CheckoutSessionRecord, CheckoutSessionRepository } from '../checkout/checkout.types';
 import { mapToPublicCheckoutStatus } from '../checkout/checkout.types';
 import { StorefrontError } from '../checkout/storefront.error';
@@ -15,58 +23,6 @@ export interface PublicFulfillment {
 
 export interface OrderTrackingPort {
   get(shopifyOrderId: string): Promise<PublicFulfillment>;
-}
-
-function safeUrl(value: string | null): string | null {
-  if (!value) return null;
-  try {
-    const url = new URL(value);
-    return url.protocol === 'https:' || url.protocol === 'http:' ? url.toString() : null;
-  } catch {
-    return null;
-  }
-}
-
-function shipmentStatus(order: OrderDto): string | null {
-  const statuses = order.fulfillments.map((item) => item.displayStatus).filter(Boolean) as string[];
-  const priority = [
-    'DELIVERED',
-    'OUT_FOR_DELIVERY',
-    'IN_TRANSIT',
-    'PICKED_UP',
-    'READY_FOR_PICKUP',
-    'FULFILLED',
-    'CONFIRMED',
-    'SUBMITTED',
-    'FAILURE',
-    'NOT_DELIVERED',
-    'ATTEMPTED_DELIVERY',
-  ];
-  return priority.find((status) => statuses.includes(status)) ?? statuses[0] ?? null;
-}
-
-export class ShopifyOrderTrackingAdapter implements OrderTrackingPort {
-  public async get(shopifyOrderId: string): Promise<PublicFulfillment> {
-    const order = await getOrder(shopifyOrderId);
-    return {
-      fulfillmentStatus: order.fulfillmentStatus,
-      shipmentStatus: shipmentStatus(order),
-      estimatedDeliveryAt:
-        order.fulfillments.map((item) => item.estimatedDeliveryAt).find(Boolean) ?? null,
-      tracking: order.fulfillments.flatMap((fulfillment) =>
-        fulfillment.tracking.map((entry) => ({
-          carrier: entry.company,
-          number: entry.number,
-          url: safeUrl(entry.url),
-        }))),
-      events: order.fulfillments
-        .flatMap((fulfillment) => fulfillment.events)
-        .filter((event): event is { id: string; status: string; happenedAt: string; message: string | null } =>
-          Boolean(event.status && event.happenedAt),
-        )
-        .map((event) => ({ status: event.status, occurredAt: event.happenedAt })),
-    };
-  }
 }
 
 export interface PublicTrackingDto {

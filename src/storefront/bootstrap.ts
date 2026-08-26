@@ -35,10 +35,8 @@ import {
   stopPaidOrderWorker,
 } from './orders/order.orchestrator';
 import { ShopifyOrderCreateAdapter } from './orders/shopify-order.adapter';
-import {
-  StorefrontTrackingService,
-  ShopifyOrderTrackingAdapter,
-} from './orders/tracking.service';
+import { StorefrontTrackingService } from './orders/tracking.service';
+import { ShopifyOrderTrackingAdapter } from './orders/shopify-tracking.adapter';
 import { StorefrontCatalogCheckoutAdapter } from './checkout/catalog-checkout.adapter';
 import type {
   AuthoritativeCheckoutLine,
