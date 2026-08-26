@@ -22,6 +22,13 @@
  * as publication.
  */
 
+// Type-only, so this module still compiles to zero imports and stays reachable from
+// tests without loading the config singleton.
+import type {
+  ChannelPublicationStatus,
+  SalesChannelSelector,
+} from '../../shopify/publications/publications.types';
+
 /** The shape of one resourcePublicationsV2 node. */
 export interface RawPublication {
   isPublished: boolean;
@@ -104,3 +111,42 @@ export function findPublicationById(
   if (wanted === '') return null;
   return nodes(resource).find((entry) => entry.publication.id === wanted) ?? null;
 }
+
+
+/**
+ * Three-valued publication status for a resource on one channel.
+ *
+ * Mirrors resolveChannelPublication in shopify/publications/visibility.ts, but reads
+ * the raw resourcePublicationsV2 payload the catalog already holds rather than the
+ * mapped ProductPublicationState, so the projection needs no extra Shopify call.
+ *
+ * A channel that is not present in the payload is UNKNOWN, never UNPUBLISHED. The
+ * app cannot tell "the merchant unpublished it" from "this app cannot see that
+ * channel", and only one of those is a merchant decision.
+ */
+export function resolveChannelPublicationStatus(
+  resource: PublishableResource,
+  selector: SalesChannelSelector,
+): ChannelPublicationStatus {
+  const id = selector.publicationId?.trim() ?? '';
+  const name = selector.name?.trim().toLowerCase() ?? '';
+  if (id === '' && name === '') return 'UNKNOWN';
+
+  const entries = nodes(resource);
+  if (entries.length === 0) return 'UNKNOWN';
+
+  let entry: RawPublication | undefined;
+  if (id !== '') {
+    entry = entries.find((candidate) => candidate.publication.id === id);
+  } else {
+    entry =
+      entries.find((candidate) => normalize(candidate.publication.name) === name) ??
+      entries.find((candidate) => normalize(candidate.publication.name).includes(name));
+  }
+
+  if (entry === undefined) return 'UNKNOWN';
+  return entry.isPublished ? 'PUBLISHED' : 'UNPUBLISHED';
+}
+
+/** The Online Store as a selector, for callers that sell through the themed store. */
+export const ONLINE_STORE_SELECTOR: SalesChannelSelector = { name: ONLINE_STORE_CHANNEL };

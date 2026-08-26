@@ -59,7 +59,7 @@ const mapping: PushedVariantMapping = {
 function evaluate(overrides: Partial<Parameters<typeof evaluateStorefrontSellability>[0]> = {}) {
   return evaluateStorefrontSellability({
     productStatus: 'ACTIVE',
-    publishedToOnlineStore: true,
+    channelPublication: 'PUBLISHED',
     sourceability: computeSourceability(supplier(), NOW),
     mapping,
     shopifyVariantAvailableForSale: true,
@@ -127,7 +127,7 @@ describe('fail-closed storefront sellability', () => {
   });
 
   it('blocks when publication or Shopify availability is unknown', () => {
-    assert.equal(evaluate({ publishedToOnlineStore: false }).availability, 'UNAVAILABLE');
+    assert.equal(evaluate({ channelPublication: 'UNPUBLISHED' }).availability, 'UNAVAILABLE');
     assert.equal(
       evaluate({ shopifyVariantAvailableForSale: null }).blockReason,
       'SHOPIFY_VARIANT_AVAILABILITY_UNKNOWN',

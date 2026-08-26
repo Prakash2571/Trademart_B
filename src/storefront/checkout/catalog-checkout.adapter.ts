@@ -6,6 +6,7 @@ import { shopifyGraphql } from '../../shopify/shopify.client';
 import { loadCatalogEvidenceByProductIds } from '../catalog/catalog.repository';
 import { projectStorefrontProduct } from '../catalog/projection';
 import { inrAmountToPaise } from '../catalog/sellability';
+import { storefrontSellingChannel } from '../catalog/selling-channel';
 import type { RawCatalogProduct, RawCatalogVariant } from '../catalog/shopify.catalog';
 import type {
   AuthoritativeCheckoutLine,
@@ -219,11 +220,16 @@ export class StorefrontCatalogCheckoutAdapter implements CheckoutCatalogPort {
         throw new StorefrontError('PRODUCT_UNAVAILABLE', 'This item is no longer available.', 409);
       }
       // CheckoutRawProduct is assignable to RawCatalogProduct (variants field is compatible)
+      // The SAME channel the catalog gated on. If checkout resolved a different
+      // channel, a product could be addable to a cart yet absent from the store, or
+      // browsable yet unbuyable - the price and availability the customer saw would
+      // not be the ones enforced here.
       const projected = projectStorefrontProduct({
         product: rawProduct as RawCatalogProduct,
         shopCurrencyCode: data.shop.currencyCode,
         evidence: candidateEvidence,
         now,
+        sellingChannel: storefrontSellingChannel(),
       });
       const publicVariant = projected?.detail.variants.find((variant) => variant.id === line.variantId);
       const rawVariant = (rawProduct.variants?.nodes ?? []).find(

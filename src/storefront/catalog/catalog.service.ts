@@ -1,8 +1,10 @@
 /** Typed public catalog service. Shopify supplies commerce data; Trademart gates sale. */
 
 import { AppError } from '../../common/errors';
+import type { SalesChannelSelector } from '../../shopify/publications/publications.types';
 import { loadCatalogEvidenceByProductIds } from './catalog.repository';
 import type { CatalogCandidateEvidence } from './catalog.repository';
+import { storefrontSellingChannel } from './selling-channel';
 import {
   buildCatalogFilters,
   projectStorefrontCollection,
@@ -30,6 +32,12 @@ import type {
 
 export interface StorefrontCatalogPorts {
   now(): Date;
+  /**
+   * The sales channel this storefront sells through. A port rather than a direct
+   * config read so the service stays unit-testable against any channel, and so the
+   * catalog and the checkout adapter provably use the SAME answer.
+   */
+  sellingChannel(): SalesChannelSelector;
   listProducts(input: {
     limit: number;
     cursor: string | null;
@@ -103,6 +111,7 @@ export function createStorefrontCatalogService(ports: StorefrontCatalogPorts) {
       shopCurrencyCode: raw.currencyCode,
       evidence: evidence.get(raw.product.id) ?? null,
       now: ports.now(),
+      sellingChannel: ports.sellingChannel(),
     });
     if (projected === null) throw productNotFound();
     return projected.detail;
@@ -110,7 +119,7 @@ export function createStorefrontCatalogService(ports: StorefrontCatalogPorts) {
 
   async function listCollections(): Promise<StorefrontCollection[]> {
     return (await ports.listCollections()).flatMap((collection) => {
-      const projected = projectStorefrontCollection(collection);
+      const projected = projectStorefrontCollection(collection, ports.sellingChannel());
       return projected === null ? [] : [projected];
     });
   }
@@ -123,7 +132,7 @@ export function createStorefrontCatalogService(ports: StorefrontCatalogPorts) {
   }): Promise<StorefrontCollectionDetailData> {
     const page = await ports.getCollectionByHandle(input);
     if (page.collection === null) throw collectionNotFound();
-    const collection = projectStorefrontCollection(page.collection);
+    const collection = projectStorefrontCollection(page.collection, ports.sellingChannel());
     if (collection === null) throw collectionNotFound();
     return {
       collection,
@@ -138,12 +147,14 @@ export function createStorefrontCatalogService(ports: StorefrontCatalogPorts) {
   ): Promise<StorefrontProductSummary[]> {
     const evidence = await ports.loadEvidence(rawProducts.map((product) => product.id));
     const now = ports.now();
+    const channel = ports.sellingChannel();
     return rawProducts.flatMap((product) => {
       const projected = projectStorefrontProduct({
         product,
         shopCurrencyCode: currencyCode,
         evidence: evidence.get(product.id) ?? null,
         now,
+        sellingChannel: channel,
       });
       return projected === null ? [] : [projected.summary];
     });
@@ -156,7 +167,10 @@ export function createStorefrontCatalogService(ports: StorefrontCatalogPorts) {
     sort: StorefrontSort,
   ): Promise<RawProductPage> {
     const page = await ports.getCollectionByHandle({ handle, limit, cursor, sort });
-    if (page.collection === null || projectStorefrontCollection(page.collection) === null) {
+    if (
+      page.collection === null ||
+      projectStorefrontCollection(page.collection, ports.sellingChannel()) === null
+    ) {
       throw collectionNotFound();
     }
     return {
@@ -171,6 +185,7 @@ export function createStorefrontCatalogService(ports: StorefrontCatalogPorts) {
 
 const realService = createStorefrontCatalogService({
   now: () => new Date(),
+  sellingChannel: storefrontSellingChannel,
   listProducts: listRawStorefrontProducts,
   getProductByHandle: getRawStorefrontProductByHandle,
   listCollections: listRawStorefrontCollections,

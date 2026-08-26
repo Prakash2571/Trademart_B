@@ -7,7 +7,8 @@ import type { PushedVariantMapping } from '../../intelligence/variant.mapping';
 import type { CatalogCandidateEvidence } from './catalog.repository';
 // From ./publication, NOT ./shopify.catalog: the latter imports the Shopify client
 // and therefore the config singleton, which this pure projection must not require.
-import { isPublishedToOnlineStore } from './publication';
+import { resolveChannelPublicationStatus, ONLINE_STORE_SELECTOR } from './publication';
+import type { SalesChannelSelector } from '../../shopify/publications/publications.types';
 import type {
   RawCatalogCollection,
   RawCatalogProduct,
@@ -45,9 +46,23 @@ export function projectStorefrontProduct(input: {
   shopCurrencyCode: string;
   evidence: CatalogCandidateEvidence | null;
   now: Date;
+  /**
+   * The sales channel THIS storefront sells through.
+   *
+   * Defaults to the themed Online Store, which is what this projection always
+   * implicitly assumed. A headless storefront passes its own publication instead,
+   * so a product published to the Online Store but absent from the headless channel
+   * is correctly not sellable there.
+   */
+  sellingChannel?: SalesChannelSelector;
 }): ProjectedProduct | null {
   const { product, evidence, now } = input;
   if (evidence === null || evidence.supplier === null) return null;
+
+  const channelPublication = resolveChannelPublicationStatus(
+    product,
+    input.sellingChannel ?? ONLINE_STORE_SELECTOR,
+  );
 
   const sourceability = computeSourceability(evidence.supplier, now);
   const mappingByVariant = uniqueMappingByShopifyVariant(evidence.variantMappings);
@@ -62,7 +77,7 @@ export function projectStorefrontProduct(input: {
 
     const sellability = evaluateStorefrontSellability({
       productStatus: product.status ?? null,
-      publishedToOnlineStore: isPublishedToOnlineStore(product),
+      channelPublication,
       sourceability,
       mapping,
       shopifyVariantAvailableForSale: rawVariant.availableForSale ?? null,
@@ -109,8 +124,16 @@ export function projectStorefrontProduct(input: {
   const priceRange = moneyRange(prices);
   if (priceRange === null) return null;
 
+  // Collections are gated on the SAME channel as the product. Listing a collection
+  // the storefront's channel cannot serve produces links to an empty or 404 page.
   const collections: StorefrontCollectionReference[] = (product.collections?.nodes ?? [])
-    .filter(isPublishedToOnlineStore)
+    .filter(
+      (collection) =>
+        resolveChannelPublicationStatus(
+          collection,
+          input.sellingChannel ?? ONLINE_STORE_SELECTOR,
+        ) === 'PUBLISHED',
+    )
     .map((collection) => ({
       id: publicId('collection', collection.id),
       handle: collection.handle,
@@ -177,8 +200,11 @@ export function projectStorefrontProduct(input: {
 
 export function projectStorefrontCollection(
   collection: RawCatalogCollection,
+  sellingChannel: SalesChannelSelector = ONLINE_STORE_SELECTOR,
 ): StorefrontCollection | null {
-  if (!isPublishedToOnlineStore(collection)) return null;
+  // UNKNOWN is withheld exactly like UNPUBLISHED: without confirmation the
+  // storefront must not advertise a collection it may not be able to serve.
+  if (resolveChannelPublicationStatus(collection, sellingChannel) !== 'PUBLISHED') return null;
   const description = clean(collection.description);
   const image =
     collection.image === null || collection.image === undefined
