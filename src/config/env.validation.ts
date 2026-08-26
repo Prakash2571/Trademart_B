@@ -91,6 +91,8 @@ export interface AppConfig {
   isProduction: boolean;
   port: number;
   frontendUrl: string;
+  /** Public Kanay Store origin. Null when unset (storefront CORS disabled). */
+  storefrontUrl: string | null;
   /**
    * Public HTTPS origin of THIS backend, as reachable by Shopify. Distinct from
    * frontendUrl (the browser app). Null when unset, which disables OAuth and
@@ -124,6 +126,14 @@ export interface AppConfig {
    */
   maxInventoryDelta: number;
   retention: RetentionConfig;
+  /** Razorpay credentials. All null when storefront payments are not configured. */
+  razorpay: {
+    keyId: string | null;
+    keySecret: string | null;
+    webhookSecret: string | null;
+  };
+  /** HMAC key for tracking/status tokens. Null when Razorpay is not configured. */
+  trackingTokenSecret: string | null;
   operator: OperatorConfig;
   shopify: ShopifyConfig;
 }
@@ -794,6 +804,55 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     ),
   };
 
+  // ---- STOREFRONT_URL (public customer site origin) -------------------------
+  const rawStorefrontUrl = read(env, 'STOREFRONT_URL');
+  let storefrontUrl: string | null = null;
+  if (rawStorefrontUrl !== null) {
+    if (!/^https?:\/\/.+/.test(rawStorefrontUrl)) {
+      errors.push(
+        `STOREFRONT_URL must start with http:// or https:// (received "${rawStorefrontUrl}").`,
+      );
+    } else {
+      storefrontUrl = rawStorefrontUrl.replace(/\/+$/, '');
+    }
+  } else {
+    warnings.push(
+      'STOREFRONT_URL not set - public storefront CORS will reject browser requests. Set it to the Kanay Store origin.',
+    );
+  }
+
+  // ---- Razorpay (storefront payments) --------------------------------------
+  const razorpayKeyId = read(env, 'RAZORPAY_KEY_ID');
+  const razorpayKeySecret = read(env, 'RAZORPAY_KEY_SECRET');
+  const razorpayWebhookSecret = read(env, 'RAZORPAY_WEBHOOK_SECRET');
+  if (razorpayKeyId !== null && !/^rzp_(test|live)_[A-Za-z0-9]+$/.test(razorpayKeyId)) {
+    errors.push('RAZORPAY_KEY_ID must match rzp_test_... or rzp_live_...');
+  }
+  if (razorpayKeySecret !== null && razorpayKeySecret.length < 8) {
+    errors.push('RAZORPAY_KEY_SECRET must be at least 8 characters.');
+  }
+  if (razorpayWebhookSecret !== null && razorpayWebhookSecret.length < 8) {
+    errors.push('RAZORPAY_WEBHOOK_SECRET must be at least 8 characters.');
+  }
+  // In production: payment credentials are required for the storefront to function.
+  // In development: warn only so the server boots and the operator panel works.
+  if (isProduction && storefrontUrl !== null) {
+    if (!razorpayKeyId)
+      errors.push('RAZORPAY_KEY_ID is required when STOREFRONT_URL is set in production.');
+    if (!razorpayKeySecret)
+      errors.push('RAZORPAY_KEY_SECRET is required when STOREFRONT_URL is set in production.');
+    if (!razorpayWebhookSecret)
+      errors.push('RAZORPAY_WEBHOOK_SECRET is required when STOREFRONT_URL is set in production.');
+  } else if (storefrontUrl !== null && !razorpayKeyId) {
+    warnings.push(
+      'RAZORPAY_KEY_ID not set - storefront checkout will return PAYMENT_NOT_CONFIGURED.',
+    );
+  }
+
+  // The tracking token secret: use RAZORPAY_WEBHOOK_SECRET as the HMAC key for token
+  // derivation (it is 256-bit and server-only). A dedicated secret can be added later.
+  const trackingTokenSecret: string | null = razorpayWebhookSecret;
+
   if (errors.length > 0) {
     return { config: null, errors, warnings };
   }
@@ -804,6 +863,7 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
       isProduction,
       port,
       frontendUrl,
+      storefrontUrl,
       appUrl,
       mongoUri,
       tokenEncryptionKey,
@@ -811,6 +871,12 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
       automationOnWebhook,
       maxInventoryDelta,
       retention,
+      razorpay: {
+        keyId: razorpayKeyId,
+        keySecret: razorpayKeySecret,
+        webhookSecret: razorpayWebhookSecret,
+      },
+      trackingTokenSecret,
       operator: {
         username: operatorUsername,
         passwordHash: operatorPasswordHash,

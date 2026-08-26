@@ -33,6 +33,7 @@ function variant(overrides: Partial<ProductVariantDto> = {}): ProductVariantDto 
     price: money(20),
     compareAtPrice: null,
     availableForSale: true,
+    selectedOptions: [],
     inventoryQuantity: 10,
     inventoryItemId: 'gid://shopify/InventoryItem/1',
     inventoryTracked: true,

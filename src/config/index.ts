@@ -47,6 +47,12 @@ export const config: AppConfig = Object.freeze(
  */
 export const isShopifyConfigured = (): boolean => config.shopify.authStrategy !== 'NONE';
 
+/** True when Razorpay credentials are configured for the storefront. */
+export const isStorefrontPaymentConfigured = (): boolean =>
+  config.razorpay.keyId !== null &&
+  config.razorpay.keySecret !== null &&
+  config.razorpay.webhookSecret !== null;
+
 /** True when a Mongo connection string was supplied. */
 export const isDatabaseConfigured = (): boolean => config.mongoUri !== null;
 

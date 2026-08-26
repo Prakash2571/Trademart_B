@@ -46,6 +46,10 @@ const VARIANT_CORE_FIELDS = /* GraphQL */ `
   compareAtPrice
   barcode
   availableForSale
+  selectedOptions {
+    name
+    value
+  }
 `;
 
 export const PRODUCTS_QUERY_FULL = /* GraphQL */ `

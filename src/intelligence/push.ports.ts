@@ -31,6 +31,10 @@ import type {
   ExistingProductRef,
 } from './duplicate.detection';
 import type { ProductCreateRequest } from '../products/product.create';
+import type {
+  PushedVariantMapping,
+  ShopifyCreatedVariantIdentity,
+} from './variant.mapping';
 
 /**
  * The verified state of a Shopify product.
@@ -64,13 +68,15 @@ export interface ExistingResearchProduct {
    * re-attached and that is reported rather than guessed.
    */
   shopifyVariantId: string | null;
+  /** All readable variants, used to reconstruct mappings after a crash. */
+  variants?: readonly ShopifyCreatedVariantIdentity[];
   state: ShopifyProductState;
 }
 
 /** What createProduct gives back, narrowed to what the orchestration uses. */
 export interface CreatedProduct extends ShopifyProductState {
   shopifyProductId: string;
-  variants: readonly { shopifyVariantId: string }[];
+  variants: readonly ShopifyCreatedVariantIdentity[];
   warnings: string[];
 }
 
@@ -172,6 +178,7 @@ export interface CompletionRequest {
   candidateId: string;
   operationId: string;
   shopifyProductId: string;
+  variantMappings: readonly PushedVariantMapping[];
   now: Date;
 }
 

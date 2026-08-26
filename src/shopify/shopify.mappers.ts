@@ -105,6 +105,7 @@ export function mapVariant(raw: RawVariant, currencyCode: string): ProductVarian
     price: toMoneyFromString(raw.price, currencyCode),
     compareAtPrice: toMoneyFromString(raw.compareAtPrice, currencyCode),
     availableForSale: raw.availableForSale ?? null,
+    selectedOptions: raw.selectedOptions ?? [],
     inventoryQuantity: raw.inventoryQuantity ?? null,
     inventoryItemId: raw.inventoryItem?.id ?? null,
     inventoryTracked: raw.inventoryItem?.tracked ?? null,

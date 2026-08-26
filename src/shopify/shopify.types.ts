@@ -115,6 +115,7 @@ export interface RawVariant {
   compareAtPrice?: string | null;
   barcode?: string | null;
   availableForSale?: boolean | null;
+  selectedOptions?: { name: string; value: string }[] | null;
   inventoryQuantity?: number | null;
   inventoryItem?: {
     id: string;
@@ -329,6 +330,8 @@ export interface ProductVariantDto {
   price: Money | null;
   compareAtPrice: Money | null;
   availableForSale: boolean | null;
+  /** Exact Shopify option identity, used for durable supplier mapping recovery. */
+  selectedOptions: { name: string; value: string }[];
   /** null when read_inventory is not granted - NOT zero. */
   inventoryQuantity: number | null;
   inventoryItemId: string | null;

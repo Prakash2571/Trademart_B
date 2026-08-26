@@ -3,11 +3,13 @@
  *
  * Middleware order matters here:
  *  1. security headers
- *  2. CORS restricted to the configured frontend origin
- *  3. webhook RECEIVER first, because HMAC verification needs the raw body and a
+ *  2. CORS - origin-based dispatch: operator (credentials:true) vs storefront (no credentials)
+ *  3. webhook RECEIVERS first, because HMAC verification needs the raw body and a
  *     global JSON parser would consume it
  *  4. JSON parser + rate limiting for the normal API surface
- *  5. 404 handler, then the terminal error handler
+ *  5. Public routes (health, diagnostics, operator login, OAuth, storefront)
+ *  6. Authenticated management routes
+ *  7. 404 handler, then the terminal error handler
  *
  * The webhook receiver and the webhook admin routes are deliberately two
  * different routers: only the receiver needs the raw body, and mounting the
@@ -20,13 +22,15 @@
  *   /api/operator/*          you cannot sign in if signing in needs a sign-in
  *   /api/auth/*              Shopify calls the OAuth callback; secured by HMAC
  *   /api/webhooks/shopify    Shopify cannot sign in; secured by HMAC
+ *   /api/webhooks/razorpay   Razorpay cannot sign in; secured by HMAC
+ *   /api/storefront/*        Guest commerce; no operator session, own rate limits
  *
  * Everything else requires an operator for state-changing methods, and for
  * reads too when OPERATOR_PROTECT_READS=true.
  */
 
-import cors from 'cors';
-import express, { type Express } from 'express';
+import cors, { type CorsOptions } from 'cors';
+import express, { type Express, type Request, type Response, type NextFunction } from 'express';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 
@@ -73,8 +77,90 @@ import {
   webhookAdminRouter,
   webhooksRouter,
 } from './webhooks/webhooks.controller';
+import type { StorefrontRouters } from './storefront/bootstrap';
 
-export function createApp(): Express {
+// ---- CORS configurations ---------------------------------------------------
+
+const operatorCorsOptions: CorsOptions = {
+  origin: [config.frontendUrl],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: [
+    'Content-Type',
+    'X-CSRF-Token',
+    'Authorization',
+    'Idempotency-Key',
+    REQUEST_ID_HEADER,
+  ],
+  credentials: true,
+  maxAge: 86400,
+  exposedHeaders: [REQUEST_ID_HEADER],
+};
+
+const storefrontCorsOptions: CorsOptions = {
+  origin: config.storefrontUrl ? [config.storefrontUrl] : [],
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Idempotency-Key', REQUEST_ID_HEADER],
+  credentials: false,
+  maxAge: 86400,
+  exposedHeaders: [REQUEST_ID_HEADER],
+};
+
+const operatorCorsMiddleware = cors(operatorCorsOptions);
+const storefrontCorsMiddleware = cors(storefrontCorsOptions);
+
+/**
+ * Origin-based CORS dispatch.
+ *
+ * - Operator origin → credentials: true, full method/header set
+ * - Storefront origin → credentials: false, limited to GET/POST/OPTIONS
+ * - Unknown origin → operator cors rejects it (no ACAO header set)
+ * - No origin (server-to-server, same-origin) → operator cors allows it
+ */
+function corsDispatch(req: Request, res: Response, next: NextFunction): void {
+  const origin = req.headers.origin;
+  if (origin && config.storefrontUrl && origin === config.storefrontUrl) {
+    storefrontCorsMiddleware(req, res, next);
+  } else {
+    operatorCorsMiddleware(req, res, next);
+  }
+}
+
+// ---- Storefront rate limiters -----------------------------------------------
+
+const storefrontRateLimitMessage = {
+  success: false,
+  code: 'RATE_LIMITED',
+  message: 'Too many requests. Please slow down.',
+};
+
+/** Catalog reads: generous for browsing (100 req/min per IP) */
+const storefrontCatalogRateLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 100,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: storefrontRateLimitMessage,
+});
+
+/** Checkout creation + payment verify: tight (10 req/min per IP) */
+const storefrontCheckoutRateLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: storefrontRateLimitMessage,
+});
+
+/** Tracking/status: very tight to resist token brute-force (15 req/min per IP) */
+const storefrontTrackingRateLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 15,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: storefrontRateLimitMessage,
+});
+
+export function createApp(storefront?: StorefrontRouters | null): Express {
   const app = express();
 
   // Trust the first proxy hop so rate limiting sees real client IPs when
@@ -94,46 +180,27 @@ export function createApp(): Express {
   // separate concern and is NOT set from this process.
   app.use(helmet(helmetOptions()));
 
-  // Only the configured frontend origin may call this API from a browser.
-  //
-  // credentials:true is required for the operator session cookie to be sent
-  // cross-origin (local dev: :3000 -> :4000). It is safe ONLY because `origin`
-  // is an explicit allowlist - the CORS spec forbids credentials with a wildcard
-  // origin, and echoing an arbitrary origin here would defeat the whole policy.
-  //
-  // Note this is defence in depth, not authentication: CORS is enforced by the
-  // browser and does nothing about curl. Authentication is requireOperator.
-  app.use(
-    cors({
-      origin: [config.frontendUrl],
-      // PUT/PATCH/DELETE are needed by the management API (e.g. PUT
-      // /api/automation/rules, which existed but was unreachable from a browser
-      // because preflight rejected the method).
-      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      // Idempotency-Key and X-Request-ID must be listed or the browser preflight
-      // rejects them, which would silently disable both features for every
-      // cross-origin request from the console.
-      allowedHeaders: [
-        'Content-Type',
-        'X-CSRF-Token',
-        'Authorization',
-        'Idempotency-Key',
-        REQUEST_ID_HEADER,
-      ],
-      credentials: true,
-      maxAge: 86400,
-      // Lets the browser READ the correlation id off the response, so the UI can
-      // show an id the operator can quote. Without this a cross-origin fetch
-      // cannot see the header at all and it would be backend-only.
-      exposedHeaders: [REQUEST_ID_HEADER],
-    }),
-  );
+  // CORS: origin-based dispatch. Operator origin gets credentials:true; the
+  // storefront origin gets credentials:false and limited methods/headers.
+  // Unknown origins are blocked (no ACAO header set by operator cors).
+  // Security invariant: Access-Control-Allow-Credentials: true is NEVER sent
+  // when the reflected origin is the storefront. The operator cookie can never
+  // be attached to a storefront request.
+  app.use(corsDispatch);
 
-  // Webhooks before the JSON parser (raw body required for HMAC).
+  // ---- Webhook receivers BEFORE the JSON body parser (raw body for HMAC) ----
+  // Shopify webhook receiver: secured by HMAC over raw bytes.
   app.use('/api', webhooksRouter);
+
+  // Razorpay webhook receiver: secured by HMAC over raw bytes.
+  // Must be before the JSON parser so the body is not mutated.
+  if (storefront) {
+    app.use('/api', storefront.razorpayWebhookRouter);
+  }
 
   app.use(express.json({ limit: '1mb' }));
 
+  // Global rate limiter: 300 req/min per IP across all routes.
   app.use(
     '/api',
     rateLimit({
@@ -166,6 +233,19 @@ export function createApp(): Express {
   // /callback and cannot present an operator credential. It is protected
   // instead by HMAC + a signed state nonce (see auth/oauth.hmac.ts).
   app.use('/api/auth', oauthRouter);
+
+  // ---- Public storefront (guest commerce, no operator session) --------------
+  // These routes serve the Kanay Store customer-facing application. They are:
+  //   ✅ Inside the error handling chain (notFoundHandler and errorHandler after)
+  //   ✅ Below the global CORS dispatch and global rate limiter
+  //   ✅ Below express.json()
+  //   ❌ NOT behind requireOperator / requireOperatorForReads / requireOperatorForWrites
+  // Each route group has its own tighter rate limiter that stacks with the global one.
+  if (storefront) {
+    app.use('/api', storefrontCatalogRateLimiter, storefront.catalogRouter);
+    app.use('/api', storefrontCheckoutRateLimiter, storefront.checkoutRouter);
+    app.use('/api', storefrontTrackingRateLimiter, storefront.ordersRouter);
+  }
 
   // ---- Management surface: mutations require an authenticated operator -----
   //

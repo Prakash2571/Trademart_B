@@ -59,6 +59,12 @@ import type {
   ShopifyProductState,
 } from './push.ports';
 import type { SourceabilityResult } from './sourceability';
+import {
+  buildSupplierVariantPlan,
+  buildVariantPlanFromSupplierVariants,
+  mapCreatedVariants,
+  type PushedVariantMapping,
+} from './variant.mapping';
 
 /**
  * How long a push claim is honoured before another operation may take it over.
@@ -477,6 +483,7 @@ async function pushWithClaim(
   }
 
   // ---- 9. create ----------------------------------------------------------
+  const variantPlan = buildSupplierVariantPlan(candidate, listedPrice.amount);
   const request = buildDraftRequest(candidate, listedPrice.amount);
   // Belt and braces over buildDraftRequest, which hard-codes both fields. A property this
   // important should be enforced by a check rather than by everyone remembering.
@@ -485,6 +492,14 @@ async function pushWithClaim(
   const product = await ports.shopify.createProduct(request);
   recordProductId(product.shopifyProductId);
   warnings.push(...product.warnings);
+
+  const variantMapping = mapCreatedVariants(
+    candidateId,
+    variantPlan.sources,
+    product.variants,
+    ports.now(),
+  );
+  warnings.push(...variantMapping.warnings);
 
   // ---- 10. draft-only is a POSTCONDITION ----------------------------------
   const safety = await enforceHidden(ports, product.shopifyProductId, product, warnings);
@@ -516,6 +531,7 @@ async function pushWithClaim(
       candidateId,
       operationId: input.operationId,
       shopifyProductId: product.shopifyProductId,
+      variantMappings: variantMapping.mappings,
       now: completionNow,
     });
     if (!owned) {
@@ -536,6 +552,7 @@ async function pushWithClaim(
       candidateId,
       operationId: input.operationId,
       shopifyProductId: product.shopifyProductId,
+      variantMappings: variantMapping.mappings,
       reason: safety.incident,
       now: completionNow,
     });
@@ -612,7 +629,12 @@ async function reconcileExisting(
   ports: PushPorts,
   claimed: ProductCandidate,
   input: PushAsDraftInput,
-  found: { shopifyProductId: string; shopifyVariantId: string | null; state: ShopifyProductState },
+  found: {
+    shopifyProductId: string;
+    shopifyVariantId: string | null;
+    variants?: readonly { shopifyVariantId: string; sku?: string | null; optionValues?: readonly { name: string; value: string }[] }[];
+    state: ShopifyProductState;
+  },
   now: Date,
   warnings: string[],
 ): Promise<PushAsDraftResult> {
@@ -634,6 +656,7 @@ async function reconcileExisting(
   // re-recording a cost the crashed attempt already saved is harmless; the point is to
   // cover the case where it crashed BEFORE saving it.
   let costRecorded = false;
+  let variantMappings: PushedVariantMapping[] = [];
   if (intent === null) {
     // Conservative reconcile: the product exists but its original commercial intent is
     // gone. Nothing is invented - the price, hash and cost are reported as unknown.
@@ -649,6 +672,25 @@ async function reconcileExisting(
       found.shopifyVariantId,
       warnings,
     );
+
+    try {
+      const recoveredPlan = buildVariantPlanFromSupplierVariants(
+        intent.supplierVariantSnapshot,
+        intent.listedPrice,
+      );
+      const recovered = mapCreatedVariants(
+        candidateId,
+        recoveredPlan.sources,
+        found.variants ?? [],
+        now,
+      );
+      variantMappings = recovered.mappings;
+      warnings.push(...recovered.warnings);
+    } catch (error) {
+      warnings.push(
+        `The original supplier-to-Shopify variant mapping could not be reconstructed (${error instanceof Error ? error.message : 'unknown error'}). Unmapped variants remain unavailable to the storefront.`,
+      );
+    }
   }
 
   if (safety.incident === null) {
@@ -656,6 +698,7 @@ async function reconcileExisting(
       candidateId,
       operationId: input.operationId,
       shopifyProductId: found.shopifyProductId,
+      variantMappings,
       now,
     });
     if (!owned) {
@@ -670,6 +713,7 @@ async function reconcileExisting(
       candidateId,
       operationId: input.operationId,
       shopifyProductId: found.shopifyProductId,
+      variantMappings,
       reason: safety.incident,
       now,
     });
