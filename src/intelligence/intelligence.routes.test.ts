@@ -201,6 +201,11 @@ describe('research can never publish', () => {
       ['publishProduct(', /(?<![A-Za-z])publishProduct\s*\(/],
       ['publishablePublish', /publishablePublish/],
       ['publishableId', /publishableId/],
+      // Headless publication is publication. A custom storefront is a customer-facing
+      // channel like any other, so research may not reach it either - by any of the
+      // names that would grant visibility there.
+      ['publishProductToHeadless', /publishProductToHeadless/],
+      ['publish-headless route', /publish-headless/],
     ];
     for (const [name, source] of RESEARCH_SOURCES) {
       for (const [label, pattern] of forbidden) {
