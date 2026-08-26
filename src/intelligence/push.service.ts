@@ -220,6 +220,7 @@ async function markSucceeded(request: CompletionRequest): Promise<boolean> {
         pushState: 'SUCCEEDED',
         pushClaimedAt: null,
         pushedShopifyProductId: request.shopifyProductId,
+        pushedVariantMappings: request.variantMappings,
         pushedAt: request.now.toISOString(),
       },
     },
@@ -261,6 +262,7 @@ async function markSafetyIncident(request: IncidentRequest): Promise<void> {
         pushOperationId: request.operationId,
         pushClaimedAt: null,
         pushedShopifyProductId: request.shopifyProductId,
+        pushedVariantMappings: request.variantMappings,
         pushedAt: request.now.toISOString(),
         pushSafetyReason: request.reason,
       },
@@ -321,6 +323,11 @@ async function findByResearchTag(candidateId: string): Promise<ExistingResearchP
     // The first variant, so a reconciliation can restore the supplier cost against it.
     // Null when Shopify returned no variant - reported rather than guessed downstream.
     shopifyVariantId: first.variants[0]?.shopifyVariantId ?? null,
+    variants: first.variants.map((variant) => ({
+      shopifyVariantId: variant.shopifyVariantId,
+      sku: variant.sku,
+      optionValues: variant.selectedOptions,
+    })),
     state: {
       status: first.status,
       published: visibility.publishedAnywhere,

@@ -148,6 +148,27 @@ const commercialsSchema = new Schema(
   { _id: false },
 );
 
+/** One supplier-side variant's availability and identity. */
+const supplierVariantSchema = new Schema(
+  {
+    supplierVariantId: { type: String, default: null },
+    sku: { type: String, default: null },
+    title: { type: String, required: true },
+    // A free-form option map (e.g. { Color: 'Black', Size: 'M' }).
+    optionValues: { type: Schema.Types.Mixed, default: () => ({}) },
+    availability: {
+      type: String,
+      enum: ['AVAILABLE', 'UNAVAILABLE', 'UNKNOWN'],
+      default: 'UNKNOWN',
+    },
+    stockKnown: { type: Boolean, default: false },
+    cost: { type: Number, default: null },
+    currencyCode: { type: String, default: null },
+    checkedAt: { type: String, default: null },
+  },
+  { _id: false },
+);
+
 /**
  * The immutable snapshot of the decision that is about to create a Shopify draft.
  *
@@ -176,28 +197,39 @@ const pushIntentSchema = new Schema(
     confidenceScore: { type: Number, default: null },
     recommendation: { type: String, default: null },
     analyzedInputRevision: { type: Number, default: null },
+    supplierProvider: {
+      type: String,
+      enum: ['TRADELLE', 'OTHER', 'UNKNOWN'],
+      default: 'UNKNOWN',
+    },
+    supplierProductId: { type: String, default: null },
+    supplierAvailability: {
+      type: String,
+      enum: ['AVAILABLE', 'UNAVAILABLE', 'UNKNOWN'],
+      default: 'UNKNOWN',
+    },
+    supplierAvailabilitySource: {
+      type: String,
+      enum: ['SHOPIFY_BRIDGE', 'MANUAL', 'DIRECT_API'],
+      default: 'MANUAL',
+    },
+    supplierAvailabilityCheckedAt: { type: String, default: null },
+    supplierVariantSnapshot: { type: [supplierVariantSchema], default: [] },
     createdAt: { type: String, required: true },
   },
   { _id: false },
 );
 
-/** One supplier-side variant's availability. */
-const supplierVariantSchema = new Schema(
+/** Durable, exact supplier -> Shopify -> public variant identity. */
+const pushedVariantMappingSchema = new Schema(
   {
+    publicVariantId: { type: String, required: true },
+    shopifyVariantId: { type: String, required: true },
     supplierVariantId: { type: String, default: null },
-    sku: { type: String, default: null },
-    title: { type: String, required: true },
-    // A free-form option map (e.g. { Color: 'Black', Size: 'M' }).
+    supplierSku: { type: String, default: null },
+    supplierTitle: { type: String, required: true },
     optionValues: { type: Schema.Types.Mixed, default: () => ({}) },
-    availability: {
-      type: String,
-      enum: ['AVAILABLE', 'UNAVAILABLE', 'UNKNOWN'],
-      default: 'UNKNOWN',
-    },
-    stockKnown: { type: Boolean, default: false },
-    cost: { type: Number, default: null },
-    currencyCode: { type: String, default: null },
-    checkedAt: { type: String, default: null },
+    mappedAt: { type: String, required: true },
   },
   { _id: false },
 );
@@ -323,6 +355,11 @@ const productCandidateSchema = new Schema(
      * this module publishes, and the field name deliberately does not say "published".
      */
     pushedShopifyProductId: { type: String, default: null },
+    /**
+     * Exact mappings captured from Shopify's create response. Public catalog and checkout
+     * fail closed for a Shopify variant that has no row here; input order is never used.
+     */
+    pushedVariantMappings: { type: [pushedVariantMappingSchema], default: [] },
     pushedAt: { type: String, default: null },
 
     /**
@@ -414,6 +451,9 @@ productCandidateSchema.index({ shopDomain: 1, status: 1, overallScore: -1 });
  * the service, where it can be explained to the operator.
  */
 productCandidateSchema.index({ shopDomain: 1, sourceProductId: 1 }, { sparse: true });
+
+/** Public catalog joins sellability evidence by the Shopify product id. */
+productCandidateSchema.index({ shopDomain: 1, pushedShopifyProductId: 1 }, { sparse: true });
 
 export type ProductCandidateDocument = InferSchemaType<typeof productCandidateSchema>;
 export const ProductCandidateModel = model('ProductCandidate', productCandidateSchema);

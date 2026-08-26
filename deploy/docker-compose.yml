@@ -137,6 +137,16 @@ services:
       OPERATOR_API_KEY: ${OPERATOR_API_KEY:-}
       SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
       OPERATOR_PROTECT_READS: ${OPERATOR_PROTECT_READS:-false}
+
+      # ---- Public storefront (Kanay customer commerce) --------------------
+      # The public Kanay Store origin. Used for CORS only — operator cookies
+      # are never sent here.
+      STOREFRONT_URL: ${STOREFRONT_URL:-}
+      # Razorpay credentials. Backend-only: key_secret and webhook_secret
+      # NEVER reach the browser. key_id is the publishable key.
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
     # No depends_on: the database is external by default. The local-db override
     # adds a depends_on for the bundled Mongo when you opt into it.
     expose:

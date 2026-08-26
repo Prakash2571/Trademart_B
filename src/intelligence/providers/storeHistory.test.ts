@@ -56,6 +56,7 @@ function product(
       price: money(price, currencyCode),
       compareAtPrice: null,
       availableForSale: true,
+      selectedOptions: [],
       inventoryQuantity: null,
       inventoryItemId: null,
       inventoryTracked: null,

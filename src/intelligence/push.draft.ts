@@ -13,6 +13,7 @@ import { AppError } from '../common/errors';
 import type { PriceRecommendation, PricingScenarioName } from '../pricing/recommendation';
 import type { ProductCreateRequest } from '../products/product.create';
 import type { ProductCandidate } from './candidate.types';
+import { buildSupplierVariantPlan } from './variant.mapping';
 
 /** Where a listed price came from, so the audit trail can say. */
 export interface ResolvedListingPrice {
@@ -127,6 +128,7 @@ export function buildDraftRequest(
   candidate: ProductCandidate,
   price: number,
 ): ProductCreateRequest {
+  const variantPlan = buildSupplierVariantPlan(candidate, price);
   const tags = [
     RESEARCH_PUSH_TAG,
     // The per-candidate identity. Load-bearing: this is what a retry looks up to discover
@@ -147,16 +149,11 @@ export function buildDraftRequest(
     status: 'DRAFT',
     publish: false,
     tags,
-    // No options and no explicit variants: createProduct's single default variant carries
-    // the price. A research candidate has no variant structure worth preserving, and
-    // inventing sizes or colours nobody specified would be fabrication.
-    options: [],
-    variants: [
-      {
-        price: price.toFixed(2),
-        optionValues: [],
-      },
-    ],
+    // Options and combinations come ONLY from AVAILABLE verified supplier variants.
+    // A product-level supplier item with no variant structure keeps one default variant;
+    // a real multi-variant item is never collapsed and no Cartesian combinations are made.
+    options: variantPlan.options,
+    variants: variantPlan.variants,
     mediaUrls: candidate.imageUrl === null ? [] : [candidate.imageUrl],
   };
 }

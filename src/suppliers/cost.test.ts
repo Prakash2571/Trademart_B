@@ -213,6 +213,7 @@ function variant(unitCost: ReturnType<typeof money> | null): ProductVariantDto {
     price: money(12),
     compareAtPrice: null,
     availableForSale: true,
+    selectedOptions: [],
     inventoryQuantity: 5,
     inventoryItemId: null,
     inventoryTracked: true,

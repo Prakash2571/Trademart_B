@@ -2,12 +2,12 @@
  * Entry point.
  *
  * Boot order: validate config (in ./config, which exits on failure) -> attempt
- * the database connection (non-fatal) -> listen.
+ * the database connection (non-fatal) -> bootstrap storefront -> listen.
  */
 
 import { createApp } from './app';
 import { logger } from './common/logger';
-import { config, isShopifyConfigured } from './config';
+import { config, isShopifyConfigured, isStorefrontPaymentConfigured } from './config';
 import { connectDatabase, disconnectDatabase, ensureIndexes } from './database/mongo';
 import { processWebhookEvent } from './webhooks/webhook.processor';
 import {
@@ -15,6 +15,11 @@ import {
   startWebhookWorker,
   stopWebhookWorker,
 } from './webhooks/webhook.queue';
+import {
+  bootstrapStorefront,
+  startStorefrontWorkers,
+  stopStorefrontWorkers,
+} from './storefront/bootstrap';
 
 async function main(): Promise<void> {
   await connectDatabase();
@@ -28,15 +33,21 @@ async function main(): Promise<void> {
   // knowledge and stays testable on its own.
   registerWebhookProcessor(processWebhookEvent);
 
-  const app = createApp();
+  // Bootstrap the public storefront (Razorpay payments, checkout, tracking).
+  // Returns null when credentials are absent — operator panel still works.
+  const storefront = bootstrapStorefront();
+
+  const app = createApp(storefront);
   const server = app.listen(config.port, () => {
     logger.info('Trademart backend listening.', {
       port: config.port,
       environment: config.nodeEnv,
       corsOrigin: config.frontendUrl,
+      storefrontOrigin: config.storefrontUrl,
       shopifyStore: config.shopify.storeDomain,
       shopifyApiVersion: config.shopify.apiVersion,
       shopifyConfigured: isShopifyConfigured(),
+      storefrontPaymentConfigured: isStorefrontPaymentConfigured(),
     });
 
     if (!isShopifyConfigured()) {
@@ -48,6 +59,7 @@ async function main(): Promise<void> {
     // Started after `listen` so the process is already answering health probes
     // when the first (possibly slow) queue drain runs.
     startWebhookWorker();
+    startStorefrontWorkers();
   });
 
   let shuttingDown = false;
@@ -56,9 +68,10 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
 
-    // Stop CLAIMING new webhook work before closing what it depends on. An event
+    // Stop CLAIMING new work before closing what it depends on. An event
     // already claimed simply has its lease expire and is retried, which is why
-    // the queue leases at all.
+    // the queues lease at all.
+    stopStorefrontWorkers();
     stopWebhookWorker();
 
     logger.info('Shutting down.', { signal });
