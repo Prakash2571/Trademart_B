@@ -1,17 +1,26 @@
 /** Shopify Admin reads for the public projection. Raw responses never leave this module. */
 
 import { shopifyGraphql } from '../../shopify/shopify.client';
+import type { RawPublication } from './publication';
 import type { StorefrontSort } from './types';
+
+/**
+ * The pure publication predicates live in ./publication.ts, which imports nothing.
+ * Re-exported here so existing callers keep working, but prefer importing them from
+ * ./publication directly - this module pulls in the Shopify client, and with it the
+ * config singleton that exits the process on invalid env.
+ */
+export {
+  isPublishedToOnlineStore,
+  isPublishedToChannelNamed,
+  isPublishedToPublicationId,
+  findPublicationById,
+} from './publication';
+export type { RawPublication, PublishableResource } from './publication';
 
 interface RawImage {
   url: string;
   altText?: string | null;
-}
-
-interface RawPublication {
-  isPublished: boolean;
-  publishDate?: string | null;
-  publication: { id: string; name: string };
 }
 
 export interface RawCatalogVariant {
@@ -282,17 +291,6 @@ export async function getRawStorefrontCollectionByHandle(input: {
   };
 }
 
-export function isPublishedToOnlineStore(
-  resource: { resourcePublicationsV2?: { nodes?: RawPublication[] | null } | null },
-): boolean {
-  const publications = resource.resourcePublicationsV2?.nodes ?? [];
-  return publications.some(
-    (entry) =>
-      entry.isPublished === true &&
-      (entry.publication.name.toLowerCase() === 'online store' ||
-        entry.publication.name.toLowerCase().includes('online store')),
-  );
-}
 
 function productSort(sort: StorefrontSort): { sortKey: string; reverse: boolean } {
   switch (sort) {

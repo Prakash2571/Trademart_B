@@ -5,11 +5,13 @@ import { createHash } from 'node:crypto';
 import { computeSourceability } from '../../intelligence/sourceability';
 import type { PushedVariantMapping } from '../../intelligence/variant.mapping';
 import type { CatalogCandidateEvidence } from './catalog.repository';
-import {
-  isPublishedToOnlineStore,
-  type RawCatalogCollection,
-  type RawCatalogProduct,
-  type RawCatalogVariant,
+// From ./publication, NOT ./shopify.catalog: the latter imports the Shopify client
+// and therefore the config singleton, which this pure projection must not require.
+import { isPublishedToOnlineStore } from './publication';
+import type {
+  RawCatalogCollection,
+  RawCatalogProduct,
+  RawCatalogVariant,
 } from './shopify.catalog';
 import {
   evaluateStorefrontSellability,
