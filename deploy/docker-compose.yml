@@ -102,6 +102,15 @@ services:
       SHOPIFY_STORE_MODE: ${SHOPIFY_STORE_MODE:-}
       ALLOW_LIVE_STORE_WRITES: ${ALLOW_LIVE_STORE_WRITES:-false}
 
+      # Which Shopify publication is the CUSTOM headless storefront. A headless
+      # store is its own sales channel, so being ACTIVE and published to the
+      # Online Store does not make a product visible there. Both blank means no
+      # headless channel: publication resolves UNKNOWN and nothing is reported
+      # sellable on a custom store, rather than guessing a channel.
+      # The GID is preferred - a channel can be renamed, its id cannot.
+      SHOPIFY_HEADLESS_PUBLICATION_ID: ${SHOPIFY_HEADLESS_PUBLICATION_ID:-}
+      SHOPIFY_HEADLESS_CHANNEL_NAME: ${SHOPIFY_HEADLESS_CHANNEL_NAME:-}
+
       # Scopes requested by the OAuth redirect flow. Ignored under Shopify-managed
       # installation, where shopify.app.toml is the source of truth.
       SHOPIFY_SCOPES: ${SHOPIFY_SCOPES:-}
