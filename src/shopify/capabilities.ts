@@ -181,9 +181,13 @@ export const SHOPIFY_FEATURES: readonly FeatureDefinition[] = Object.freeze([
       'GET /api/shopify/products/:id/publications',
     ],
   },
+  // Its own group rather than more `publications` actions: the catalogue requires
+  // key === `${group}.${action}`, so a second publications/read entry would collide.
+  // A separate group is also the more honest shape - the console surfaces headless
+  // storefront operations as their own concern.
   {
-    key: 'publications.headless.read',
-    group: 'publications',
+    key: 'headless.read',
+    group: 'headless',
     action: 'read',
     title: 'Report headless storefront channel readiness and per-channel visibility',
     requiredScopes: ['read_publications'],
@@ -196,8 +200,8 @@ export const SHOPIFY_FEATURES: readonly FeatureDefinition[] = Object.freeze([
     note: 'A custom headless storefront is its own publication. Online Store publication does NOT make a product visible there, and status ACTIVE alone never does. Requires SHOPIFY_HEADLESS_PUBLICATION_ID or SHOPIFY_HEADLESS_CHANNEL_NAME; with neither set, headless publication is reported as UNKNOWN rather than assumed.',
   },
   {
-    key: 'publications.headless.publish',
-    group: 'publications',
+    key: 'headless.publish',
+    group: 'headless',
     action: 'publish',
     title: 'Publish a product to the headless storefront channel',
     requiredScopes: ['write_publications'],
