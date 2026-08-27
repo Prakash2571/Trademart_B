@@ -20,6 +20,7 @@ import { Router } from 'express';
 import { recordAudit } from '../../audit/audit.service';
 import { AppError } from '../../common/errors';
 import { asyncHandler, sendSuccess } from '../../common/http';
+import { idempotent } from '../../common/idempotency';
 import { toShopifyGid } from '../../common/validate';
 import { getTokenDiagnostics } from '../shopify.client';
 import {
@@ -100,8 +101,14 @@ publicationsRouter.get(
   }),
 );
 
+// Publish/unpublish are wrapped in `idempotent` for two reasons. The obvious one
+// is duplicate suppression on a retry. The load-bearing one is that the wrapper
+// FAILS CLOSED when Mongo is down: making a product visible to customers - or
+// pulling it from sale - is exactly the change that must never happen without an
+// audit row saying who did it, and the audit trail lives in Mongo.
 publicationsWriteRouter.post(
   '/products/:id/publish',
+  idempotent('POST /api/shopify/products/:id/publish'),
   asyncHandler(async (req, res) => {
     const gid = toShopifyGid(req.params.id ?? '', 'Product');
     const publicationIds = readPublicationIds((req.body ?? {}) as Record<string, unknown>);
@@ -128,6 +135,7 @@ publicationsWriteRouter.post(
 
 publicationsWriteRouter.post(
   '/products/:id/publish-headless',
+  idempotent('POST /api/shopify/products/:id/publish-headless'),
   asyncHandler(async (req, res) => {
     const gid = toShopifyGid(req.params.id ?? '', 'Product');
 
@@ -161,6 +169,7 @@ publicationsWriteRouter.post(
 
 publicationsWriteRouter.post(
   '/products/:id/unpublish',
+  idempotent('POST /api/shopify/products/:id/unpublish'),
   asyncHandler(async (req, res) => {
     const gid = toShopifyGid(req.params.id ?? '', 'Product');
     const publicationIds = readPublicationIds((req.body ?? {}) as Record<string, unknown>);

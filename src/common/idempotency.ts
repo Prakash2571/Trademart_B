@@ -25,6 +25,7 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import { createHash } from 'node:crypto';
 
+import { durableSafetyGate } from './durableSafety';
 import { AppError } from './errors';
 import { logger } from './logger';
 import { getContext, getRequestId } from './requestContext';
@@ -86,6 +87,20 @@ async function handle(
   res: Response,
   next: NextFunction,
 ): Promise<void> {
+  // Checked BEFORE the header, and for every caller: this is not about honouring
+  // a supplied key, it is about whether a dangerous write may happen at all while
+  // duplicate suppression and the audit trail are unavailable. A client that
+  // sends no key is not safer - it is the one with no protection whatsoever.
+  const unavailable = durableSafetyGate(getDatabaseStatus().status === 'connected');
+  if (unavailable !== null) {
+    logger.error('Refused a dangerous write: no durable idempotency or audit trail.', {
+      operation,
+      method: req.method,
+      path: req.path,
+    });
+    throw unavailable;
+  }
+
   const supplied = req.header(IDEMPOTENCY_HEADER);
 
   // Opt-in: a client that does not send the header behaves exactly as before.
@@ -100,16 +115,6 @@ async function handle(
       'VALIDATION_ERROR',
       `${IDEMPOTENCY_HEADER} must be 8-200 characters of letters, digits, dot, dash, underscore, tilde or colon. A UUID is a good choice.`,
     );
-  }
-
-  // Without a database the guarantee cannot be honoured. Being explicit about
-  // that in a response header is better than silently accepting the key and
-  // implying protection that is not there.
-  if (getDatabaseStatus().status !== 'connected') {
-    res.setHeader('X-Idempotency-Status', 'unsupported-no-database');
-    logger.warn('Idempotency-Key ignored: no database is connected.', { operation });
-    next();
-    return;
   }
 
   const requestHash = hashRequest(req);

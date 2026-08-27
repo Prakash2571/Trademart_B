@@ -755,13 +755,36 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     }
   }
 
+  // ---- OPERATOR_PROTECT_READS ---------------------------------------------
+  //
+  // Whether management READS need an operator too. Development defaults to false
+  // so a console with no login screen still shows data; production defaults to
+  // TRUE and cannot be turned off.
+  //
+  // Management reads are not harmless. They list products with costs and margins,
+  // customers, orders, supplier pricing, audit-adjacent diagnostics and the live
+  // Shopify integration wiring. Serving them to anyone who knows the URL is a data
+  // breach that leaves no trace, so in production an explicit "false" is rejected
+  // rather than honoured: a deployment that boots insecurely is worse than one
+  // that refuses to boot with an actionable message.
   const rawProtectReads = read(env, 'OPERATOR_PROTECT_READS');
-  let protectReads = false;
+  const protectReadsExplicitlyRequested = rawProtectReads?.toLowerCase() === 'true';
+  let protectReads = isProduction;
   if (rawProtectReads !== null) {
     const normalised = rawProtectReads.toLowerCase();
     if (normalised === 'true') protectReads = true;
-    else if (normalised === 'false') protectReads = false;
-    else {
+    else if (normalised === 'false') {
+      if (isProduction) {
+        errors.push(
+          'OPERATOR_PROTECT_READS=false is not permitted when NODE_ENV=production: management reads expose costs, margins, customers, orders and integration wiring. Remove it (production defaults to true) and sign in to read them.',
+        );
+        // Kept true for the returned config so a caller that ignores `errors`
+        // cannot end up serving reads publicly.
+        protectReads = true;
+      } else {
+        protectReads = false;
+      }
+    } else {
       errors.push(
         `OPERATOR_PROTECT_READS must be "true" or "false" (received "${rawProtectReads}").`,
       );
@@ -806,13 +829,21 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
     // would be a serious hole.
     const message =
       'No operator credentials configured (OPERATOR_PASSWORD_HASH + SESSION_SECRET, or OPERATOR_API_KEY). All management endpoints - automation apply/approve/rules and webhook registration - will refuse with UNAUTHORIZED.';
-    if (isProduction) warnings.push(`${message} Set them before using the console.`);
-    else warnings.push(message);
-  }
-  if (protectReads && !hasPasswordLogin && operatorApiKey === null) {
-    errors.push(
-      'OPERATOR_PROTECT_READS=true would lock every endpoint with no way to sign in. Configure OPERATOR_PASSWORD_HASH + SESSION_SECRET first.',
-    );
+    if (isProduction) {
+      // An ERROR in production, not a warning. Production requires operator auth
+      // for reads as well as writes, so with no credentials the management surface
+      // is not "read-only" - it is unusable, and the deployment is broken. Better
+      // to refuse to start with instructions than to serve 401s for every request.
+      errors.push(
+        `${message} They are REQUIRED when NODE_ENV=production, because production also requires an operator for management reads (OPERATOR_PROTECT_READS defaults to true and cannot be disabled there). Generate a hash with: npm run operator:hash`,
+      );
+    } else if (protectReadsExplicitlyRequested) {
+      errors.push(
+        'OPERATOR_PROTECT_READS=true would lock every endpoint with no way to sign in. Configure OPERATOR_PASSWORD_HASH + SESSION_SECRET first.',
+      );
+    } else {
+      warnings.push(message);
+    }
   }
 
   // ---- MAX_INVENTORY_DELTA ------------------------------------------------
