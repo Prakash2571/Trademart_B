@@ -28,6 +28,7 @@ import { createHash } from 'node:crypto';
 import { durableSafetyGate } from './durableSafety';
 import { AppError } from './errors';
 import { logger } from './logger';
+import { incrementCounter } from './metrics';
 import { getContext, getRequestId } from './requestContext';
 import { config } from '../config';
 import { IdempotencyKeyModel } from '../database/models/IdempotencyKey';
@@ -93,6 +94,7 @@ async function handle(
   // sends no key is not safer - it is the one with no protection whatsoever.
   const unavailable = durableSafetyGate(getDatabaseStatus().status === 'connected');
   if (unavailable !== null) {
+    incrementCounter('write.refused_no_durable_safety');
     logger.error('Refused a dangerous write: no durable idempotency or audit trail.', {
       operation,
       method: req.method,

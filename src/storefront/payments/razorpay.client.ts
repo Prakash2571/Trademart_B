@@ -1,5 +1,18 @@
+import { logger } from '../../common/logger';
 import { StorefrontError } from '../checkout/storefront.error';
 import type { RazorpayConfig } from './razorpay.config';
+import {
+  MAX_READ_ATTEMPTS,
+  parseRetryAfterSeconds,
+  retryDelayMs,
+  shouldRetryRead,
+  type RazorpayAttemptOutcome,
+} from './razorpay.retry';
+
+/** Local sleep so this module does not depend on the Shopify throttle helpers. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export interface RazorpayOrder {
   id: string;
@@ -74,7 +87,15 @@ export class RazorpayHttpClient implements RazorpayPort {
     private readonly requestFetch: typeof fetch = fetch,
   ) {}
 
-  private async request(path: string, init: RequestInit = {}): Promise<unknown> {
+  /**
+   * One attempt. Every call has an explicit 15s timeout: without the AbortController
+   * a hung TCP connection would hold a checkout request open until the reverse proxy
+   * gave up, with the customer watching a spinner.
+   */
+  private async attempt(
+    path: string,
+    init: RequestInit,
+  ): Promise<{ ok: true; body: unknown } | { ok: false; outcome: RazorpayAttemptOutcome }> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15_000);
     try {
@@ -89,27 +110,72 @@ export class RazorpayHttpClient implements RazorpayPort {
         signal: controller.signal,
       });
       if (!response.ok) {
-        throw new StorefrontError(
-          'PAYMENT_FAILED',
-          'Payment could not be prepared. Please try again.',
-          response.status >= 500 || response.status === 429 ? 503 : 502,
-          { providerStatus: response.status },
-          response.status >= 500 || response.status === 429,
-        );
+        return {
+          ok: false,
+          outcome: {
+            status: response.status,
+            retryAfterSeconds: parseRetryAfterSeconds(response.headers.get('Retry-After')),
+          },
+        };
       }
-      return await response.json();
-    } catch (error) {
-      if (error instanceof StorefrontError) throw error;
-      throw new StorefrontError(
-        'PAYMENT_FAILED',
-        'Payment service is temporarily unavailable. Please try again.',
-        503,
-        undefined,
-        true,
-      );
+      return { ok: true, body: await response.json() };
+    } catch {
+      // No response at all: a timeout, a reset, a DNS failure. Reported as
+      // `status: null` so the retry classifier can tell it apart from a 4xx.
+      return { ok: false, outcome: { status: null } };
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  private failure(outcome: RazorpayAttemptOutcome): StorefrontError {
+    const transient =
+      outcome.status === null || outcome.status === 429 || outcome.status >= 500;
+    return new StorefrontError(
+      'PAYMENT_FAILED',
+      transient
+        ? 'Payment service is temporarily unavailable. Please try again.'
+        : 'Payment could not be prepared. Please try again.',
+      transient ? 503 : 502,
+      outcome.status === null ? undefined : { providerStatus: outcome.status },
+      transient,
+    );
+  }
+
+  /**
+   * A READ. Retried, because nothing changes upstream and the caller is deciding
+   * whether a customer's money moved - see razorpay.retry.ts for why writes are not.
+   */
+  private async read(path: string): Promise<unknown> {
+    let last: RazorpayAttemptOutcome = { status: null };
+    for (let attempt = 1; attempt <= MAX_READ_ATTEMPTS; attempt += 1) {
+      const result = await this.attempt(path, {});
+      if (result.ok) return result.body;
+      last = result.outcome;
+
+      const verdict = shouldRetryRead(result.outcome);
+      if (!verdict.retry || attempt === MAX_READ_ATTEMPTS) break;
+
+      logger.warn('Retrying a Razorpay read.', {
+        attempt,
+        of: MAX_READ_ATTEMPTS,
+        providerStatus: result.outcome.status,
+        reason: verdict.reason,
+      });
+      await sleep(retryDelayMs(attempt, result.outcome));
+    }
+    throw this.failure(last);
+  }
+
+  /**
+   * A WRITE. Exactly one attempt, on purpose: a blind retry of an order creation can
+   * produce a second Razorpay order for one purchase. Recovery is by receipt lookup
+   * in createOrRecoverOrder, which is idempotent by identity rather than by hope.
+   */
+  private async write(path: string, init: RequestInit): Promise<unknown> {
+    const result = await this.attempt(path, init);
+    if (result.ok) return result.body;
+    throw this.failure(result.outcome);
   }
 
   private assertExpectedOrder(
@@ -135,7 +201,7 @@ export class RazorpayHttpClient implements RazorpayPort {
     currency: 'INR';
     receipt: string;
   }): Promise<RazorpayOrder | null> {
-    const body = (await this.request(
+    const body = (await this.read(
       `/orders?receipt=${encodeURIComponent(input.receipt)}&count=10`,
     )) as { items?: unknown };
     if (!Array.isArray(body.items)) return null;
@@ -156,7 +222,7 @@ export class RazorpayHttpClient implements RazorpayPort {
       throw new StorefrontError('VALIDATION_ERROR', 'Payment amount is invalid.', 400);
     }
     try {
-      const body = (await this.request('/orders', {
+      const body = (await this.write('/orders', {
         method: 'POST',
         body: JSON.stringify({
           amount: input.amountPaise,
@@ -187,7 +253,7 @@ export class RazorpayHttpClient implements RazorpayPort {
     if (!validProviderId(paymentId, 'pay_')) {
       throw new StorefrontError('VALIDATION_ERROR', 'Payment identifier is invalid.', 400);
     }
-    const raw = (await this.request(`/payments/${encodeURIComponent(paymentId)}`)) as Record<
+    const raw = (await this.read(`/payments/${encodeURIComponent(paymentId)}`)) as Record<
       string,
       unknown
     >;

@@ -1,9 +1,24 @@
 /**
  * OAuth redirect flow routes.
  *
- * GET /api/auth/install   - starts the handshake (redirects to Shopify)
- * GET /api/auth/callback  - the "Allowed redirection URL" Shopify calls back
- * GET /api/auth/status    - non-secret diagnostics for the Settings page
+ * GET /api/auth/install   - starts the handshake (redirects to Shopify)   PUBLIC
+ * GET /api/auth/callback  - the "Allowed redirection URL" Shopify calls back  PUBLIC
+ * GET /api/auth/status    - install diagnostics for the Settings page   OPERATOR
+ *
+ * TWO ROUTERS, FOR THE SAME REASON THE WEBHOOK MODULE HAS TWO
+ * -----------------------------------------------------------
+ * install and callback MUST be public: a merchant clicks the first from a browser
+ * with no session, and Shopify itself calls the second and cannot present a
+ * credential (the callback is secured by HMAC over the raw query string plus a
+ * signed, shop-bound state nonce).
+ *
+ * `status` is not in that category. It reports the app's public origin, the exact
+ * redirect URI, every access scope this deployment requests, whether offline tokens
+ * are encrypted at rest, and whether persistence is up. Individually non-secret;
+ * together it is a map of the integration's capabilities and weak points, retrievable
+ * anonymously and leaving no audit trace. It is an operator tool - the Settings page
+ * reads it while an operator is signed in - so it now lives on its own router behind
+ * the unconditional operator requirement.
  *
  * These are only needed for the redirect-based install. A single-store
  * deployment using Shopify-managed installation plus the client credentials
@@ -33,7 +48,11 @@ import { verifyOAuthHmac } from './oauth.hmac';
 import { createOAuthState, verifyOAuthState } from './oauth.state';
 import { exchangeCodeForToken, persistOfflineToken } from './oauth.service';
 
+/** Public: the install redirect and Shopify's callback. Secured by HMAC + state. */
 export const oauthRouter = Router();
+
+/** Operator-only: install diagnostics. Mounted behind requireOperator in app.ts. */
+export const oauthAdminRouter = Router();
 
 /**
  * Express strips the query string from `req.url` differently depending on the
@@ -169,7 +188,11 @@ oauthRouter.get(
   }),
 );
 
-oauthRouter.get(
+/**
+ * Install diagnostics. On the ADMIN router: no secrets, but every value here helps
+ * someone else attack the integration (see the header comment).
+ */
+oauthAdminRouter.get(
   '/status',
   asyncHandler(async (_req, res) => {
     // Booleans and non-secret identifiers only.

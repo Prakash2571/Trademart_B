@@ -32,6 +32,7 @@ import { recordAudit } from '../audit/audit.service';
 import { AppError } from '../common/errors';
 import { asyncHandler, sendSuccess } from '../common/http';
 import { logger } from '../common/logger';
+import { incrementCounter } from '../common/metrics';
 import { parseIntParam, parseStringParam } from '../common/validate';
 import { clearOfflineToken } from '../auth/oauth.service';
 import { config, isWebhookRegistrationConfigured } from '../config';
@@ -85,6 +86,7 @@ webhooksRouter.post(
     );
 
     if (!verification.valid) {
+      incrementCounter('webhook.delivery.rejected');
       // Log the rejection but never the body or the secret.
       logger.warn('Rejected Shopify webhook.', {
         topic,
@@ -99,6 +101,7 @@ webhooksRouter.post(
     }
 
     if (!isExpectedShopDomain(shopDomain, config.shopify.storeDomain)) {
+      incrementCounter('webhook.delivery.rejected');
       logger.warn('Webhook rejected: unexpected shop domain.', { shopDomain, topic });
       throw new AppError(
         'WEBHOOK_INVALID_SIGNATURE',
@@ -181,6 +184,9 @@ webhooksRouter.post(
     });
 
     if (ack.kind === 'not-persisted') {
+      // Counted so a burst of refusals is visible in diagnostics without grepping:
+      // every one of these is an event Shopify is still holding and will resend.
+      incrementCounter('webhook.delivery.not_persisted');
       // Loud, and a 503: the sender still owns this event and will redeliver it.
       logger.error(
         'Webhook verified but NOT persisted; answering 503 so it is redelivered.',
@@ -296,7 +302,11 @@ webhookAdminRouter.get(
     if (getDatabaseStatus().status !== 'connected') {
       throw new AppError(
         'DATABASE_UNAVAILABLE',
-        'Webhook delivery history requires MongoDB. Without it, deliveries are acknowledged but neither stored nor retried.',
+        // Accuracy matters here: this text is what an operator reads while deciding
+        // whether events were LOST. They were not. Without storage a verified
+        // delivery is refused with a retryable 503, so Shopify keeps it and
+        // redelivers - there is simply no local history to show yet.
+        'Webhook delivery history requires MongoDB. While storage is down, verified deliveries are refused with a retryable 503 rather than acknowledged, so Shopify retains and redelivers them - nothing is lost, but there is no history to show until storage is back.',
       );
     }
 

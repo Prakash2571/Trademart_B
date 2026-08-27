@@ -1,9 +1,10 @@
 /**
- * GET /api/diagnostics/integrity  - Shopify state consistency findings
- * GET /api/shopify/rate-limit     - Shopify throttle + circuit breaker state
- * GET /api/version                - app version / git SHA / build time
+ * GET /api/diagnostics/integrity   - Shopify state consistency findings
+ * GET /api/diagnostics/operations  - failure counters, queue depth, index health
+ * GET /api/shopify/rate-limit      - Shopify throttle + circuit breaker state
+ * GET /api/version                 - app version / git SHA / build time
  *
- * Read-only, all three.
+ * Read-only, all four.
  *
  * The integrity endpoint deliberately has NO "fix" counterpart. Every finding it
  * reports has more than one valid explanation - an ACTIVE-but-unpublished product
@@ -24,12 +25,44 @@ import { asyncHandler, sendSuccess } from '../common/http';
 import { getVersionInfo } from '../common/version';
 import { getRateLimitReport } from '../shopify/rateLimit.service';
 import { runIntegrityChecks } from './integrity.service';
+import { buildOperationsReport } from './operations';
 
 /**
  * Store-data diagnostics. Mounted behind the operator READ guard, because the
  * integrity report names products and their visibility.
  */
 export const diagnosticsRouter = Router();
+
+/**
+ * Operational state, behind the UNCONDITIONAL operator requirement.
+ *
+ * Separate router from diagnosticsRouter because the guard is different: failure
+ * counters, queue depths, breaker state and index health together describe exactly
+ * how to hurt this deployment and when it is weakest, so unlike the other read
+ * routes this one is never left open by OPERATOR_PROTECT_READS=false.
+ */
+export const operationsRouter = Router();
+
+/**
+ * GET /api/diagnostics/operations - "is anything wrong right now?"
+ *
+ * The one endpoint an operator can check without knowing what to grep for. See
+ * operations.ts for what is deliberately absent (any per-order or per-customer
+ * label).
+ */
+operationsRouter.get(
+  '/diagnostics/operations',
+  asyncHandler(async (_req, res) => {
+    const report = await buildOperationsReport();
+    sendSuccess(res, report, {
+      // Lifted into the metadata so a UI can badge the endpoint without walking the
+      // whole document.
+      failedWebhooks: report.webhooks.queue.failed,
+      indexFailures: report.database.indexes.failed.length,
+      databaseStatus: report.database.status,
+    });
+  }),
+);
 
 /**
  * Build identity only. Mounted PUBLIC, next to health.

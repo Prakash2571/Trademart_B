@@ -23,6 +23,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
+import { buildHealthPayload } from './health.payload';
+
 function repoFile(...segments: string[]): string {
   return readFileSync(join(process.cwd(), ...segments), 'utf8');
 }
@@ -99,8 +101,25 @@ describe('the probes keep their contracts', () => {
   });
 
   it('/health still reports status ok at the top level, unwrapped', () => {
-    // The documented contract other probes already read.
-    assert.match(HEALTH_CONTROLLER, /status: 'ok',\n\s+service: 'trademart-backend'/);
+    // The documented contract other probes already read. Asserted against the real
+    // payload builder rather than the file's text, because the body moved into
+    // health.payload.ts when detail gating was added - and a text match would have
+    // silently stopped checking anything.
+    const body = buildHealthPayload({
+      detailed: false,
+      nodeEnv: 'production',
+      uptimeSeconds: 1,
+      database: { configured: true, status: 'connected', error: null },
+      shopify: {
+        configured: true,
+        authStrategy: 'CLIENT_CREDENTIALS',
+        storeDomain: 'example.myshopify.com',
+        apiVersion: '2026-07',
+      },
+    });
+
+    assert.equal(body['status'], 'ok');
+    assert.equal(body['service'], 'trademart-backend');
   });
 
   it('neither probe calls Shopify', () => {

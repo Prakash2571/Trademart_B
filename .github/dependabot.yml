@@ -1,0 +1,44 @@
+# Dependency updates.
+#
+# WHY WEEKLY, AND WHY THE LIMITS ARE LOW
+# --------------------------------------
+# A daily schedule on a repository with one maintainer produces a queue nobody reads,
+# and an unread update queue is worse than none: it trains you to ignore the one PR
+# that matters. Weekly, capped at five open PRs, keeps the list short enough to
+# actually review.
+#
+# WHY MAJOR VERSIONS ARE NOT AUTOMATED
+# ------------------------------------
+# Express 4 -> 5, Mongoose 8 -> 9 and a Node major are breaking changes with real
+# migration notes. A bot cannot read a changelog, and a green CI run on a major
+# upgrade proves only that the tests that exist still pass. Majors are ignored here
+# and done deliberately; patch and minor updates - which is where security fixes
+# arrive - are automated.
+#
+# The github-actions ecosystem is included because the workflows pin Actions to
+# immutable commit SHAs. Pinning without an update mechanism is how a pinned Action
+# quietly stays vulnerable for a year; Dependabot rewrites the SHA and the trailing
+# version comment together.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    ignore:
+      - dependency-name: '*'
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: ci

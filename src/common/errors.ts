@@ -8,6 +8,8 @@
  *   { success: false, code, message, details? }
  */
 
+import { buildErrorBody } from './errorBody';
+
 export type ErrorCode =
   // Shopify
   | 'SHOPIFY_NOT_CONFIGURED'
@@ -196,21 +198,19 @@ export class AppError extends Error {
   /**
    * `requestId` is passed in rather than read from a global, so this class stays
    * import-free and unit testable in isolation.
+   *
+   * The construction itself lives in ./errorBody, which is the single source of
+   * truth for the wire format - the storefront routers, the origin rejection and
+   * the rate limiters all build their bodies from the same function, so no two
+   * failure paths can disagree about the contract.
    */
   toBody(requestId?: string | null): ErrorBody {
-    const nested: ErrorBody['error'] = { code: this.code, message: this.message };
-    if (requestId !== undefined && requestId !== null) nested.requestId = requestId;
-    if (this.details !== undefined) nested.details = this.details;
-
-    const body: ErrorBody = {
-      success: false,
+    return buildErrorBody<ErrorCode>({
       code: this.code,
       message: this.message,
-      error: nested,
-    };
-    if (this.details !== undefined) body.details = this.details;
-    if (requestId !== undefined && requestId !== null) body.requestId = requestId;
-    return body;
+      details: this.details,
+      requestId,
+    });
   }
 }
 

@@ -109,26 +109,87 @@ const INDEXED_MODELS = [
  * syncIndexes also DROPS indexes no longer declared in a schema, which stops a
  * long-lived deployment accumulating dead ones.
  */
+/**
+ * Outcome of the last index synchronisation.
+ *
+ * WHY THIS IS REPORTED RATHER THAN ONLY LOGGED
+ * -------------------------------------------
+ * The unique indexes here are not performance tuning - they ARE the concurrency
+ * control. Webhook deduplication, the idempotency claim, one-Razorpay-order-per-
+ * checkout and one-payment-per-checkout are all enforced by a unique index rather
+ * than by a read-then-write check, precisely because two simultaneous requests can
+ * both pass a check. If `syncIndexes` fails (a pre-existing conflicting index, a
+ * user without the rights to build one), the process keeps serving traffic with
+ * those guarantees silently absent, and the only trace is one log line at startup
+ * that nobody was looking at.
+ *
+ * So the result is retained and surfaced in the operator diagnostics, where "are my
+ * uniqueness guarantees actually in place?" can be answered on demand.
+ */
+export interface IndexSyncReport {
+  ranAt: string | null;
+  /** Models whose indexes are in sync. */
+  synced: string[];
+  /** Models whose index build FAILED, with the reason. Uniqueness may not hold. */
+  failed: { model: string; reason: string }[];
+  /** True when the sweep was skipped because there was no connection. */
+  skipped: boolean;
+}
+
+let indexSyncReport: IndexSyncReport = {
+  ranAt: null,
+  synced: [],
+  failed: [],
+  skipped: true,
+};
+
+export function getIndexSyncReport(): IndexSyncReport {
+  return {
+    ranAt: indexSyncReport.ranAt,
+    synced: [...indexSyncReport.synced],
+    failed: indexSyncReport.failed.map((entry) => ({ ...entry })),
+    skipped: indexSyncReport.skipped,
+  };
+}
+
 export async function ensureIndexes(): Promise<void> {
   if (getDatabaseStatus().status !== 'connected') {
     logger.info('Skipping index creation - no database connection.');
+    indexSyncReport = { ranAt: new Date().toISOString(), synced: [], failed: [], skipped: true };
     return;
   }
+
+  const synced: string[] = [];
+  const failed: { model: string; reason: string }[] = [];
 
   for (const entry of INDEXED_MODELS) {
     try {
       await entry.model.syncIndexes();
+      synced.push(entry.name);
     } catch (error) {
+      const reason = error instanceof Error ? error.message : 'unknown';
+      failed.push({ model: entry.name, reason });
       logger.error(
         `Could not sync indexes for ${entry.name}. Uniqueness and TTL guarantees for this collection may not be enforced.`,
-        { model: entry.name, reason: error instanceof Error ? error.message : 'unknown' },
+        { model: entry.name, reason },
       );
     }
   }
 
-  logger.info('Database indexes synchronised.', {
-    models: INDEXED_MODELS.map((entry) => entry.name),
-  });
+  indexSyncReport = { ranAt: new Date().toISOString(), synced, failed, skipped: false };
+
+  if (failed.length > 0) {
+    // Deliberately not fatal: refusing to boot would take the whole service down
+    // over one collection, and the rest of it still works. But it is an ERROR, and
+    // it is now visible in /api/diagnostics/operations rather than only here.
+    logger.error(
+      'Some indexes could not be synchronised. Deduplication and idempotency rely on unique indexes - check /api/diagnostics/operations.',
+      { failed: failed.map((entry) => entry.model) },
+    );
+    return;
+  }
+
+  logger.info('Database indexes synchronised.', { models: synced });
 }
 
 export async function disconnectDatabase(): Promise<void> {

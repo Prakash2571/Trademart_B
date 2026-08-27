@@ -1,3 +1,4 @@
+import { incrementCounter } from '../../common/metrics';
 import type { CheckoutSessionRecord, CheckoutSessionRepository } from '../checkout/checkout.types';
 import { StorefrontError } from '../checkout/storefront.error';
 import type { PaidOrderOrchestrator } from '../orders/order.orchestrator';
@@ -149,6 +150,10 @@ export class StorefrontPaymentService {
         keySecret: this.razorpayConfig.keySecret,
       })
     ) {
+      // Counted, not just thrown: a signature that does not verify is either an
+      // attempt to forge a payment or a key-rotation mistake, and both need to be
+      // visible somewhere an operator looks. See common/metrics.ts.
+      incrementCounter('storefront.payment.signature_invalid');
       throw new StorefrontError(
         'PAYMENT_INVALID_SIGNATURE',
         'Payment confirmation could not be verified.',
@@ -174,6 +179,7 @@ export class StorefrontPaymentService {
     }
     if (payment.status !== 'captured' || !payment.captured) {
       await this.observe(session, payment, 'BROWSER_VERIFY');
+      incrementCounter('storefront.payment.verify_failed');
       throw new StorefrontError(
         'PAYMENT_FAILED',
         "Payment wasn't completed. You were not charged if Razorpay shows it as failed.",
