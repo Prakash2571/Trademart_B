@@ -6,8 +6,10 @@ import {
   deriveTrackingToken,
   hashTrackingToken,
 } from '../orders/tracking-token';
+import { meetsMinimumOrderQuantity, minimumOrderValuePaise } from '../catalog/moq';
 import { buildCheckoutSnapshot, checkoutRequestHash } from './checkout.snapshot';
 import { StorefrontError } from './storefront.error';
+import type { AuthoritativeCheckoutLine } from './checkout.types';
 import type {
   CheckoutCatalogPort,
   CheckoutSessionRecord,
@@ -16,6 +18,37 @@ import type {
   CreateCheckoutResponse,
   CustomerShippingPolicyPort,
 } from './checkout.types';
+
+/**
+ * Refuses a checkout whose lines fall below their products' wholesale minimums.
+ *
+ * Throws on the FIRST short line rather than collecting every violation: the storefront
+ * corrects one item at a time (it raises that line to the minimum and resubmits), and a
+ * combined message listing four products is harder to act on than one naming the item, its
+ * minimum and what that minimum costs.
+ *
+ * `details` carries the machine-readable numbers so the storefront can fix the quantity
+ * itself instead of asking the customer to work it out.
+ */
+function assertMinimumOrderQuantities(lines: AuthoritativeCheckoutLine[]): void {
+  for (const line of lines) {
+    if (meetsMinimumOrderQuantity(line.quantity, line.minimumOrderQuantity)) continue;
+
+    const minimum = line.minimumOrderQuantity as number;
+    throw new StorefrontError(
+      'MOQ_NOT_MET',
+      `${line.title} is sold in minimum quantities of ${minimum}. Increase the quantity to at least ${minimum} to continue.`,
+      409,
+      {
+        publicProductId: line.publicProductId,
+        publicVariantId: line.publicVariantId,
+        requestedQuantity: line.quantity,
+        minimumOrderQuantity: minimum,
+        minimumOrderValuePaise: minimumOrderValuePaise(line.unitPricePaise, minimum),
+      },
+    );
+  }
+}
 
 export interface CheckoutServiceDependencies {
   catalog: CheckoutCatalogPort;
@@ -88,6 +121,14 @@ export class CheckoutService {
 
     if (!session) {
       const approved = await this.deps.catalog.revalidateLines(request.lines);
+
+      // MOQ is enforced HERE, against the minimum just re-read from Shopify - not against
+      // anything the browser sent. The storefront also knows the minimum and starts its
+      // quantity stepper there, but that is a convenience; this is the control. A stale tab,
+      // a cached page or a crafted request must not be able to buy under a minimum the
+      // merchant has raised since the page was rendered.
+      assertMinimumOrderQuantities(approved);
+
       const preliminarySubtotal = approved.reduce((sum, line) => {
         const amount = line.unitPricePaise * line.quantity;
         if (!Number.isSafeInteger(amount) || !Number.isSafeInteger(sum + amount)) {

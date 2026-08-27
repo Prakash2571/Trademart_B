@@ -3,6 +3,14 @@ export type StorefrontErrorCode =
   | 'PRODUCT_UNAVAILABLE'
   | 'VARIANT_UNAVAILABLE'
   | 'PRICE_CHANGED'
+  /**
+   * A line is below the product's wholesale minimum order quantity.
+   *
+   * Its own code rather than VALIDATION_ERROR because the storefront can act on it: it
+   * knows which item and which minimum (both are in `details`), so it can correct the
+   * quantity instead of showing a generic failure.
+   */
+  | 'MOQ_NOT_MET'
   | 'PRICE_INVALID'
   | 'PAYMENT_NOT_CONFIGURED'
   | 'PAYMENT_FAILED'

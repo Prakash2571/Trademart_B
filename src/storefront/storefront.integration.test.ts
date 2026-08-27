@@ -424,6 +424,9 @@ function makeApprovedLine(overrides: Partial<AuthoritativeCheckoutLine> = {}): A
     currencyCode: 'INR',
     availableQuantity: 10,
     sellability: 'SELLABLE',
+    // No wholesale minimum by default, which is the common case: most products carry no
+    // `moq:` tag, and null means "no minimum" rather than "one".
+    minimumOrderQuantity: null,
     ...overrides,
   };
 }
@@ -485,6 +488,10 @@ describe('1. public catalog privacy - projected DTO contains no internal/supplie
       'handle',
       'id',
       'images',
+      // Safe and necessary: a wholesale minimum is a merchandising rule the shopper has to
+      // see before adding to a cart. It carries no cost, margin or supplier information -
+      // it comes from a public Shopify product tag.
+      'minimumOrderQuantity',
       'priceRange',
       'productType',
       'quickAddVariant',
@@ -837,6 +844,169 @@ describe('6. INR-only pricing - non-INR shop currency fails closed with PRICE_NO
       now: NOW,
     });
     assert.equal(projected, null);
+  });
+});
+
+// ===========================================================================
+// 6b. Wholesale minimum order quantity, enforced server-side
+// ===========================================================================
+
+describe('6b. MOQ enforcement - the server refuses a short order whatever the browser sends', () => {
+  /** A checkout service whose catalog reports a fixed authoritative line. */
+  function serviceFor(approved: AuthoritativeCheckoutLine) {
+    const sessions = new FakeCheckoutSessionRepository();
+    const razorpay = new FakeRazorpayPort();
+    const catalog: CheckoutCatalogPort = {
+      async revalidateLines() {
+        return [approved];
+      },
+    };
+    const shippingPolicy: CustomerShippingPolicyPort = {
+      async quote() {
+        return { shippingPaise: 0, discountPaise: 0, taxPaise: 0 };
+      },
+    };
+    const service = new CheckoutService({
+      catalog,
+      shippingPolicy,
+      sessions,
+      razorpay,
+      razorpayKeyId: 'rzp_test_key',
+      trackingTokenSecret: SECRET,
+    });
+    return { service, razorpay, sessions };
+  }
+
+  const request = (quantity: number) =>
+    makeCheckoutRequest({
+      lines: [
+        { productId: 'kp_test_product_id_12345678', variantId: 'kv_test123', quantity },
+      ],
+    });
+
+  it('refuses a quantity below the minimum, and creates NO Razorpay order', async () => {
+    // The important half is the second one: a refused checkout must not leave a payment
+    // order behind for a cart that was never valid.
+    const { service, razorpay, sessions } = serviceFor(
+      makeApprovedLine({ quantity: 6, minimumOrderQuantity: 12 }),
+    );
+
+    const error = await service
+      .create(request(6), 'idem-key-moq-short-order')
+      .then(() => null)
+      .catch((caught: unknown) => caught);
+
+    assert.ok(error instanceof StorefrontError);
+    assert.equal(error.code, 'MOQ_NOT_MET');
+    assert.equal(error.status, 409);
+    assert.equal(razorpay.orders.length, 0, 'no payment order may be created');
+    assert.equal(sessions.sessions.size, 0, 'no checkout session may be persisted');
+  });
+
+  it('names the minimum in the message, so the shopper knows what to do', async () => {
+    const { service } = serviceFor(makeApprovedLine({ quantity: 1, minimumOrderQuantity: 24 }));
+
+    const error = (await service
+      .create(request(1), 'idem-key-moq-message')
+      .catch((caught: unknown) => caught)) as StorefrontError;
+
+    assert.match(error.message, /24/);
+    assert.match(error.message, /Test Product/);
+  });
+
+  it('carries the numbers the storefront needs to fix the quantity itself', async () => {
+    const { service } = serviceFor(
+      makeApprovedLine({ quantity: 5, minimumOrderQuantity: 10, unitPricePaise: 34_900 }),
+    );
+
+    const error = (await service
+      .create(request(5), 'idem-key-moq-details')
+      .catch((caught: unknown) => caught)) as StorefrontError;
+
+    assert.deepEqual(error.details, {
+      publicProductId: 'kp_test_product_id_12345678',
+      publicVariantId: 'kv_test123',
+      requestedQuantity: 5,
+      minimumOrderQuantity: 10,
+      // ₹349 x 10 = ₹3,490, computed by the backend rather than by the browser.
+      minimumOrderValuePaise: 349_000,
+    });
+  });
+
+  it('accepts exactly the minimum', async () => {
+    // availableQuantity null = inventory not tracked for this variant. Tracked stock is
+    // enforced separately in the snapshot, which the next test covers.
+    const { service, razorpay } = serviceFor(
+      makeApprovedLine({
+        quantity: 12,
+        minimumOrderQuantity: 12,
+        unitPricePaise: 34_900,
+        availableQuantity: null,
+      }),
+    );
+
+    const response = await service.create(request(12), 'idem-key-moq-exact-minimum');
+
+    assert.equal(response.amountPaise, 418_800);
+    assert.equal(razorpay.orders[0]!.amount, 418_800);
+  });
+
+  it('accepts a bulk quantity far above the old retail cap of 10', async () => {
+    // This is the regression that matters: the checkout validator used to reject anything
+    // over 10 per variant, which made every wholesale order impossible.
+    const { service, razorpay } = serviceFor(
+      makeApprovedLine({
+        quantity: 500,
+        minimumOrderQuantity: 12,
+        unitPricePaise: 34_900,
+        availableQuantity: null,
+      }),
+    );
+
+    const response = await service.create(request(500), 'idem-key-moq-bulk-order');
+
+    assert.equal(response.amountPaise, 34_900 * 500);
+    assert.equal(razorpay.orders[0]!.amount, 34_900 * 500);
+  });
+
+  it('still refuses an order that meets the MOQ but exceeds tracked stock', async () => {
+    // MOQ and inventory are independent gates and stock wins: a product tagged `moq:12`
+    // with 10 units on hand cannot be sold at all until it is restocked. Passing the
+    // minimum must not become a way around the stock check.
+    const { service, razorpay } = serviceFor(
+      makeApprovedLine({ quantity: 12, minimumOrderQuantity: 12, availableQuantity: 10 }),
+    );
+
+    const error = (await service
+      .create(request(12), 'idem-key-moq-over-stock')
+      .catch((caught: unknown) => caught)) as StorefrontError;
+
+    assert.equal(error.code, 'VARIANT_UNAVAILABLE');
+    assert.equal(razorpay.orders.length, 0);
+  });
+
+  it('allows any quantity when the product has no minimum', async () => {
+    const { service } = serviceFor(
+      makeApprovedLine({ quantity: 1, minimumOrderQuantity: null }),
+    );
+
+    const response = await service.create(request(1), 'idem-key-moq-no-minimum-set');
+    assert.equal(response.amountPaise, 149_900);
+  });
+
+  it('ignores the browser and uses the re-read minimum', async () => {
+    // The catalog port is the authority. Here the browser asked for 2 units of a product
+    // whose live minimum is 50; the request is refused even though nothing in the request
+    // itself mentions a minimum at all.
+    const { service } = serviceFor(
+      makeApprovedLine({ quantity: 2, minimumOrderQuantity: 50 }),
+    );
+
+    const error = (await service
+      .create(request(2), 'idem-key-moq-stale-browser')
+      .catch((caught: unknown) => caught)) as StorefrontError;
+
+    assert.equal(error.code, 'MOQ_NOT_MET');
   });
 });
 

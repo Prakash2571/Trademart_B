@@ -93,6 +93,13 @@ export interface AuthoritativeCheckoutLine {
   currencyCode: 'INR';
   availableQuantity: number | null;
   sellability: 'SELLABLE' | 'OUT_OF_STOCK' | 'UNAVAILABLE';
+  /**
+   * The product's wholesale minimum, re-read from Shopify during revalidation.
+   *
+   * Authoritative: the browser also knows this number and uses it to set the quantity
+   * stepper, but a request that ignores it is refused here. Null means no minimum.
+   */
+  minimumOrderQuantity: number | null;
 }
 
 export interface CheckoutSnapshotLine extends AuthoritativeCheckoutLine {

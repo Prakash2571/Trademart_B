@@ -66,6 +66,16 @@ export interface StorefrontProductSummary {
   collections: StorefrontCollectionReference[];
   /** Present only when one and only one variant can be added without a choice. */
   quickAddVariant?: StorefrontProductVariant | null;
+  /**
+   * Wholesale minimum order quantity, or null when the merchant has not set one.
+   *
+   * Read from a `moq:<n>` product tag (see catalog/moq.ts). Null means NO minimum, not
+   * "one" - the storefront shows nothing in that case rather than implying a rule the
+   * merchant never expressed. This value is advisory to the browser and authoritative at
+   * checkout: checkout.service re-reads it from Shopify and rejects a short quantity
+   * regardless of what the browser sent.
+   */
+  minimumOrderQuantity?: number | null;
 }
 
 export interface StorefrontProduct extends StorefrontProductSummary {

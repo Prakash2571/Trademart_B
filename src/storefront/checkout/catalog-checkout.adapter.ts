@@ -27,6 +27,7 @@ const CHECKOUT_PRODUCTS_QUERY = /* GraphQL */ `
         status
         vendor
         productType
+        tags
         createdAt
         updatedAt
         seo { title description }
@@ -273,6 +274,10 @@ export class StorefrontCatalogCheckoutAdapter implements CheckoutCatalogPort {
             ? Math.max(0, rawVariant.inventoryQuantity ?? 0)
             : null,
         sellability: publicVariant.availability,
+        // Re-read from the live product, not taken from the request. The MOQ the checkout
+        // enforces is the one Shopify carries right now, so a stale browser (or a crafted
+        // request) cannot buy under a minimum the merchant has since raised.
+        minimumOrderQuantity: projected.summary.minimumOrderQuantity ?? null,
       };
     });
   }
