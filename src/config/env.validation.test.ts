@@ -182,6 +182,11 @@ describe('validateEnv', () => {
       ...VALID,
       NODE_ENV: 'production',
       FRONTEND_URL: 'https://app.example.com',
+      // Required in production alongside everything else: management reads are
+      // protected there, so a deployment with no operator credential could only
+      // answer 401. See "production locks the management surface" below - this
+      // test is about the SHOPIFY auth strategy, so it just satisfies that rule.
+      OPERATOR_API_KEY: 'k'.repeat(32),
     });
 
     assert.deepEqual(result.errors, []);
