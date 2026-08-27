@@ -182,6 +182,11 @@ describe('validateEnv', () => {
       ...VALID,
       NODE_ENV: 'production',
       FRONTEND_URL: 'https://app.example.com',
+      // Required in production alongside everything else: management reads are
+      // protected there, so a deployment with no operator credential could only
+      // answer 401. See "production locks the management surface" below - this
+      // test is about the SHOPIFY auth strategy, so it just satisfies that rule.
+      OPERATOR_API_KEY: 'k'.repeat(32),
     });
 
     assert.deepEqual(result.errors, []);
@@ -643,10 +648,117 @@ describe('validateEnv - operator authentication', () => {
   it('derives secureCookies from production', () => {
     assert.equal(validateEnv(VALID).config?.operator.secureCookies, false);
     assert.equal(
-      validateEnv({ ...VALID, NODE_ENV: 'production', MONGODB_URI: VALID.MONGODB_URI }).config
-        ?.operator.secureCookies,
+      validateEnv({
+        ...VALID,
+        NODE_ENV: 'production',
+        APP_URL: 'https://api.example.com',
+        MONGODB_URI: VALID.MONGODB_URI,
+        // Required in production: see "production locks the management surface".
+        OPERATOR_PASSWORD_HASH: HASH,
+        SESSION_SECRET: SECRET,
+      }).config?.operator.secureCookies,
       true,
     );
+  });
+});
+
+/**
+ * Production must not serve the management surface to anonymous callers.
+ *
+ * Management "reads" are not harmless: they list products with costs and margins,
+ * customers, orders, supplier pricing and the live Shopify integration wiring.
+ * Serving them publicly is a data breach that leaves no trace, so production
+ * defaults OPERATOR_PROTECT_READS to true and refuses an explicit false. A
+ * deployment that refuses to start with an actionable message is strictly better
+ * than one that starts and quietly exposes the store's economics.
+ */
+describe('production locks the management surface', () => {
+  const HASH = 'scrypt$16384$8$1$c2FsdHNhbHQ=$aGFzaGhhc2hoYXNo';
+  const SECRET = 'x'.repeat(48);
+  const PROD = {
+    ...VALID,
+    NODE_ENV: 'production',
+    APP_URL: 'https://api.example.com',
+    OPERATOR_PASSWORD_HASH: HASH,
+    SESSION_SECRET: SECRET,
+  } as const;
+
+  it('protects reads by default, with no variable set at all', () => {
+    const result = validateEnv(PROD);
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(
+      result.config?.operator.protectReads,
+      true,
+      'production must require an operator for management reads without anyone remembering to ask',
+    );
+  });
+
+  it('still defaults reads OPEN outside production', () => {
+    // Development keeps the old behaviour on purpose: a console with no login
+    // screen deployed must still show data locally.
+    const result = validateEnv({
+      ...VALID,
+      OPERATOR_PASSWORD_HASH: HASH,
+      SESSION_SECRET: SECRET,
+    });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.operator.protectReads, false);
+  });
+
+  it('rejects OPERATOR_PROTECT_READS=false in production', () => {
+    const result = validateEnv({ ...PROD, OPERATOR_PROTECT_READS: 'false' });
+
+    assert.equal(result.config, null, 'the server must refuse to start');
+    assert.ok(
+      result.errors.some((error) => error.includes('OPERATOR_PROTECT_READS')),
+      'the error must name the variable so the fix is obvious',
+    );
+  });
+
+  it('accepts an explicit true in production', () => {
+    const result = validateEnv({ ...PROD, OPERATOR_PROTECT_READS: 'true' });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.operator.protectReads, true);
+  });
+
+  it('requires operator credentials in production, as an error not a warning', () => {
+    // Without credentials AND with reads protected, every endpoint answers 401:
+    // the deployment is not "read-only", it is broken. Fail at startup, with
+    // instructions, rather than after the first request.
+    const result = validateEnv({
+      ...VALID,
+      NODE_ENV: 'production',
+      APP_URL: 'https://api.example.com',
+    });
+
+    assert.equal(result.config, null);
+    assert.ok(
+      result.errors.some((error) => error.includes('operator:hash')),
+      `the error must say how to create a credential, got: ${result.errors.join(' | ')}`,
+    );
+  });
+
+  it('accepts an API key alone as the production credential', () => {
+    // Scripts and server-to-server callers do not need a password login.
+    const result = validateEnv({
+      ...VALID,
+      NODE_ENV: 'production',
+      APP_URL: 'https://api.example.com',
+      OPERATOR_API_KEY: 'k'.repeat(32),
+    });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.operator.protectReads, true);
+  });
+
+  it('never reports protectReads as false in a config it returns for production', () => {
+    // Belt and braces: even on the rejected path, a caller that ignores `errors`
+    // must not be handed a config that would serve reads publicly.
+    const rejected = validateEnv({ ...PROD, OPERATOR_PROTECT_READS: 'false', PORT: 'nonsense' });
+    assert.equal(rejected.config, null);
   });
 });
 

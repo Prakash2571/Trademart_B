@@ -25,8 +25,14 @@
  *   /api/webhooks/razorpay   Razorpay cannot sign in; secured by HMAC
  *   /api/storefront/*        Guest commerce; no operator session, own rate limits
  *
+ * That list is exhaustive on purpose: those five are DELIVERY and SIGN-IN
+ * surfaces. Webhook ADMINISTRATION (status, subscriptions, events, register,
+ * unregister, retry) is not on it - it requires an authenticated operator for
+ * reads as well as writes.
+ *
  * Everything else requires an operator for state-changing methods, and for
- * reads too when OPERATOR_PROTECT_READS=true.
+ * reads too when OPERATOR_PROTECT_READS=true - which defaults to true, and
+ * cannot be turned off, when NODE_ENV=production.
  */
 
 import cors, { type CorsOptions } from 'cors';
@@ -257,7 +263,15 @@ export function createApp(storefront?: StorefrontRouters | null): Express {
   // webhookAdminRouter is separate from webhooksRouter because the receiver must
   // stay ahead of express.json() for raw-body HMAC verification - and the
   // receiver must NOT be behind operator auth, since Shopify cannot sign in.
-  app.use('/api', requireOperatorForWrites, webhookAdminRouter);
+  //
+  // Webhook ADMINISTRATION uses the unconditional requireOperator, not the
+  // writes-only guard: its reads are as sensitive as its writes. GET
+  // /webhooks/status reports whether a signing secret exists and where the
+  // callback points; GET /webhooks/subscriptions and GET /webhooks/events expose
+  // live integration wiring and delivery payload metadata. Behind the
+  // writes-only guard all of that would be world-readable whenever
+  // OPERATOR_PROTECT_READS is false.
+  app.use('/api', requireOperator, webhookAdminRouter);
   app.use('/api', requireOperatorForWrites, automationRouter);
 
   // ---- Read surface --------------------------------------------------------

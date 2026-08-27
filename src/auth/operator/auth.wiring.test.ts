@@ -27,8 +27,9 @@ function mountLine(router: string): string | undefined {
 
 describe('write routers are guarded', () => {
   // Routers that expose POST/PUT/PATCH/DELETE against the store or app state.
+  // webhookAdminRouter is deliberately NOT here: it is held to the stricter
+  // requireOperator, asserted in its own block below.
   const writeRouters = [
-    'webhookAdminRouter',
     'automationRouter',
     'productsWriteRouter',
     'publicationsWriteRouter',
@@ -89,6 +90,61 @@ describe('the audit trail is privileged, not merely a read', () => {
   });
 });
 
+describe('webhook ADMINISTRATION requires an operator for reads as well as writes', () => {
+  // The distinction that matters in this module: the RECEIVER is a delivery
+  // endpoint that Shopify calls and must stay public (HMAC secures it), while
+  // webhook ADMINISTRATION is an operator tool. Its reads are not harmless:
+  //   GET /webhooks/status        - is a signing secret configured, where does the
+  //                                callback point, is persistence up
+  //   GET /webhooks/subscriptions - the live integration wiring in Shopify
+  //   GET /webhooks/events        - delivery history, topics, failures
+  // Behind requireOperatorForWrites all of that is world-readable whenever
+  // OPERATOR_PROTECT_READS is false.
+  const CONTROLLER = readFileSync(
+    join(process.cwd(), 'src', 'webhooks', 'webhooks.controller.ts'),
+    'utf8',
+  );
+
+  it('webhookAdminRouter is mounted behind the unconditional requireOperator', () => {
+    const line = mountLine('webhookAdminRouter') ?? '';
+    assert.notEqual(line, '', 'webhookAdminRouter is not mounted in app.ts');
+    assert.ok(
+      /requireOperator\b(?!For)/.test(line),
+      `webhook administration must use requireOperator, not the writes-only or reads-only guard, got: ${line.trim()}`,
+    );
+  });
+
+  it('the public receiver router carries ONLY the receiver route', () => {
+    // Any other route defined on webhooksRouter is public by construction,
+    // because that router is mounted with no guard. This is how GET
+    // /webhooks/status came to be anonymously readable.
+    const routes = [...CONTROLLER.matchAll(/webhooksRouter\.(get|post|put|patch|delete)\(\s*\n?\s*'([^']+)'/g)]
+      .map((match) => `${(match[1] as string).toUpperCase()} ${match[2] as string}`);
+
+    assert.deepEqual(
+      routes,
+      ['POST /webhooks/shopify'],
+      `webhooksRouter is mounted unguarded, so every route on it is public. Move anything that is not the raw-body receiver to webhookAdminRouter. Found: ${routes.join(', ')}`,
+    );
+  });
+
+  it('every management route lives on the admin router', () => {
+    for (const route of [
+      '/webhooks/status',
+      '/webhooks/subscriptions',
+      '/webhooks/events',
+      '/webhooks/register',
+      '/webhooks/unregister',
+    ]) {
+      assert.ok(
+        CONTROLLER.includes(`webhookAdminRouter.get(\n  '${route}'`) ||
+          CONTROLLER.includes(`webhookAdminRouter.post(\n  '${route}'`),
+        `${route} must be declared on webhookAdminRouter`,
+      );
+    }
+  });
+});
+
 describe('public routers are intentionally public', () => {
   it('publicDiagnosticsRouter is mounted with no guard, and is version-only', () => {
     // It is public because a deploy check must read it before anyone signs in.
@@ -125,6 +181,44 @@ describe('public routers are intentionally public', () => {
     const line = mountLine('webhooksRouter');
     assert.ok(line !== undefined);
     assert.ok(!line.includes('requireOperator'), 'the receiver is secured by HMAC, not operator auth');
+  });
+
+  it('the Razorpay receiver is unguarded and ahead of the JSON parser', () => {
+    // Same reasoning as Shopify's: Razorpay cannot present an operator credential,
+    // and its signature is computed over the raw bytes. Guarding it would silently
+    // stop every payment webhook; parsing before it would break every signature.
+    const line = mountLine('storefront.razorpayWebhookRouter') ?? '';
+    assert.notEqual(line, '', 'the Razorpay webhook receiver is not mounted in app.ts');
+    assert.ok(
+      !line.includes('requireOperator'),
+      'the Razorpay receiver is secured by HMAC, not operator auth',
+    );
+
+    const receiver = APP.indexOf('storefront.razorpayWebhookRouter');
+    const jsonParser = APP.indexOf('express.json(');
+    assert.ok(receiver < jsonParser, 'the Razorpay receiver must precede express.json()');
+  });
+
+  it('storefront guest commerce is not behind an operator guard', () => {
+    // Customers have no operator session. These routers carry their own tighter
+    // rate limiters instead, which is what app.ts asserts by mounting them with a
+    // limiter and no auth middleware.
+    for (const router of [
+      'storefront.catalogRouter',
+      'storefront.checkoutRouter',
+      'storefront.ordersRouter',
+    ]) {
+      const line = mountLine(router) ?? '';
+      assert.notEqual(line, '', `${router} is not mounted in app.ts`);
+      assert.ok(
+        !line.includes('requireOperator'),
+        `${router} serves guest customers and must not require an operator, got: ${line.trim()}`,
+      );
+      assert.ok(
+        line.includes('RateLimiter'),
+        `${router} is public, so it must be mounted with its own rate limiter, got: ${line.trim()}`,
+      );
+    }
   });
 
   it('operator and oauth routers are reachable without an operator session', () => {

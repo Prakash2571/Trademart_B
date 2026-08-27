@@ -16,6 +16,7 @@ import { Router } from 'express';
 import { recordAudit } from '../audit/audit.service';
 import { AppError } from '../common/errors';
 import { asyncHandler, sendSuccess } from '../common/http';
+import { idempotent } from '../common/idempotency';
 import { parseIntParam, parseStringParam, toShopifyGid } from '../common/validate';
 import { config, isAutomationEnabled, isAutomationOnWebhookEnabled } from '../config';
 import { getBreakerSnapshot } from '../shopify/shopify.breaker';
@@ -237,8 +238,13 @@ automationRouter.post(
   }),
 );
 
+// The most dangerous route in the application: it changes live prices and
+// visibility across many products at once. `idempotent` gives it duplicate
+// suppression on a retry AND makes it fail closed when Mongo is down - a bulk
+// price change with no audit trail is not a change anyone could explain later.
 automationRouter.post(
   '/automation/apply',
+  idempotent('POST /api/automation/apply'),
   asyncHandler(async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
 

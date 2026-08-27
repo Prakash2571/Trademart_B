@@ -1,16 +1,24 @@
 /**
- * POST /api/webhooks/shopify          - receives Shopify webhook deliveries
- * GET  /api/webhooks/status           - what is configured / registered
- * GET  /api/webhooks/subscriptions    - subscriptions as Shopify reports them
- * POST /api/webhooks/register         - reconcile subscriptions (idempotent)
- * POST /api/webhooks/unregister       - delete one subscription by id
+ * POST /api/webhooks/shopify          - receives Shopify webhook deliveries (PUBLIC, HMAC)
+ * GET  /api/webhooks/status           - what is configured / registered  (operator)
+ * GET  /api/webhooks/subscriptions    - subscriptions as Shopify reports them (operator)
+ * GET  /api/webhooks/events           - delivery history and queue state (operator)
+ * POST /api/webhooks/register         - reconcile subscriptions (idempotent) (operator)
+ * POST /api/webhooks/unregister       - delete one subscription by id (operator)
+ * POST /api/webhooks/events/:id/retry - re-queue a FAILED delivery (operator)
  *
  * Two routers are exported on purpose:
  *
- *   webhooksRouter     - the RECEIVER. Mounted before express.json() in app.ts
- *                        because HMAC verification needs the exact raw bytes.
- *   webhookAdminRouter - management routes. Mounted after express.json(), since
- *                        they read and write JSON like any other endpoint.
+ *   webhooksRouter     - the RECEIVER, and ONLY the receiver. Mounted before
+ *                        express.json() in app.ts because HMAC verification needs
+ *                        the exact raw bytes, and deliberately NOT behind operator
+ *                        auth, because Shopify cannot sign in.
+ *   webhookAdminRouter - webhook ADMINISTRATION. Mounted after express.json() and
+ *                        behind requireOperator, so both reads and writes need an
+ *                        authenticated operator. /webhooks/status lives here and
+ *                        not on the receiver: it reports whether a signing secret
+ *                        exists, the callback URL and whether persistence is up,
+ *                        which is deployment reconnaissance, not public data.
  *
  * Security order of operations on a delivery (never reordered):
  *   1. verify HMAC over the raw body
@@ -51,12 +59,10 @@ import {
   isExpectedShopDomain,
   verifyWebhookSignature,
 } from './webhook.verify';
+import { decideWebhookAck, requiresInlineHandling } from './webhook.ack';
 
 export const webhooksRouter = Router();
 export const webhookAdminRouter = Router();
-
-/** Topic (header form) that means the merchant removed the app. */
-const APP_UNINSTALLED_TOPIC = 'app/uninstalled';
 
 /**
  * The raw body parser must be mounted on this route specifically - HMAC is
@@ -112,17 +118,17 @@ webhooksRouter.post(
 
     // ---- Persist, THEN acknowledge. Never process inline. -------------------
     //
-    // The previous flow acknowledged Shopify and then did the work on a detached
-    // promise. A crash or a deploy in that window dropped the event permanently:
-    // Shopify had its 2xx and would never redeliver, and nothing recorded that
-    // the work had not happened.
-    //
-    // Now the only thing that has to succeed inside Shopify's few-second timeout
-    // is a single insert; a durable worker does the rest and can retry.
+    // The only thing that has to succeed inside Shopify's few-second timeout is a
+    // single insert; a durable worker does the rest and can retry.
     //
     // Deduplication is the unique index on webhookId inside enqueueEvent, not a
     // read-then-write check: two simultaneous Shopify retries can both pass a
     // read, and only one can win an insert.
+    //
+    // A 2xx is a PROMISE that the event is safe with us. When it is not - no
+    // database, or the insert failed - the answer is a retryable 503 and Shopify
+    // redelivers. Answering 200 anyway (the previous behaviour) turned a
+    // transient storage blip into permanent, silent event loss.
     let enqueued: { stored: boolean; duplicate: boolean; id: string | null } = {
       stored: false,
       duplicate: false,
@@ -138,9 +144,6 @@ webhooksRouter.post(
           payload,
         });
       } catch (error) {
-        // A storage failure must not produce a non-2xx: Shopify would retry, and
-        // the retry would hit the same broken storage. Fall through to the
-        // no-database path below so an uninstall is still honoured.
         logger.error('Failed to queue the webhook event.', {
           topic,
           reason: error instanceof Error ? error.message : 'unknown',
@@ -148,55 +151,80 @@ webhooksRouter.post(
       }
     }
 
-    if (enqueued.duplicate) {
+    // ---- Inline fallback, for topics that must be honoured regardless -------
+    //
+    // An uninstall revokes the offline token. Leaving a revoked token in storage
+    // is a security problem, not a bookkeeping one, so it is handled even with no
+    // database. Everything else has no inline path: without storage there is
+    // nowhere to retry from, so it must NOT be acknowledged.
+    let inline: 'handled' | 'failed' | 'not-needed' = 'not-needed';
+    if (!enqueued.stored && !enqueued.duplicate && requiresInlineHandling(topic)) {
+      try {
+        if (normalisedShop !== undefined) await clearOfflineToken(normalisedShop);
+        inline = 'handled';
+        logger.info('Processed app/uninstalled inline (no durable queue).', {
+          shopDomain: normalisedShop,
+        });
+      } catch (error) {
+        inline = 'failed';
+        logger.error('Failed to clear the stored token after an uninstall.', {
+          reason: error instanceof Error ? error.message : 'unknown',
+        });
+      }
+    }
+
+    const ack = decideWebhookAck({
+      topic,
+      stored: enqueued.stored,
+      duplicate: enqueued.duplicate,
+      inline,
+    });
+
+    if (ack.kind === 'not-persisted') {
+      // Loud, and a 503: the sender still owns this event and will redeliver it.
+      logger.error(
+        'Webhook verified but NOT persisted; answering 503 so it is redelivered.',
+        { topic, webhookId, persistenceAvailable },
+      );
+      throw new AppError('WEBHOOK_NOT_PERSISTED', ack.message, {
+        details: { topic, persistenceAvailable },
+      });
+    }
+
+    if (ack.kind === 'duplicate') {
       logger.info('Ignoring duplicate webhook delivery.', { topic, webhookId });
       res.status(200).json({ success: true, duplicate: true });
       return;
     }
 
+    if (ack.kind === 'handled-inline') {
+      res.status(200).json({ success: true, queued: false, handledInline: true });
+      return;
+    }
+
     // Acknowledge fast; Shopify expects a 2xx within a few seconds.
-    res.status(200).json({ success: true, queued: enqueued.stored });
+    res.status(200).json({ success: true, queued: true });
 
-    if (enqueued.stored) {
-      // Nudge the worker so a delivery is handled in about a second rather than
-      // at the next poll. Fire-and-forget is safe here BECAUSE the event is
-      // already durable - a failure only delays it to the next tick.
-      void drainQueue(1).catch((error: unknown) => {
-        logger.warn('Immediate webhook drain failed; the poller will retry.', {
-          reason: error instanceof Error ? error.message : 'unknown',
-        });
+    // Nudge the worker so a delivery is handled in about a second rather than at
+    // the next poll. Fire-and-forget is safe here BECAUSE the event is already
+    // durable - a failure only delays it to the next tick.
+    void drainQueue(1).catch((error: unknown) => {
+      logger.warn('Immediate webhook drain failed; the poller will retry.', {
+        reason: error instanceof Error ? error.message : 'unknown',
       });
-      return;
-    }
-
-    // ---- No-database fallback ----------------------------------------------
-    //
-    // An uninstall must still invalidate the stored token: leaving a revoked
-    // token in place is a security problem, not a bookkeeping one. Everything
-    // else is dropped with a loud log, because without storage there is nowhere
-    // to retry from and pretending otherwise would be worse.
-    if (topic.toLowerCase() === APP_UNINSTALLED_TOPIC) {
-      try {
-        if (normalisedShop !== undefined) await clearOfflineToken(normalisedShop);
-        logger.info('Processed app/uninstalled inline (no database).', {
-          shopDomain: normalisedShop,
-        });
-      } catch (error) {
-        logger.error('Failed to clear the stored token after an uninstall.', {
-          reason: error instanceof Error ? error.message : 'unknown',
-        });
-      }
-      return;
-    }
-
-    logger.warn(
-      'Webhook acknowledged but NOT queued - no database. It will not be processed or retried.',
-      { topic, webhookId },
-    );
+    });
   }),
 );
 
-webhooksRouter.get(
+/**
+ * GET /api/webhooks/status - local webhook configuration.
+ *
+ * On the ADMIN router (operator required) rather than the public receiver: it
+ * reports whether a signing secret is configured, the exact callback URL and
+ * whether persistence is up. That is a map of the deployment's weak points, and
+ * an anonymous caller has no business reading it.
+ */
+webhookAdminRouter.get(
   '/webhooks/status',
   asyncHandler(async (_req, res) => {
     // Reports local configuration only, and never fails: this endpoint is what

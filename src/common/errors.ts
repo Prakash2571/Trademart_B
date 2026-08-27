@@ -44,6 +44,13 @@ export type ErrorCode =
   | 'WEBHOOK_NOT_CONFIGURED'
   | 'WEBHOOK_INVALID_SIGNATURE'
   | 'WEBHOOK_REGISTRATION_FAILED'
+  /**
+   * A verified delivery could not be made DURABLE (no database, or the insert
+   * failed). 503 and retryable on purpose: the sender must redeliver, because
+   * acknowledging an event nobody stored drops it permanently - Shopify has its
+   * 2xx and will never send it again.
+   */
+  | 'WEBHOOK_NOT_PERSISTED'
   // OAuth (authorization code grant / redirect flow)
   | 'OAUTH_NOT_CONFIGURED'
   | 'OAUTH_INVALID_REQUEST'
@@ -301,6 +308,9 @@ export function defaultStatusForCode(code: ErrorCode): number {
     case 'OPERATOR_NOT_CONFIGURED':
       return 503;
     case 'DATABASE_UNAVAILABLE':
+    // A verified delivery that could not be stored. 503 so the sender retries
+    // into a healthy process rather than the event being lost behind a 2xx.
+    case 'WEBHOOK_NOT_PERSISTED':
     // The dependency is unhealthy; come back later. Honest 503 semantics.
     case 'SHOPIFY_DEGRADED':
     case 'SUPPLIER_UNAVAILABLE':
@@ -348,6 +358,12 @@ export function defaultRetryableForCode(code: ErrorCode): boolean {
     // Publication is an ordinary Shopify write, so a transient failure can
     // genuinely succeed on a later, operator-initiated attempt.
     case 'PUBLICATION_FAILED':
+    // Mongo being briefly unreachable is the textbook transient failure: the
+    // same request, sent again once storage is back, is expected to succeed.
+    // Marking it non-retryable would tell a webhook sender and a client alike to
+    // give up on a problem that fixes itself.
+    case 'DATABASE_UNAVAILABLE':
+    case 'WEBHOOK_NOT_PERSISTED':
       return true;
     case 'OAUTH_NOT_CONFIGURED':
     case 'OAUTH_INVALID_REQUEST':
