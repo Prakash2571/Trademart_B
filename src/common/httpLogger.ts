@@ -14,6 +14,8 @@ import type { NextFunction, Request, RequestHandler, Response } from 'express';
 
 import { config } from '../config';
 import { logger } from './logger';
+// A tracking token lives in a path segment; it must not reach the access log.
+import { sanitiseLogPath } from './logPath';
 
 /**
  * Paths that are far too frequent and far too boring to log at info.
@@ -25,6 +27,8 @@ const QUIET_PATHS = new Set([
   '/api/health/ready',
 ]);
 
+
+
 export function httpLogger(): RequestHandler {
   return (req: Request, res: Response, next: NextFunction) => {
     const startedAt = process.hrtime.bigint();
@@ -34,10 +38,11 @@ export function httpLogger(): RequestHandler {
       const quiet = QUIET_PATHS.has(req.path) && res.statusCode < 400;
       if (quiet) return;
 
+      const path = sanitiseLogPath(req.path);
       const meta: Record<string, unknown> = {
-        operation: `${req.method} ${req.path}`,
+        operation: `${req.method} ${path}`,
         method: req.method,
-        path: req.path,
+        path,
         status: res.statusCode,
         durationMs: Math.round(durationMs),
         storeDomain: config.shopify.storeDomain,

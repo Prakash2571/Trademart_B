@@ -20,6 +20,7 @@
 
 import { toAppError } from '../common/errors';
 import { logger } from '../common/logger';
+import { incrementCounter } from '../common/metrics';
 import {
   createContext,
   getRequestId,
@@ -223,6 +224,7 @@ async function markFailure(
         },
       },
     );
+    incrementCounter('webhook.event.failed');
     logger.error('Webhook processing failed permanently; needs a manual retry.', {
       topic: row.topic,
       webhookId: row.webhookId,

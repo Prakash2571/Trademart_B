@@ -19,8 +19,10 @@
  * -----------------------
  * Public by design, each for a specific reason:
  *   /api/health              uptime probes must not need a credential
+ *                            (identifying detail is operator-gated inside)
  *   /api/operator/*          you cannot sign in if signing in needs a sign-in
- *   /api/auth/*              Shopify calls the OAuth callback; secured by HMAC
+ *   /api/auth/install        a merchant clicks it from a browser with no session
+ *   /api/auth/callback       Shopify calls it; secured by HMAC + signed state
  *   /api/webhooks/shopify    Shopify cannot sign in; secured by HMAC
  *   /api/webhooks/razorpay   Razorpay cannot sign in; secured by HMAC
  *   /api/storefront/*        Guest commerce; no operator session, own rate limits
@@ -37,16 +39,16 @@
 
 import cors, { type CorsOptions } from 'cors';
 import express, { type Express, type Request, type Response, type NextFunction } from 'express';
-import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 
 import { errorHandler, notFoundHandler } from './common/errorHandler';
 import { httpLogger } from './common/httpLogger';
+import { createRateLimiter } from './common/rateLimit';
 import { REQUEST_ID_HEADER, requestIdMiddleware } from './common/requestId';
 import { helmetOptions } from './common/securityHeaders';
 import { analyticsRouter } from './analytics/analytics.controller';
 import { automationRouter } from './automation/automation.controller';
-import { oauthRouter } from './auth/oauth.controller';
+import { oauthAdminRouter, oauthRouter } from './auth/oauth.controller';
 import { operatorRouter } from './auth/operator/operator.controller';
 import {
   requireOperator,
@@ -62,6 +64,7 @@ import { intelligenceRouter } from './intelligence/intelligence.controller';
 import { intelligenceWriteRouter } from './intelligence/intelligence.write.controller';
 import {
   diagnosticsRouter,
+  operationsRouter,
   publicDiagnosticsRouter,
 } from './diagnostics/diagnostics.controller';
 import { healthRouter } from './health/health.controller';
@@ -133,37 +136,30 @@ function corsDispatch(req: Request, res: Response, next: NextFunction): void {
 
 // ---- Storefront rate limiters -----------------------------------------------
 
-const storefrontRateLimitMessage = {
-  success: false,
-  code: 'RATE_LIMITED',
-  message: 'Too many requests. Please slow down.',
-};
+const STOREFRONT_RATE_LIMIT_MESSAGE = 'Too many requests. Please slow down.';
 
 /** Catalog reads: generous for browsing (100 req/min per IP) */
-const storefrontCatalogRateLimiter = rateLimit({
+const storefrontCatalogRateLimiter = createRateLimiter({
+  scope: 'storefront-catalog',
   windowMs: 60_000,
   limit: 100,
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-  message: storefrontRateLimitMessage,
+  message: STOREFRONT_RATE_LIMIT_MESSAGE,
 });
 
 /** Checkout creation + payment verify: tight (10 req/min per IP) */
-const storefrontCheckoutRateLimiter = rateLimit({
+const storefrontCheckoutRateLimiter = createRateLimiter({
+  scope: 'storefront-checkout',
   windowMs: 60_000,
   limit: 10,
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-  message: storefrontRateLimitMessage,
+  message: STOREFRONT_RATE_LIMIT_MESSAGE,
 });
 
 /** Tracking/status: very tight to resist token brute-force (15 req/min per IP) */
-const storefrontTrackingRateLimiter = rateLimit({
+const storefrontTrackingRateLimiter = createRateLimiter({
+  scope: 'storefront-tracking',
   windowMs: 60_000,
   limit: 15,
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-  message: storefrontRateLimitMessage,
+  message: STOREFRONT_RATE_LIMIT_MESSAGE,
 });
 
 export function createApp(storefront?: StorefrontRouters | null): Express {
@@ -207,18 +203,19 @@ export function createApp(storefront?: StorefrontRouters | null): Express {
   app.use(express.json({ limit: '1mb' }));
 
   // Global rate limiter: 300 req/min per IP across all routes.
+  //
+  // Mounted AFTER the webhook receivers on purpose. Shopify and Razorpay deliver in
+  // bursts (a bulk edit in the Shopify admin can produce dozens of products/update
+  // events in seconds), and a 429 to a webhook sender is a delivery failure that
+  // eats into its retry budget. The receivers are protected by HMAC and a 2mb body
+  // cap instead, which is the right shape of limit for a signed sender.
   app.use(
     '/api',
-    rateLimit({
+    createRateLimiter({
+      scope: 'global',
       windowMs: 60_000,
       limit: 300,
-      standardHeaders: 'draft-7',
-      legacyHeaders: false,
-      message: {
-        success: false,
-        code: 'RATE_LIMITED',
-        message: 'Too many requests. Please slow down.',
-      },
+      message: 'Too many requests. Please slow down.',
     }),
   );
 
@@ -235,10 +232,17 @@ export function createApp(storefront?: StorefrontRouters | null): Express {
   // authenticating requires being authenticated.
   app.use('/api/operator', operatorRouter);
 
-  // Shopify OAuth redirect flow. Public by necessity: Shopify itself calls
-  // /callback and cannot present an operator credential. It is protected
-  // instead by HMAC + a signed state nonce (see auth/oauth.hmac.ts).
+  // Shopify OAuth redirect flow. Public by necessity: a merchant clicks /install
+  // from a browser with no session, and Shopify itself calls /callback and cannot
+  // present an operator credential. Protected instead by HMAC over the raw query
+  // string + a signed, shop-bound state nonce (see auth/oauth.hmac.ts).
   app.use('/api/auth', oauthRouter);
+
+  // GET /api/auth/status is NOT part of that: it reports the app origin, the exact
+  // redirect URI, every scope requested, whether offline tokens are encrypted at
+  // rest and whether persistence is up. That is a capability map of the
+  // integration, so it requires an operator for reads as well as writes.
+  app.use('/api/auth', requireOperator, oauthAdminRouter);
 
   // ---- Public storefront (guest commerce, no operator session) --------------
   // These routes serve the Kanay Store customer-facing application. They are:
@@ -306,6 +310,11 @@ export function createApp(storefront?: StorefrontRouters | null): Express {
   // Integrity findings name products and their visibility, so they follow the
   // normal read guard.
   app.use('/api', requireOperatorForReads, diagnosticsRouter);
+  // Operational state (failure counters, queue depth, breaker, index health) is a
+  // privileged read like the audit trail: together it describes how to hurt this
+  // deployment and when it is weakest. Always the full operator requirement, never
+  // left open by OPERATOR_PROTECT_READS=false.
+  app.use('/api', requireOperator, operationsRouter);
   // Dropshipping is a READ-ONLY view over Shopify orders - there is no write
   // surface, so the read guard is the whole story. Fulfilling, refunding and
   // cancelling deliberately stay in Shopify.

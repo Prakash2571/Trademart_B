@@ -741,6 +741,54 @@ describe('production locks the management surface', () => {
     );
   });
 
+  it('refuses to derive SESSION_SECRET from the password in production', () => {
+    // A derived secret makes the PASSWORD sufficient to forge operator sessions
+    // offline - no login request, no rate limiter, no audit entry, no future MFA.
+    const result = validateEnv({
+      ...VALID,
+      NODE_ENV: 'production',
+      APP_URL: 'https://api.example.com',
+      OPERATOR_PASSWORD: 'a-good-password',
+    });
+
+    assert.equal(result.config, null, 'production must not boot with a derived session key');
+    assert.ok(
+      result.errors.some((error) => error.includes('SESSION_SECRET must be set explicitly')),
+      `expected an explicit-secret error, got: ${result.errors.join(' | ')}`,
+    );
+    // And the error must say how to make one.
+    assert.ok(result.errors.some((error) => error.includes('openssl rand')));
+  });
+
+  it('accepts a plaintext password in production WITH an explicit secret', () => {
+    // The plaintext-password login path itself is still supported - only the derived
+    // signing key is refused.
+    const result = validateEnv({
+      ...VALID,
+      NODE_ENV: 'production',
+      APP_URL: 'https://api.example.com',
+      OPERATOR_PASSWORD: 'a-good-password',
+      SESSION_SECRET: SECRET,
+    });
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.config?.operator.sessionSecret, SECRET);
+    assert.equal(result.config?.operator.password, 'a-good-password');
+  });
+
+  it('still derives one outside production, for local development', () => {
+    // Removing this would make "just a username and password" stop working locally,
+    // which is the whole reason the derivation exists.
+    const result = validateEnv({ ...VALID, OPERATOR_PASSWORD: 'a-good-password' });
+
+    assert.deepEqual(result.errors, []);
+    assert.ok((result.config?.operator.sessionSecret ?? '').length >= 32);
+    assert.ok(
+      result.warnings.some((warning) => warning.includes('refused when NODE_ENV=production')),
+      'the development warning must say the derivation does not apply in production',
+    );
+  });
+
   it('accepts an API key alone as the production credential', () => {
     // Scripts and server-to-server callers do not need a password login.
     const result = validateEnv({

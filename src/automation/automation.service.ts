@@ -19,6 +19,7 @@ import { createHash } from 'node:crypto';
 
 import { AppError, toAppError } from '../common/errors';
 import { logger } from '../common/logger';
+import { incrementCounter } from '../common/metrics';
 import { getContext, getRequestId } from '../common/requestContext';
 import { config, isAutomationEnabled } from '../config';
 import {
@@ -697,6 +698,10 @@ async function runPreparedPlan(
   }
 
   const summary = { ...plan.summary, applied, failed };
+  // One increment per apply that left anything unapplied, not one per action: the
+  // question an operator asks is "are applies going wrong", and counting actions
+  // would let a single bad run look like an outage.
+  if (failed > 0) incrementCounter('automation.apply.failed');
   const auditRunId = await persistRun({
     dryRun: options.dryRun,
     trigger: options.trigger ?? 'manual',

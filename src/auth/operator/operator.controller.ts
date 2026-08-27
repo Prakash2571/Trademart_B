@@ -11,9 +11,9 @@
  */
 
 import { Router } from 'express';
-import rateLimit from 'express-rate-limit';
 
 import { recordAudit } from '../../audit/audit.service';
+import { createRateLimiter } from '../../common/rateLimit';
 import { AppError } from '../../common/errors';
 import { asyncHandler, sendSuccess } from '../../common/http';
 import { logger } from '../../common/logger';
@@ -43,18 +43,13 @@ export const operatorRouter = Router();
  * password endpoint. Keyed by IP; behind nginx this is the real client because
  * app.ts sets `trust proxy`.
  */
-const loginLimiter = rateLimit({
+const loginLimiter = createRateLimiter({
+  scope: 'operator-login',
   windowMs: 15 * 60 * 1000,
   limit: 10,
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
   // Successful sign-ins should not count toward the lockout.
   skipSuccessfulRequests: true,
-  message: {
-    success: false,
-    code: 'RATE_LIMITED',
-    message: 'Too many sign-in attempts. Wait 15 minutes and try again.',
-  },
+  message: 'Too many sign-in attempts. Wait 15 minutes and try again.',
 });
 
 /** Cookie attributes shared by the session and CSRF cookies. */

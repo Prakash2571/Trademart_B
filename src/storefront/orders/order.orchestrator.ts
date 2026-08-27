@@ -1,4 +1,5 @@
 import { logger } from '../../common/logger';
+import { incrementCounter } from '../../common/metrics';
 import type { CheckoutSessionRepository } from '../checkout/checkout.types';
 import { asStorefrontError } from '../checkout/storefront.error';
 import type { ShopifyOrderCreationPort } from './shopify-order.adapter';
@@ -28,6 +29,10 @@ export class PaidOrderOrchestrator {
       });
       return true;
     } catch (error) {
+      // The most expensive failure in the system: the customer HAS been charged and
+      // there is no Shopify order yet. It retries on a schedule, but an operator
+      // needs to be able to see that it is happening without reading logs.
+      incrementCounter('storefront.order.creation_failed');
       const safe = asStorefrontError(error);
       const delayMinutes =
         RETRY_MINUTES[Math.min(session.orderAttempts - 1, RETRY_MINUTES.length - 1)] ?? 360;

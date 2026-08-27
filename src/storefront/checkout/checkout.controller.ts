@@ -1,7 +1,8 @@
-import { Router, raw, type NextFunction, type Request, type RequestHandler, type Response } from 'express';
+import { Router, raw } from 'express';
 
 import { sendSuccess } from '../../common/http';
-import { getRequestId } from '../../common/requestContext';
+import { incrementCounter } from '../../common/metrics';
+import { requireAllowedOrigin, storefrontHandler } from '../http/storefront.http';
 import type { CheckoutService } from './checkout.service';
 import { StorefrontError } from './storefront.error';
 import { validateCreateCheckoutRequest, validateIdempotencyKey } from './checkout.validation';
@@ -13,49 +14,6 @@ import {
   drainRazorpayWebhookQueue,
   enqueueRazorpayWebhook,
 } from '../payments/payment-webhook.queue';
-
-function storefrontHandler(
-  fn: (req: Request, res: Response) => Promise<void>,
-): RequestHandler {
-  return (req, res, next: NextFunction) => {
-    fn(req, res).catch((error: unknown) => {
-      if (!(error instanceof StorefrontError)) {
-        next(error);
-        return;
-      }
-      const requestId = getRequestId();
-      res.status(error.status).json({
-        success: false,
-        code: error.code,
-        message: error.message,
-        ...(error.details === undefined ? {} : { details: error.details }),
-        ...(requestId ? { requestId } : {}),
-        error: {
-          code: error.code,
-          message: error.message,
-          ...(error.details === undefined ? {} : { details: error.details }),
-          ...(requestId ? { requestId } : {}),
-        },
-      });
-    });
-  };
-}
-
-function requireAllowedOrigin(allowedOrigins: readonly string[]): RequestHandler {
-  const allowed = new Set(allowedOrigins.map((origin) => origin.replace(/\/+$/, '')));
-  return (req, res, next) => {
-    const origin = req.header('Origin');
-    if (origin && !allowed.has(origin.replace(/\/+$/, ''))) {
-      res.status(403).json({
-        success: false,
-        code: 'FORBIDDEN',
-        message: 'This storefront origin is not allowed.',
-      });
-      return;
-    }
-    next();
-  };
-}
 
 function bodyObject(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -79,7 +37,15 @@ export function createStorefrontCheckoutRouter(input: {
       const idempotencyKey = validateIdempotencyKey(
         req.header('Idempotency-Key') ?? rawBody['idempotencyKey'],
       );
-      const data = await input.checkout.create(validateCreateCheckoutRequest(rawBody), idempotencyKey);
+      const data = await input.checkout
+        .create(validateCreateCheckoutRequest(rawBody), idempotencyKey)
+        .catch((error: unknown) => {
+          // Counted here rather than inside the service so one increment covers every
+          // reason a checkout can fail to be created - including validation, which is
+          // the signal that the storefront and backend have drifted apart.
+          incrementCounter('storefront.checkout.failed');
+          throw error;
+        });
       res.status(201);
       sendSuccess(res, data);
     }),

@@ -801,12 +801,27 @@ export function validateEnv(env: RawEnv): EnvValidationResult {
   const hasAnyPassword = operatorPasswordHash !== null || operatorPassword !== null;
   let effectiveSessionSecret = sessionSecret;
   if (effectiveSessionSecret === null && operatorPassword !== null && operatorPasswordHash === null) {
-    effectiveSessionSecret = createHash('sha256')
-      .update(`trademart-session|${operatorUsername}|${operatorPassword}`)
-      .digest('base64');
-    warnings.push(
-      'SESSION_SECRET is not set, so a stable session-signing key was derived from OPERATOR_PASSWORD. Changing the password invalidates existing sessions. Set SESSION_SECRET explicitly to decouple them.',
-    );
+    if (isProduction) {
+      // NOT derived in production. A session secret derived from the password means
+      // the password's entropy is the only thing standing between an attacker and
+      // FORGING sessions: anyone who ever learns the password (a shoulder-surf, a
+      // reused credential, a support screenshot) can mint valid operator cookies
+      // offline, indefinitely, without ever using the login endpoint - so the login
+      // rate limiter, the audit trail and any future MFA are all bypassed.
+      // Rotating the password is also not a real remedy, because the two are the
+      // same value. A 48-byte random secret costs one line of setup and removes the
+      // whole class of problem.
+      errors.push(
+        'SESSION_SECRET must be set explicitly when NODE_ENV=production. Deriving it from OPERATOR_PASSWORD would let anyone who learns the password forge operator sessions offline, bypassing the login endpoint entirely. Generate one with: openssl rand -base64 48',
+      );
+    } else {
+      effectiveSessionSecret = createHash('sha256')
+        .update(`trademart-session|${operatorUsername}|${operatorPassword}`)
+        .digest('base64');
+      warnings.push(
+        'SESSION_SECRET is not set, so a stable session-signing key was derived from OPERATOR_PASSWORD. Convenient for local development only - it is refused when NODE_ENV=production, because it makes the password sufficient to forge a session. Changing the password invalidates existing sessions.',
+      );
+    }
   }
 
   const hasPasswordLogin = hasAnyPassword && effectiveSessionSecret !== null;

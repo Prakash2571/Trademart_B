@@ -1,5 +1,5 @@
 /**
- * GET /api/health        - the original combined probe (unchanged contract)
+ * GET /api/health        - the original combined probe
  * GET /api/health/live   - is the process alive?
  * GET /api/health/ready  - can it usefully serve traffic?
  *
@@ -17,45 +17,56 @@
  * Neither probe calls Shopify. A probe that runs every few seconds must not spend
  * Shopify rate-limit budget, so readiness uses cached state observed from real
  * traffic instead.
+ *
+ * WHAT THESE ROUTES DISCLOSE
+ * --------------------------
+ * They are PUBLIC, because a load balancer cannot sign in - so they answer the
+ * question they exist for and nothing else. The identifying detail (store domain,
+ * API version, auth strategy, NODE_ENV, and the Mongo driver error, which leaks
+ * hosts and sometimes URI fragments) is returned only when the caller proves they
+ * are an operator. Same URL, same keys, same probe contract: see health.payload.ts.
  */
 
-import { Router } from 'express';
+import { Router, type Request } from 'express';
 
+import { resolveOperator } from '../auth/operator/operator.middleware';
 import { getVersionInfo } from '../common/version';
 import { config, isDatabaseConfigured, isShopifyConfigured } from '../config';
 import { getDatabaseStatus } from '../database/mongo';
 import { getBreakerState } from '../shopify/shopify.breaker';
+import { buildHealthPayload, buildReadinessPayload, type HealthInputs } from './health.payload';
 
 export const healthRouter = Router();
 
 /**
- * The original endpoint, kept byte-compatible.
+ * Collects the probe inputs.
  *
- * `status: 'ok'` stays at the top level and unwrapped because that is the
- * documented contract and existing probes read it.
+ * `resolveOperator` is used WITHOUT a response object on purpose: a health probe
+ * must never be given a refreshed session cookie, and it must never fail because
+ * authentication is unconfigured. It only ever answers "is this an operator".
  */
-healthRouter.get('/health', (_req, res) => {
+function healthInputs(req: Request): HealthInputs {
   const database = getDatabaseStatus();
-
-  res.json({
-    status: 'ok',
-    service: 'trademart-backend',
-    environment: config.nodeEnv,
+  return {
+    detailed: resolveOperator(req) !== null,
+    nodeEnv: config.nodeEnv,
     uptimeSeconds: Math.round(process.uptime()),
-    checks: {
-      database: {
-        configured: isDatabaseConfigured(),
-        status: database.status,
-        error: database.error,
-      },
-      shopify: {
-        configured: isShopifyConfigured(),
-        authStrategy: config.shopify.authStrategy,
-        storeDomain: config.shopify.storeDomain,
-        apiVersion: config.shopify.apiVersion,
-      },
+    database: {
+      configured: isDatabaseConfigured(),
+      status: database.status,
+      error: database.error,
     },
-  });
+    shopify: {
+      configured: isShopifyConfigured(),
+      authStrategy: config.shopify.authStrategy,
+      storeDomain: config.shopify.storeDomain,
+      apiVersion: config.shopify.apiVersion,
+    },
+  };
+}
+
+healthRouter.get('/health', (req, res) => {
+  res.json(buildHealthPayload(healthInputs(req)));
 });
 
 /**
@@ -73,55 +84,16 @@ healthRouter.get('/health/live', (_req, res) => {
   });
 });
 
-/**
- * Readiness. Can this instance do useful work right now?
- *
- * Mongo is required only when it is CONFIGURED. Trademart deliberately runs
- * without a database (Shopify reads and pricing still work), so treating an
- * absent MONGODB_URI as not-ready would report a supported configuration as
- * broken. A configured database that is failing is a real readiness problem.
- */
-healthRouter.get('/health/ready', (_req, res) => {
-  const database = getDatabaseStatus();
+healthRouter.get('/health/ready', (req, res) => {
   const version = getVersionInfo();
-
-  const databaseReady =
-    !isDatabaseConfigured() || database.status === 'connected';
-  const shopifyConfigured = isShopifyConfigured();
-  // Cached breaker state, not a live call. 'open' means Shopify has been failing
-  // repeatedly, which is worth reporting without making it a readiness failure:
-  // reads may still work and the instance can still serve the console.
-  const shopifyBreaker = getBreakerState();
-
-  const ready = databaseReady && shopifyConfigured;
-
-  res.status(ready ? 200 : 503).json({
-    status: ready ? 'ok' : 'unavailable',
-    ready,
+  const { status, body } = buildReadinessPayload({
+    ...healthInputs(req),
     version: version.version,
     gitSha: version.gitShaShort,
-    checks: {
-      database: {
-        required: isDatabaseConfigured(),
-        configured: isDatabaseConfigured(),
-        status: database.status,
-        ready: databaseReady,
-        error: database.error,
-      },
-      shopifyConfiguration: {
-        configured: shopifyConfigured,
-        authStrategy: config.shopify.authStrategy,
-        ready: shopifyConfigured,
-      },
-      shopifyConnectivity: {
-        // Explicit about provenance so nobody reads this as a live probe.
-        source: 'cached-from-real-traffic',
-        circuitBreaker: shopifyBreaker,
-        degraded: shopifyBreaker === 'open',
-      },
-    },
-    note: ready
-      ? 'Dependencies are usable. Shopify is not probed by health checks - its state here is observed from real traffic.'
-      : 'Not ready: see checks. Use /api/health/live for the liveness probe, which must not fail because a dependency is down.',
+    // Cached breaker state, not a live call. 'open' means Shopify has been failing
+    // repeatedly, which is worth reporting to an operator without making it a
+    // readiness failure: reads may still work and the console is still usable.
+    shopifyBreaker: getBreakerState(),
   });
+  res.status(status).json(body);
 });

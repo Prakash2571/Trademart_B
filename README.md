@@ -1,5 +1,12 @@
 # Trademart Backend
 
+> **New here?** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the one-page tour of all
+> three repositories: how Trademart_F and Kanay-Store reach this API, how it reaches
+> Shopify, Razorpay and MongoDB, the order state machine, the production environment
+> variables, and the safe deployment procedure. Route-by-route access control is in
+> [docs/ROUTE_SECURITY.md](docs/ROUTE_SECURITY.md); branch protection (which must be
+> applied by hand) is in [docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md).
+
 Node.js + TypeScript API that connects Trademart to a Shopify store through the
 **GraphQL Admin API**, plus a standalone pricing/margin engine.
 
@@ -458,13 +465,22 @@ Envelopes are consistent:
 
 **Authentication:** everything that changes the store requires a signed-in
 operator (session cookie or `Authorization: Bearer <OPERATOR_API_KEY>`). See
-[docs/OPERATOR_AUTH.md](docs/OPERATOR_AUTH.md). Public exceptions: `/api/health`,
-`/api/operator/*`, the Shopify OAuth callback, and the HMAC-verified webhook
-receiver.
+[docs/OPERATOR_AUTH.md](docs/OPERATOR_AUTH.md). Public exceptions: `/api/health*`,
+`/api/version`, `/api/operator/*`, the Shopify OAuth **install and callback**
+(`/api/auth/status` is operator-only), the HMAC-verified Shopify and Razorpay webhook
+receivers, and the guest storefront routes.
+
+Every route, with its access level, auth mechanism, CSRF requirement, rate limiter,
+idempotency behaviour and whether it needs MongoDB, is enumerated in
+[docs/ROUTE_SECURITY.md](docs/ROUTE_SECURITY.md) — and a test fails the build if that
+document and the code disagree.
 
 | Method | Route | Notes |
 | --- | --- | --- |
-| GET | `/api/health` | Liveness + database/Shopify diagnostics. Public. |
+| GET | `/api/health` | Public probe. Store domain, API version, auth strategy, `NODE_ENV` and the database error are returned **only to an operator**. |
+| GET | `/api/health/live` | Liveness. Checks nothing else — a dependency outage must not restart the container. |
+| GET | `/api/health/ready` | Readiness. 503 when a configured database is down. |
+| GET | `/api/diagnostics/operations` | Failure counters, webhook queue depth and oldest-pending age, breaker state, index health. **Operator only, always.** |
 | POST | `/api/operator/login` | Start a session. Public, rate-limited. |
 | POST | `/api/operator/logout` | Clear the session. |
 | GET | `/api/operator/me` | Auth state. Always 200. |
@@ -760,7 +776,14 @@ src/
 ## Security
 
 - Secrets are backend-only; `.env` is gitignored and `.env.example` holds placeholders.
-- The logger redacts `shpat_`/`shpss_`-style tokens and Mongo URIs; tokens are never logged.
+- The logger redacts by field NAME as well as value shape: tokens, secrets, cookies,
+  **signatures**, and customer PII (email, phone, address, `payload`) never reach stdout —
+  including inside arrays and nested objects. The tracking token is masked out of the
+  access log, where it used to appear in the request path verbatim.
+- `SESSION_SECRET` must be set explicitly in production; deriving it from
+  `OPERATOR_PASSWORD` (which local development still does) would make the password
+  sufficient to forge a session offline, bypassing the login endpoint entirely.
+- `OPERATOR_PROTECT_READS` is **true in production and cannot be disabled** there.
 - `/api/shopify/status` reports credential **presence as booleans** — never values.
 - CORS is restricted to `FRONTEND_URL`; `helmet` sets security headers; `/api` is rate limited.
 - All query/body input is validated; Shopify ids are treated as opaque strings.

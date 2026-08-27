@@ -28,6 +28,7 @@
 
 import { AppError } from '../common/errors';
 import { logger } from '../common/logger';
+import { incrementCounter } from '../common/metrics';
 
 /** Consecutive qualifying failures before bulk writes are refused. */
 const FAILURE_THRESHOLD = 5;
@@ -100,9 +101,11 @@ export function recordShopifyOutcome(outcome: {
   breaker.consecutiveFailures += 1;
   breaker.lastFailureAt = now;
   breaker.lastFailureCode = outcome.code;
+  incrementCounter('shopify.request.failed');
 
   if (breaker.consecutiveFailures >= FAILURE_THRESHOLD && breaker.openedAt === null) {
     breaker.openedAt = now;
+    incrementCounter('shopify.breaker.opened');
     logger.error('Shopify looks degraded; pausing bulk writes.', {
       consecutiveFailures: breaker.consecutiveFailures,
       code: outcome.code,
