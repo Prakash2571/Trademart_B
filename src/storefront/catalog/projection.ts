@@ -7,6 +7,7 @@ import type { PushedVariantMapping } from '../../intelligence/variant.mapping';
 import type { CatalogCandidateEvidence } from './catalog.repository';
 // From ./publication, NOT ./shopify.catalog: the latter imports the Shopify client
 // and therefore the config singleton, which this pure projection must not require.
+import { parseMinimumOrderQuantity } from './moq';
 import { resolveChannelPublicationStatus, ONLINE_STORE_SELECTOR } from './publication';
 import type { SalesChannelSelector } from '../../shopify/publications/publications.types';
 import type {
@@ -178,6 +179,9 @@ export function projectStorefrontProduct(input: {
     availableForSale: sellable.length > 0,
     availability,
     collections,
+    // Wholesale minimum, from a `moq:<n>` tag. Null when unset, and deliberately not
+    // defaulted to 1 - see catalog/moq.ts.
+    minimumOrderQuantity: parseMinimumOrderQuantity(product.tags),
   };
   const compareAtRange = moneyRange(compareAtPrices);
   if (compareAtRange !== null) {

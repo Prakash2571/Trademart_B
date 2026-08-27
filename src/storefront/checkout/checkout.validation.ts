@@ -11,6 +11,25 @@ const INDIA_PHONE = /^[6-9]\d{9}$/;
 const INDIA_PIN = /^\d{6}$/;
 const SAFE_ID = /^[A-Za-z0-9_:/.-]{1,255}$/;
 
+/**
+ * Largest quantity accepted for one variant in one checkout.
+ *
+ * THIS WAS 10, AND THAT WAS A BUG FOR THIS BUSINESS.
+ * A wholesale marketplace whose checkout refuses an eleventh unit is not a wholesale
+ * marketplace: it made every bulk order impossible, and it would have rejected any product
+ * carrying an MOQ above 10 outright - the storefront would advertise "MOQ 12" and the
+ * checkout would answer "maximum 10". The cap was a sensible retail guard inherited from a
+ * single-item storefront, and it quietly contradicted the whole point of the product.
+ *
+ * A cap is still needed. It bounds the arithmetic (quantity x price must stay a safe
+ * integer in paise), it bounds what one request can ask Shopify to reserve, and it stops a
+ * fat-fingered 100000 from becoming an order. 10,000 units of one variant is far beyond any
+ * plausible order here and far below anything that could overflow; MAX_MINIMUM_ORDER_QUANTITY
+ * in catalog/moq.ts is pinned to the same number so an MOQ can never exceed what the
+ * checkout will accept.
+ */
+export const MAX_LINE_QUANTITY = 10_000;
+
 function object(value: unknown, field: string): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new StorefrontError('VALIDATION_ERROR', `${field} must be an object.`, 400);
@@ -116,10 +135,14 @@ function parseLines(value: unknown): RequestedCheckoutLine[] {
         : undefined;
 
     const quantity = raw['quantity'];
-    if (!Number.isSafeInteger(quantity) || (quantity as number) < 1 || (quantity as number) > 10) {
+    if (
+      !Number.isSafeInteger(quantity) ||
+      (quantity as number) < 1 ||
+      (quantity as number) > MAX_LINE_QUANTITY
+    ) {
       throw new StorefrontError(
         'VALIDATION_ERROR',
-        `Quantity for item ${index + 1} must be a whole number from 1 to 10.`,
+        `Quantity for item ${index + 1} must be a whole number from 1 to ${MAX_LINE_QUANTITY}.`,
         400,
       );
     }
@@ -132,8 +155,12 @@ function parseLines(value: unknown): RequestedCheckoutLine[] {
     const existing = combined.get(key);
     if (existing) {
       const total = existing.quantity + (quantity as number);
-      if (total > 10) {
-        throw new StorefrontError('VALIDATION_ERROR', 'Quantity per variant cannot exceed 10.', 400);
+      if (total > MAX_LINE_QUANTITY) {
+        throw new StorefrontError(
+          'VALIDATION_ERROR',
+          `Quantity per variant cannot exceed ${MAX_LINE_QUANTITY}.`,
+          400,
+        );
       }
       existing.quantity = total;
       continue;

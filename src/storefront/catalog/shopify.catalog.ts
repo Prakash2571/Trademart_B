@@ -41,6 +41,8 @@ export interface RawCatalogProduct {
   status?: string | null;
   vendor?: string | null;
   productType?: string | null;
+  /** Shopify product tags. Source of the wholesale MOQ - see catalog/moq.ts. */
+  tags?: string[] | null;
   createdAt: string;
   updatedAt: string;
   seo?: { title?: string | null; description?: string | null } | null;
@@ -89,6 +91,7 @@ const PRODUCT_FIELDS = /* GraphQL */ `
   status
   vendor
   productType
+  tags
   createdAt
   updatedAt
   seo { title description }
