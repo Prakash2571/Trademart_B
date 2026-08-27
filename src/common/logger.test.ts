@@ -32,15 +32,18 @@ describe('value-shape redaction', () => {
   });
 
   it('redacts a Mongo connection string, which embeds credentials', () => {
+    // Placeholder credentials on purpose: the secret-scan workflow greps the source for
+    // credential SHAPES, and a realistic-looking URI in a test fixture would fail the
+    // build for the right reason. `user:pass@` and example.com are on its allow-list.
     assert.equal(
-      redact('failed: mongodb+srv://user:pw@cluster.example.net/db?retryWrites=true'),
+      redact('failed: mongodb+srv://user:pass@cluster.example.com/db?retryWrites=true'),
       'failed: [REDACTED]',
     );
   });
 
   it('redacts Razorpay key ids, which sit next to the secret', () => {
-    assert.equal(redact('using rzp_live_ABCdef123'), 'using [REDACTED]');
-    assert.equal(redact('using rzp_test_ABCdef123'), 'using [REDACTED]');
+    assert.equal(redact('using rzp_live_placeholderKey'), 'using [REDACTED]');
+    assert.equal(redact('using rzp_test_placeholderKey'), 'using [REDACTED]');
   });
 
   it('leaves ordinary diagnostics readable', () => {
