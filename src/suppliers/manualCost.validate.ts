@@ -42,7 +42,7 @@ function pick(body: Record<string, unknown>, canonical: string, alias: string): 
   return value === undefined ? body[alias] : value;
 }
 
-const PROVIDERS: readonly SupplierClassification[] = ['TRADELLE', 'OTHER', 'UNKNOWN'];
+const PROVIDERS: readonly SupplierClassification[] = ['TRADELLE', 'DEODAP', 'OTHER', 'UNKNOWN'];
 
 function requirePositive(raw: unknown, field: string): number {
   if (typeof raw !== 'number' || !Number.isFinite(raw)) {

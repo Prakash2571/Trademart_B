@@ -91,6 +91,8 @@ const MOUNT: Record<string, string> = {
   pricingRouter: '/api',
   suppliersRouter: '/api',
   manualCostRouter: '/api',
+  // Mounted at its own prefix so its unconditional operator guard runs only there.
+  deodapRouter: '/api/suppliers/deodap',
   themesRouter: '/api',
   dropshippingRouter: '/api',
   dropshippingWriteRouter: '/api',

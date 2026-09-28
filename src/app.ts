@@ -80,6 +80,7 @@ import {
 } from './shopify/publications/publications.controller';
 import { shopifyRouter } from './shopify/shopify.controller';
 import { themesRouter } from './shopify/themes/themes.controller';
+import { deodapRouter } from './suppliers/deodap/deodap.controller';
 import { manualCostRouter } from './suppliers/manualCost.controller';
 import { suppliersRouter } from './suppliers/suppliers.controller';
 import {
@@ -303,6 +304,12 @@ export function createApp(storefront?: StorefrontRouters | null): Express {
   // Manual supplier costs: GET is a read, PUT/DELETE are operator-protected
   // writes. Mounted with the write guard, which leaves GET open by default.
   app.use('/api', requireOperatorForWrites, manualCostRouter);
+  // DeoDap supplier: encrypted credentials, CSV import into Shopify DRAFTS, cost sync
+  // and supplier order records. The unconditional requireOperator, reads included:
+  // the status read describes the stored supplier login, and the order list carries
+  // order data and supplier costs. Mounted at its own prefix so the guard only runs
+  // for these routes.
+  app.use('/api/suppliers/deodap', requireOperator, deodapRouter);
   // The audit trail is a read, but a privileged one: it records who changed what.
   // Always behind the full operator requirement, never the writes-only guard, so
   // it cannot be read anonymously even with OPERATOR_PROTECT_READS left at false.

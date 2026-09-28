@@ -90,6 +90,29 @@ describe('the audit trail is privileged, not merely a read', () => {
   });
 });
 
+describe('the DeoDap supplier surface requires an operator for reads as well as writes', () => {
+  // It stores an encrypted supplier login and reports which account is connected,
+  // imports products into Shopify, and lists orders with supplier costs. None of that
+  // may be readable anonymously just because OPERATOR_PROTECT_READS is false.
+  it('deodapRouter is mounted behind the unconditional requireOperator', () => {
+    const line = mountLine('deodapRouter') ?? '';
+    assert.notEqual(line, '', 'deodapRouter is not mounted in app.ts');
+    assert.ok(
+      /requireOperator\b(?!For)/.test(line),
+      `deodapRouter must use requireOperator, not the writes-only or reads-only guard, got: ${line.trim()}`,
+    );
+  });
+
+  it('is mounted at its own prefix, so the guard does not run for other routes', () => {
+    // app.use('/api', requireOperator, router) would run the guard for EVERY later
+    // /api request, locking reads that are meant to follow OPERATOR_PROTECT_READS.
+    assert.ok(
+      APP.includes("app.use('/api/suppliers/deodap', requireOperator, deodapRouter)"),
+      'deodapRouter must be mounted at /api/suppliers/deodap',
+    );
+  });
+});
+
 describe('webhook ADMINISTRATION requires an operator for reads as well as writes', () => {
   // The distinction that matters in this module: the RECEIVER is a delivery
   // endpoint that Shopify calls and must stay public (HMAC secures it), while

@@ -320,7 +320,8 @@ export interface Money {
   raw: string;
 }
 
-export type SupplierClassification = 'TRADELLE' | 'OTHER' | 'UNKNOWN';
+/** Must stay identical to SupplierClassification in suppliers/supplier.types.ts. */
+export type SupplierClassification = 'TRADELLE' | 'DEODAP' | 'OTHER' | 'UNKNOWN';
 
 export interface ProductVariantDto {
   shopifyVariantId: string;

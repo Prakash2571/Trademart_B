@@ -41,14 +41,16 @@ export type SupplierAvailability = 'AVAILABLE' | 'UNAVAILABLE' | 'UNKNOWN';
 /**
  * How the availability was established.
  *
- *   SHOPIFY_BRIDGE  inferred from a Tradelle-imported Shopify product's evidence
- *   MANUAL          an operator verified it inside Tradelle and recorded it
- *   DIRECT_API      a documented Tradelle API said so. NOT AVAILABLE today - there is no
- *                   such API, and nothing may set this until one is configured.
+ *   SHOPIFY_BRIDGE  inferred from the evidence on a Shopify product the supplier's own
+ *                   app imported (Tradelle's or DeoDap's)
+ *   MANUAL          an operator verified it inside Tradelle or DeoDap and recorded it
+ *   DIRECT_API      a documented supplier API said so. NOT AVAILABLE today - neither
+ *                   supplier has one, and nothing may set this until one is configured.
  */
 export type SupplierAvailabilitySource = 'SHOPIFY_BRIDGE' | 'MANUAL' | 'DIRECT_API';
 
-export type SupplierProvider = 'TRADELLE' | 'OTHER' | 'UNKNOWN';
+/** Mirrors SupplierClassification in suppliers/supplier.types.ts. */
+export type SupplierProvider = 'TRADELLE' | 'DEODAP' | 'OTHER' | 'UNKNOWN';
 
 export type VariantCoverage = 'FULL' | 'PARTIAL' | 'NONE' | 'UNKNOWN';
 

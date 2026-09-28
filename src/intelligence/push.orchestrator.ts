@@ -344,7 +344,7 @@ async function pushWithClaim(
   if (sourceability.block === 'SUPPLIER_AVAILABILITY_UNKNOWN') {
     throw new AppError(
       'RESEARCH_SUPPLIER_UNVERIFIED',
-      'This product has not been verified as sourceable from the supplier, so nothing was created. Record a supplier verification (or confirm availability in Tradelle) before pushing.',
+      'This product has not been verified as sourceable from the supplier, so nothing was created. Record a supplier verification (confirm availability in Tradelle or DeoDap) before pushing.',
       { details: { candidateId, reasons: sourceability.reasons } },
     );
   }
@@ -1106,7 +1106,12 @@ async function recordCost(
       supplierProductCost: cost,
       supplierShippingCost: candidate.commercials.shippingCost,
       currencyCode,
-      provider: candidate.source === 'TRADELLE' ? 'TRADELLE' : 'OTHER',
+      // Researched on a supplier Trademart can identify: record the cost against it,
+      // so the pricing and dropshipping views attribute it to the right supplier.
+      provider:
+        candidate.source === 'TRADELLE' || candidate.source === 'DEODAP'
+          ? candidate.source
+          : 'OTHER',
       note: `Recorded from Trademart research candidate ${candidate.id} on push.`,
     });
     return true;

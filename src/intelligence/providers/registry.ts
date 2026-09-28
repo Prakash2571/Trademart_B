@@ -16,6 +16,7 @@
  * Pure: no config, no network.
  */
 
+import { deodapResearchProvider } from './deodap.provider';
 import { manualResearchProvider } from './manual.provider';
 import {
   describeResearchCapabilities,
@@ -41,9 +42,10 @@ export const staticResearchProviders: readonly ResearchProvider[] = Object.freez
   // The operator's own entry is last among the market sources: it is real data and the
   // only one available today, but if a measured source ever answers, it should win.
   manualResearchProvider,
-  // Supplies nothing. Registered so its limitations can be reported rather than
-  // leaving an unexplained blank where Tradelle should be.
+  // Supply nothing. Registered so their limitations can be reported rather than
+  // leaving an unexplained blank where Tradelle or DeoDap should be.
   tradelleResearchProvider,
+  deodapResearchProvider,
 ]);
 
 /**

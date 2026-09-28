@@ -14,6 +14,9 @@ import { config } from '../config';
 import { AuditLogModel } from './models/AuditLog';
 import { IdempotencyKeyModel } from './models/IdempotencyKey';
 import { ProductCandidateModel } from './models/ProductCandidate';
+import { SupplierConnectionModel } from './models/SupplierConnection';
+import { SupplierImportModel } from './models/SupplierImport';
+import { SupplierOrderModel } from './models/SupplierOrder';
 import { WebhookEventModel } from './models/WebhookEvent';
 
 export type DatabaseStatus = 'disabled' | 'connecting' | 'connected' | 'error';
@@ -89,6 +92,12 @@ const INDEXED_MODELS = [
   // Shopify as two draft products. Lazy autoIndex does not enforce that until it has
   // finished building, so it is created deliberately like the others here.
   { name: 'ProductCandidate', model: ProductCandidateModel },
+  // DeoDap: the import ledger's unique { shopDomain, provider, refKey } index IS the claim
+  // that stops one supplier product being created in Shopify twice, and the other two
+  // keep one connection and one order record per shop / Shopify order.
+  { name: 'SupplierConnection', model: SupplierConnectionModel },
+  { name: 'SupplierImport', model: SupplierImportModel },
+  { name: 'SupplierOrder', model: SupplierOrderModel },
 ];
 
 /**

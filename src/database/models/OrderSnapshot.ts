@@ -21,7 +21,7 @@ const lineItemSnapshotSchema = new Schema(
     discountedTotal: { type: Number, default: null },
     supplier: {
       type: String,
-      enum: ['TRADELLE', 'OTHER', 'UNKNOWN'],
+      enum: ['TRADELLE', 'DEODAP', 'OTHER', 'UNKNOWN'],
       default: 'UNKNOWN',
     },
   },
@@ -56,7 +56,7 @@ const orderSnapshotSchema = new Schema(
     total: { type: Number, default: null },
     supplier: {
       type: String,
-      enum: ['TRADELLE', 'OTHER', 'UNKNOWN'],
+      enum: ['TRADELLE', 'DEODAP', 'OTHER', 'UNKNOWN'],
       default: 'UNKNOWN',
     },
     lineItems: { type: [lineItemSnapshotSchema], default: [] },

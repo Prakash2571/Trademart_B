@@ -74,7 +74,16 @@ export type AuditAction =
   | 'RESEARCH_PUSH_DRAFT'
   // Settings
   | 'DROPSHIPPING_SETTINGS_UPDATE'
-  | 'PRICING_RULE_UPDATE';
+  | 'PRICING_RULE_UPDATE'
+  // Supplier connections (DeoDap). Credentials are never part of an entry: only
+  // their kind, the operator's label and a masked identifier.
+  | 'SUPPLIER_SETTINGS_UPDATE'
+  | 'SUPPLIER_CONNECT'
+  | 'SUPPLIER_DISCONNECT'
+  /** A DRAFT product created in Shopify from a supplier file row. */
+  | 'SUPPLIER_IMPORT'
+  /** The supplier order number, status or tracking recorded against a Shopify order. */
+  | 'SUPPLIER_ORDER_UPDATE';
 
 export type AuditResourceType =
   | 'PRODUCT'
@@ -87,7 +96,11 @@ export type AuditResourceType =
   /** A research candidate, identified by its Trademart candidateId. */
   | 'RESEARCH_CANDIDATE'
   /** Store-wide configuration. resourceId is null. */
-  | 'SETTINGS';
+  | 'SETTINGS'
+  /** A supplier connection. resourceId is the provider name, e.g. DEODAP. */
+  | 'SUPPLIER'
+  /** A Shopify order, identified by its GID. */
+  | 'ORDER';
 
 export interface AuditEntryInput {
   action: AuditAction;

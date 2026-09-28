@@ -31,7 +31,7 @@ const productSnapshotSchema = new Schema(
     tags: { type: [String], default: [] },
     supplier: {
       type: String,
-      enum: ['TRADELLE', 'OTHER', 'UNKNOWN'],
+      enum: ['TRADELLE', 'DEODAP', 'OTHER', 'UNKNOWN'],
       default: 'UNKNOWN',
     },
     supplierEvidence: { type: [String], default: [] },

@@ -21,6 +21,7 @@ import {
   type ResearchProvider,
   type ResearchRequest,
 } from './provider.types';
+import { DEODAP_MODES, deodapResearchMode, deodapResearchProvider } from './deodap.provider';
 import { describeResearchSupport, staticResearchProviders } from './registry';
 import { TRADELLE_MODES, tradelleResearchMode, tradelleResearchProvider } from './tradelle.provider';
 import {
@@ -183,6 +184,44 @@ describe('tradelleResearchProvider', () => {
   it('describes the Shopify bridge as the real route, and says it does not scrape', () => {
     assert.ok(TRADELLE_MODES.SHOPIFY_BRIDGE.includes('Shopify'));
     assert.ok(TRADELLE_MODES.DIRECT_API_UNAVAILABLE.includes('does not scrape'));
+  });
+});
+
+/* ===========================================================================
+ * DeoDap: the same honest absence as Tradelle
+ * ======================================================================== */
+
+describe('deodapResearchProvider', () => {
+  it('declares every capability false, like Tradelle', () => {
+    assert.deepEqual(deodapResearchProvider.capabilities, tradelleResearchProvider.capabilities);
+    assert.deepEqual(deodapResearchProvider.capabilities, NO_RESEARCH_CAPABILITIES);
+  });
+
+  it('has no fetch methods', () => {
+    assert.equal(deodapResearchProvider.fetchDemand, undefined);
+    assert.equal(deodapResearchProvider.fetchTrend, undefined);
+    assert.equal(deodapResearchProvider.fetchCompetition, undefined);
+    assert.equal(deodapResearchProvider.fetchSeasonality, undefined);
+  });
+
+  it('explains every absence in its own words', () => {
+    for (const capability of RESEARCH_CAPABILITIES) {
+      const limitation = deodapResearchProvider.limitations?.[capability];
+      assert.ok(limitation !== undefined && limitation.includes('DeoDap'), `${capability} needs a DeoDap reason`);
+    }
+  });
+
+  it('offers the same modes as Tradelle, with no DIRECT_API mode', () => {
+    assert.equal(deodapResearchMode(), 'DIRECT_API_UNAVAILABLE');
+    assert.deepEqual(Object.keys(DEODAP_MODES).sort(), Object.keys(TRADELLE_MODES).sort());
+    assert.ok(DEODAP_MODES.SHOPIFY_BRIDGE.includes('Shopify app'));
+    assert.ok(DEODAP_MODES.DIRECT_API_UNAVAILABLE.includes('does not scrape'));
+  });
+
+  it('is registered, so the capability report names it', () => {
+    assert.ok(staticResearchProviders.includes(deodapResearchProvider));
+    const demand = describeResearchSupport().find((entry) => entry.capability === 'demand');
+    assert.ok(demand?.limitations.some((reason) => reason.includes('DeoDap')));
   });
 });
 

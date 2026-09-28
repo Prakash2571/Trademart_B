@@ -31,6 +31,7 @@ import {
 } from './intelligence.service';
 import type { CurrentSourceability } from './sourceability';
 import { describeResearchSupport } from './providers/registry';
+import { DEODAP_DOCUMENTATION, DEODAP_MODES, deodapResearchMode } from './providers/deodap.provider';
 import { TRADELLE_DOCUMENTATION, TRADELLE_MODES, tradelleResearchMode } from './providers/tradelle.provider';
 import {
   GOOGLE_ADS_RESEARCH_DESCRIPTOR,
@@ -111,6 +112,13 @@ intelligenceRouter.get(
           modes: TRADELLE_MODES,
           documentation: TRADELLE_DOCUMENTATION,
         },
+        // Reported in the same shape as Tradelle, because DeoDap reaches Trademart the
+        // same way: through its own Shopify app, and by hand.
+        deodap: {
+          mode: deodapResearchMode(),
+          modes: DEODAP_MODES,
+          documentation: DEODAP_DOCUMENTATION,
+        },
         unbuiltIntegrations: [
           GOOGLE_ADS_RESEARCH_DESCRIPTOR,
           GOOGLE_TRENDS_RESEARCH_DESCRIPTOR,
@@ -118,13 +126,14 @@ intelligenceRouter.get(
         /*
          * Supplier sourceability, stated as honestly as everything else here.
          *
-         *   manual         an operator verifies in Tradelle and records it - real, and the
-         *                  primary path today.
-         *   shopifyBridge  a Tradelle-imported Shopify product proves supplier IDENTITY,
-         *                  but Shopify does not report Tradelle's current stock, so this
-         *                  supports "appears Tradelle-sourced", never "AVAILABLE now".
-         *   direct         no documented Tradelle production API exists, so there is no
-         *                  live availability poll. Unavailable until one is configured.
+         *   manual         an operator verifies in Tradelle or DeoDap and records it -
+         *                  real, and the primary path today.
+         *   shopifyBridge  a Shopify product the supplier's app imported proves supplier
+         *                  IDENTITY, but Shopify does not report the supplier's current
+         *                  stock, so this supports "appears supplier-sourced", never
+         *                  "AVAILABLE now".
+         *   direct         neither Tradelle nor DeoDap has a documented production API,
+         *                  so there is no live availability poll.
          */
         supplier: {
           productAvailability: 'AVAILABLE',
@@ -134,11 +143,11 @@ intelligenceRouter.get(
             shopifyBridge: 'IDENTITY_ONLY',
             direct: 'API_UNAVAILABLE',
           },
-          note: 'Supplier availability is established by manual Tradelle verification or by Shopify-bridge identity evidence. There is no live Tradelle API, so current stock is never polled automatically - a recorded verification ages and must be refreshed.',
+          note: 'Supplier availability is established by manual verification in Tradelle or DeoDap, or by Shopify-bridge identity evidence. Neither supplier has a live API, so current stock is never polled automatically - a recorded verification ages and must be refreshed.',
         },
       },
       {
-        note: 'Store performance and fulfillment history are read from Shopify. Demand, trend, competition and seasonality come only from figures an operator records by hand, because Tradelle publishes no API and the keyword integrations are not built.',
+        note: 'Store performance and fulfillment history are read from Shopify. Demand, trend, competition and seasonality come only from figures an operator records by hand, because Tradelle and DeoDap publish no API and the keyword integrations are not built.',
       },
     );
   }),
@@ -315,7 +324,7 @@ intelligenceRouter.get(
         opportunityRecommendation: gate.opportunityRecommendation,
         note:
           candidate.supplier === null
-            ? 'This candidate has not been verified as sourceable from a supplier. Record a Tradelle verification to make it pushable.'
+            ? 'This candidate has not been verified as sourceable from a supplier. Record a supplier verification (Tradelle or DeoDap) to make it pushable.'
             : null,
       },
     );

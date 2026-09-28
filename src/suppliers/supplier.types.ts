@@ -7,7 +7,12 @@
  * today - it documents a Shopify integration, not a public REST API).
  */
 
-export type SupplierClassification = 'TRADELLE' | 'OTHER' | 'UNKNOWN';
+/**
+ * DEODAP is identified from the vendor/tag Trademart writes when it imports a
+ * DeoDap product, or from SKU prefixes the operator configures - see
+ * suppliers/deodap/deodap.identify.ts.
+ */
+export type SupplierClassification = 'TRADELLE' | 'DEODAP' | 'OTHER' | 'UNKNOWN';
 
 /**
  * The Shopify-derived signals a provider is allowed to inspect.

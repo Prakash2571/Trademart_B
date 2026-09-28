@@ -99,6 +99,17 @@ Notes on the deliberate choices in that table:
 | GET | `/api/costs` | OPERATOR (writes → open GET) | session / API key | n/a | no | yes | no |
 | PUT | `/api/costs` | OPERATOR (writes) | session / API key | yes | no | yes | yes |
 | DELETE | `/api/costs` | OPERATOR (writes) | session / API key | yes | no | yes | yes |
+| GET | `/api/suppliers/deodap/status` | **OPERATOR** | session / API key | n/a | no | degrades | no |
+| PUT | `/api/suppliers/deodap/settings` | **OPERATOR** | session / API key | yes | no | yes | yes |
+| PUT | `/api/suppliers/deodap/credentials` | **OPERATOR** | session / API key | yes | no | yes (+ `TOKEN_ENCRYPTION_KEY`) | yes |
+| DELETE | `/api/suppliers/deodap/credentials` | **OPERATOR** | session / API key | yes | no | yes | yes |
+| POST | `/api/suppliers/deodap/import/preview` | **OPERATOR** | session / API key | yes | no | degrades | no |
+| POST | `/api/suppliers/deodap/import` | **OPERATOR** | session / API key | yes | **yes — fails closed** | yes | yes |
+| GET | `/api/suppliers/deodap/imports` | **OPERATOR** | session / API key | n/a | no | yes | no |
+| POST | `/api/suppliers/deodap/sync/preview` | **OPERATOR** | session / API key | yes | no | yes | no |
+| POST | `/api/suppliers/deodap/sync` | **OPERATOR** | session / API key | yes | **yes — fails closed** | yes | yes |
+| GET | `/api/suppliers/deodap/orders` | **OPERATOR** | session / API key | n/a | no | degrades | no |
+| PUT | `/api/suppliers/deodap/orders/:id` | **OPERATOR** | session / API key | yes | no | yes | yes |
 | PUT | `/api/dropshipping/settings` | OPERATOR (writes) | session / API key | yes | no | yes | yes |
 | POST | `/api/intelligence/candidates` | OPERATOR (writes) | session / API key | yes | no | yes | yes |
 | PATCH | `/api/intelligence/candidates/:id` | OPERATOR (writes) | session / API key | yes | no | yes | yes |
@@ -158,6 +169,21 @@ state, so this stays true.
 false, which it cannot be in production. They are read-only companions of the mutation
 on the same router; splitting the routers would buy nothing in a production deployment
 where reads are protected anyway.
+
+## The DeoDap routes
+
+All of `/api/suppliers/deodap/*` is mounted with the unconditional `requireOperator`,
+at its own prefix (asserted in `auth.wiring.test.ts`). Even the reads are privileged:
+`status` describes the stored supplier login (kind, label, masked identifier - never the
+credential itself), and `orders` lists Shopify orders with supplier costs.
+
+The two `*/preview` POSTs read a CSV file and compute; they write nothing to Shopify or
+MongoDB. They are POSTs only because a file does not fit in a query string. The two
+routes that do write in bulk - `import` (Shopify DRAFT products) and `sync` (recorded
+supplier costs) - honour `Idempotency-Key` and refuse outright without the database.
+Nothing on this surface calls DeoDap: there is no DeoDap API yet
+(`src/suppliers/deodap/deodap.api.ts`). DeoDap orders reach DeoDap through DeoDap's own
+Shopify app, as Tradelle's do, and the `orders` read only reports what Shopify shows.
 
 ## Changes made in hardening pass 2
 
