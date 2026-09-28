@@ -9,9 +9,27 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  defaultVerificationProvider,
   validateSupplierVerification,
+  verificationEvidence,
   type SupplierVerificationInput,
 } from './supplier.validation';
+
+describe('which supplier a verification is for', () => {
+  it('defaults to where the candidate was researched, and to Tradelle otherwise', () => {
+    assert.equal(defaultVerificationProvider('DEODAP'), 'DEODAP');
+    assert.equal(defaultVerificationProvider('TRADELLE'), 'TRADELLE');
+    // Unchanged for everything that existed before DeoDap.
+    assert.equal(defaultVerificationProvider('MANUAL'), 'TRADELLE');
+  });
+
+  it('names where the operator looked in the evidence', () => {
+    // The Tradelle wording is exactly what was stored before, so old and new rows agree.
+    assert.equal(verificationEvidence('TRADELLE'), 'Operator verified availability in Tradelle');
+    assert.equal(verificationEvidence('DEODAP'), 'Operator verified availability in DeoDap');
+    assert.equal(verificationEvidence('OTHER'), 'Operator verified availability with the supplier');
+  });
+});
 
 function input(overrides: Partial<SupplierVerificationInput> = {}): SupplierVerificationInput {
   return {
@@ -26,6 +44,15 @@ function input(overrides: Partial<SupplierVerificationInput> = {}): SupplierVeri
 describe('validateSupplierVerification', () => {
   it('accepts a minimal valid verification', () => {
     assert.deepEqual(validateSupplierVerification(input()), []);
+  });
+
+  it('accepts DeoDap as a supplier, alongside Tradelle', () => {
+    assert.deepEqual(
+      validateSupplierVerification(
+        input({ provider: 'DEODAP', sourceUrl: 'https://deodap.example/p/1', supplierProductId: '1234' }),
+      ),
+      [],
+    );
   });
 
   it('rejects an unknown provider or availability', () => {

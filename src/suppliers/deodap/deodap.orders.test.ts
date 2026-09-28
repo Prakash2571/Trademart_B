@@ -1,22 +1,35 @@
 /**
- * DeoDap orders: which lines are DeoDap's, what DeoDap will charge, and what still
- * needs placing.
+ * DeoDap orders: which lines are DeoDap's, who sends each one to DeoDap, what DeoDap
+ * will charge, and what needs a person.
+ *
+ * The rule under test above all others: with DeoDap's Shopify app doing the ordering
+ * (the Tradelle model), an order the app never picked up must still surface - and a
+ * product Trademart imported itself is never assumed to be the app's.
  */
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { AppError } from '../../common/errors';
-import type { OrderDto, OrderLineItemDto } from '../../shopify/shopify.types';
+import { DEFAULT_SHIPPING_SLA } from '../../dropshipping/dropshipping.types';
+import type { FulfillmentDto, OrderDto, OrderLineItemDto } from '../../shopify/shopify.types';
 import type { ManualCost } from '../cost';
 import {
   buildDeodapOrderView,
   extractDeodapLines,
-  needsForwarding,
+  orderRoute,
   stageTimestamps,
   validateForwardingUpdate,
+  type DeodapOrderContext,
   type ForwardingRecord,
 } from './deodap.orders';
+import type { DeodapOrderFlow } from './deodap.settings';
+
+const PLACED_AT = '2026-09-01T10:00:00.000Z';
+/** Two hours after the order: inside the default 24h processing SLA. */
+const SOON = new Date('2026-09-01T12:00:00.000Z');
+/** Thirty hours after the order: past it. */
+const LATE = new Date('2026-09-02T16:00:00.000Z');
 
 function line(overrides: Partial<OrderLineItemDto>): OrderLineItemDto {
   return {
@@ -41,7 +54,7 @@ function order(lines: OrderLineItemDto[], overrides: Partial<OrderDto> = {}): Or
   return {
     shopifyOrderId: 'gid://shopify/Order/1',
     name: '#1001',
-    createdAt: '2026-09-01T10:00:00.000Z',
+    createdAt: PLACED_AT,
     processedAt: null,
     financialStatus: 'PAID',
     fulfillmentStatus: 'UNFULFILLED',
@@ -62,7 +75,27 @@ function order(lines: OrderLineItemDto[], overrides: Partial<OrderDto> = {}): Or
   };
 }
 
-const DEODAP_LINE = line({
+function fulfillment(overrides: Partial<FulfillmentDto> = {}): FulfillmentDto {
+  return {
+    id: 'gid://shopify/Fulfillment/1',
+    status: 'SUCCESS',
+    displayStatus: 'IN_TRANSIT',
+    createdAt: '2026-09-02T09:00:00.000Z',
+    updatedAt: null,
+    estimatedDeliveryAt: null,
+    inTransitAt: '2026-09-02T10:00:00.000Z',
+    deliveredAt: null,
+    trackingCompany: 'Delhivery',
+    trackingNumber: 'DL123',
+    trackingUrl: null,
+    tracking: [{ company: 'Delhivery', number: 'DL123', url: null }],
+    events: [],
+    ...overrides,
+  };
+}
+
+/** Identified as DeoDap in Shopify, NOT created by Trademart: the app's product. */
+const APP_LINE = line({
   shopifyLineItemId: 'gid://shopify/LineItem/1',
   title: 'Mini Fan',
   quantity: 2,
@@ -73,6 +106,7 @@ const DEODAP_LINE = line({
   supplierEvidence: ['vendor="DeoDap"'],
 });
 
+/** Created by Trademart's CSV import (in the ledger), vendor changed to the store brand. */
 const LEDGER_LINE = line({
   shopifyLineItemId: 'gid://shopify/LineItem/2',
   title: 'Jar',
@@ -88,7 +122,14 @@ const OTHER_LINE = line({ shopifyLineItemId: 'gid://shopify/LineItem/3', vendor:
 
 const REFS = new Map([['gid://shopify/ProductVariant/21', 'DD-102']]);
 
-function forwarding(status: ForwardingRecord['status']): ForwardingRecord {
+function context(flow: DeodapOrderFlow, now: Date = SOON): DeodapOrderContext {
+  return { flow, sla: DEFAULT_SHIPPING_SLA, now };
+}
+
+function forwarding(
+  status: ForwardingRecord['status'],
+  overrides: Partial<ForwardingRecord> = {},
+): ForwardingRecord {
   return {
     status,
     supplierOrderId: null,
@@ -102,12 +143,27 @@ function forwarding(status: ForwardingRecord['status']): ForwardingRecord {
     deliveredAt: null,
     updatedAt: null,
     updatedBy: null,
+    ...overrides,
   };
+}
+
+function view(
+  current: OrderDto,
+  flow: DeodapOrderFlow,
+  options: { now?: Date; record?: ForwardingRecord | null; costs?: Map<string, ManualCost> } = {},
+) {
+  return buildDeodapOrderView(
+    current,
+    extractDeodapLines(current, REFS, flow),
+    options.record ?? null,
+    options.costs ?? new Map(),
+    context(flow, options.now ?? SOON),
+  );
 }
 
 describe('extractDeodapLines', () => {
   it('takes identified DeoDap lines and lines the import ledger knows, and counts the rest', () => {
-    const result = extractDeodapLines(order([DEODAP_LINE, LEDGER_LINE, OTHER_LINE]), REFS);
+    const result = extractDeodapLines(order([APP_LINE, LEDGER_LINE, OTHER_LINE]), REFS, 'MANUAL');
     assert.deepEqual(
       result.lines.map((entry) => entry.sku),
       ['DD-100', 'DD-102'],
@@ -116,69 +172,161 @@ describe('extractDeodapLines', () => {
     assert.equal(result.lines[1]?.supplierRef, 'DD-102');
     assert.ok(result.lines[1]?.evidence.includes('imported from DeoDap by Trademart'));
   });
+
+  it('routes app products to DeoDap\u2019s app, and Trademart\u2019s own imports to the operator', () => {
+    const result = extractDeodapLines(order([APP_LINE, LEDGER_LINE]), REFS, 'SHOPIFY_APP');
+    assert.deepEqual(
+      result.lines.map((entry) => [entry.sku, entry.route, entry.importedByTrademart]),
+      [
+        ['DD-100', 'DEODAP_APP', false],
+        ['DD-102', 'MANUAL', true],
+      ],
+    );
+    assert.equal(orderRoute(result.lines), 'MIXED');
+  });
+
+  it('routes everything to the operator in the manual flow', () => {
+    const result = extractDeodapLines(order([APP_LINE, LEDGER_LINE]), REFS, 'MANUAL');
+    assert.equal(orderRoute(result.lines), 'MANUAL');
+  });
 });
 
-describe('needsForwarding', () => {
-  const paid = order([DEODAP_LINE]);
+describe('orders sent by DeoDap\u2019s Shopify app', () => {
+  it('asks nothing of the operator while the app still has time', () => {
+    const result = view(order([APP_LINE]), 'SHOPIFY_APP');
+    assert.equal(result.route, 'DEODAP_APP');
+    assert.equal(result.shipment.normalizedStatus, 'AWAITING_SUPPLIER');
+    assert.deepEqual(result.attention, []);
+    assert.equal(result.needsAction, false);
+  });
 
-  it('is true for an open order not yet placed with DeoDap', () => {
-    assert.equal(needsForwarding(paid, null), true);
-    assert.equal(needsForwarding(paid, forwarding('NOT_PLACED')), true);
+  it('flags a paid order the app has not dispatched within the SLA', () => {
+    const result = view(order([APP_LINE]), 'SHOPIFY_APP', { now: LATE });
+    assert.equal(result.needsAction, true);
+    assert.ok(result.attention.some((reason) => reason.includes('has not dispatched it')));
+  });
+
+  it('flags a cash-on-delivery order the app has not dispatched, which the paid-only SLA would miss', () => {
+    const result = view(order([APP_LINE], { financialStatus: 'PENDING' }), 'SHOPIFY_APP', { now: LATE });
+    assert.equal(result.shipment.delayed, false, 'the dashboard SLA only watches paid orders');
+    assert.ok(result.attention.some((reason) => reason.includes('cash on delivery')));
+    assert.ok(result.attention.some((reason) => reason.includes("DeoDap's app")));
+  });
+
+  it('reports progress and tracking the app wrote into Shopify', () => {
+    const result = view(
+      order([APP_LINE], { fulfillmentStatus: 'FULFILLED', fulfillments: [fulfillment()] }),
+      'SHOPIFY_APP',
+      { now: LATE },
+    );
+    assert.equal(result.shipment.normalizedStatus, 'IN_TRANSIT');
+    assert.deepEqual(result.shipment.trackingNumbers, ['DL123']);
+    assert.equal(result.needsAction, false);
+  });
+
+  it('still asks the operator to place items Trademart imported itself', () => {
+    const result = view(order([APP_LINE, LEDGER_LINE]), 'SHOPIFY_APP');
+    assert.equal(result.route, 'MIXED');
+    assert.ok(result.attention.some((reason) => reason.includes("Trademart's CSV import")));
+  });
+});
+
+describe('orders placed by hand', () => {
+  it('flags an order not yet placed with DeoDap', () => {
+    const result = view(order([APP_LINE]), 'MANUAL');
+    assert.equal(result.route, 'MANUAL');
+    assert.ok(result.attention.some((reason) => reason.startsWith('Not placed with DeoDap')));
   });
 
   it('includes cash-on-delivery orders, whose payment is still pending', () => {
-    assert.equal(needsForwarding(order([DEODAP_LINE], { financialStatus: 'PENDING' }), null), true);
+    assert.equal(view(order([APP_LINE], { financialStatus: 'PENDING' }), 'MANUAL').needsAction, true);
   });
 
-  it('is false once placed, when cancelled, or when already fulfilled', () => {
-    assert.equal(needsForwarding(paid, forwarding('PLACED')), false);
-    assert.equal(needsForwarding(order([DEODAP_LINE], { cancelledAt: '2026-09-02T00:00:00Z' }), null), false);
-    assert.equal(needsForwarding(order([DEODAP_LINE], { fulfillmentStatus: 'FULFILLED' }), null), false);
+  it('asks nothing once placed, while there is still time', () => {
+    assert.equal(view(order([APP_LINE]), 'MANUAL', { record: forwarding('PLACED') }).needsAction, false);
   });
 
-  it('is true for a recorded problem, whatever else is true', () => {
-    assert.equal(needsForwarding(order([DEODAP_LINE], { fulfillmentStatus: 'FULFILLED' }), forwarding('PROBLEM')), true);
+  it('flags tracking recorded here that the Shopify order does not have', () => {
+    const result = view(order([APP_LINE]), 'MANUAL', {
+      now: LATE,
+      record: forwarding('SHIPPED', { trackingNumber: 'DL999' }),
+    });
+    assert.equal(result.attention.length, 1, 'the stale "not dispatched" signal is left out');
+    assert.match(result.attention[0] ?? '', /Fulfil the order in Shopify/);
+  });
+
+  it('is satisfied once the same tracking is on the Shopify order', () => {
+    const result = view(
+      order([APP_LINE], { fulfillmentStatus: 'FULFILLED', fulfillments: [fulfillment()] }),
+      'MANUAL',
+      { now: LATE, record: forwarding('SHIPPED', { trackingNumber: ' dl123 ' }) },
+    );
+    assert.equal(result.needsAction, false);
   });
 });
 
-describe('buildDeodapOrderView', () => {
+describe('what always applies', () => {
+  it('flags a recorded problem, even on a cancelled order', () => {
+    const result = view(order([APP_LINE], { cancelledAt: '2026-09-02T00:00:00Z' }), 'SHOPIFY_APP', {
+      record: forwarding('PROBLEM', { note: 'Out of stock at DeoDap' }),
+    });
+    assert.deepEqual(result.attention, ['You recorded a problem with DeoDap: Out of stock at DeoDap']);
+  });
+
+  it('asks nothing of a cancelled or refunded order', () => {
+    assert.equal(
+      view(order([APP_LINE], { cancelledAt: '2026-09-02T00:00:00Z' }), 'MANUAL', { now: LATE }).needsAction,
+      false,
+    );
+    assert.equal(
+      view(order([APP_LINE], { financialStatus: 'REFUNDED' }), 'SHOPIFY_APP', { now: LATE }).needsAction,
+      false,
+    );
+  });
+
+  it('flags a DeoDap cancellation the Shopify order does not reflect', () => {
+    const result = view(order([APP_LINE]), 'SHOPIFY_APP', { now: LATE, record: forwarding('CANCELLED') });
+    assert.equal(result.attention.length, 1);
+    assert.match(result.attention[0] ?? '', /Cancel or refund it in Shopify/);
+  });
+
+  it('asks nothing of an order already fulfilled in Shopify', () => {
+    const result = view(
+      order([APP_LINE], { fulfillmentStatus: 'FULFILLED', fulfillments: [fulfillment()] }),
+      'MANUAL',
+    );
+    assert.equal(result.needsAction, false);
+  });
+});
+
+describe('supplier cost', () => {
   const costs = new Map<string, ManualCost>([
     ['gid://shopify/ProductVariant/11', { amount: 100, currencyCode: 'INR', shippingCost: 20 }],
     ['gid://shopify/ProductVariant/21', { amount: 40, currencyCode: 'INR', shippingCost: null }],
   ]);
 
   it('totals what DeoDap will charge, shipping included, per unit ordered', () => {
-    const current = order([DEODAP_LINE, LEDGER_LINE]);
-    const view = buildDeodapOrderView(current, extractDeodapLines(current, REFS), null, costs);
+    const result = view(order([APP_LINE, LEDGER_LINE]), 'MANUAL', { costs });
     // 2 x (100 + 20) + 1 x 40
-    assert.deepEqual(view.supplierCost, { total: 280, currencyCode: 'INR', complete: true });
-    assert.equal(view.needsAction, true);
+    assert.deepEqual(result.supplierCost, { total: 280, currencyCode: 'INR', complete: true });
   });
 
   it('marks the total incomplete when a line has no recorded cost', () => {
-    const current = order([DEODAP_LINE, LEDGER_LINE]);
-    const view = buildDeodapOrderView(
-      current,
-      extractDeodapLines(current, REFS),
-      null,
-      new Map([['gid://shopify/ProductVariant/11', { amount: 100, currencyCode: 'INR' }]]),
-    );
-    assert.equal(view.supplierCost.total, 200);
-    assert.equal(view.supplierCost.complete, false);
+    const result = view(order([APP_LINE, LEDGER_LINE]), 'MANUAL', {
+      costs: new Map([['gid://shopify/ProductVariant/11', { amount: 100, currencyCode: 'INR' }]]),
+    });
+    assert.equal(result.supplierCost.total, 200);
+    assert.equal(result.supplierCost.complete, false);
   });
 
   it('refuses to add up costs in different currencies', () => {
-    const current = order([DEODAP_LINE, LEDGER_LINE]);
-    const view = buildDeodapOrderView(
-      current,
-      extractDeodapLines(current, REFS),
-      null,
-      new Map<string, ManualCost>([
+    const result = view(order([APP_LINE, LEDGER_LINE]), 'MANUAL', {
+      costs: new Map<string, ManualCost>([
         ['gid://shopify/ProductVariant/11', { amount: 100, currencyCode: 'INR' }],
         ['gid://shopify/ProductVariant/21', { amount: 1, currencyCode: 'USD' }],
       ]),
-    );
-    assert.equal(view.supplierCost.total, null);
+    });
+    assert.equal(result.supplierCost.total, null);
   });
 });
 

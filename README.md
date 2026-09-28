@@ -525,13 +525,13 @@ document and the code disagree.
 | PUT | `/api/costs` | Set a manual cost for a product/variant |
 | DELETE | `/api/costs` | Remove a manual cost (`?productId=&variantId=`) |
 | GET | `/api/suppliers/deodap/status` | DeoDap settings, connection (masked), API availability |
-| PUT | `/api/suppliers/deodap/settings` | SKU prefixes, currency, vendor, import pricing defaults |
+| PUT | `/api/suppliers/deodap/settings` | Order flow (DeoDap's Shopify app or manual), SKU prefixes, currency, vendor, import pricing defaults |
 | PUT / DELETE | `/api/suppliers/deodap/credentials` | Store (encrypted) or remove a DeoDap login / API key |
 | POST | `/api/suppliers/deodap/import/preview` | Read and price a DeoDap CSV; writes nothing |
 | POST | `/api/suppliers/deodap/import` | Create up to 10 previewed products as Shopify drafts |
 | GET | `/api/suppliers/deodap/imports` | The DeoDap import ledger |
 | POST | `/api/suppliers/deodap/sync/preview` · `/sync` | Match a newer price list; record chosen cost changes |
-| GET | `/api/suppliers/deodap/orders` | Shopify orders with DeoDap products and what was recorded |
+| GET | `/api/suppliers/deodap/orders` | Shopify orders with DeoDap products: route, Shopify progress and tracking, what needs you |
 | PUT | `/api/suppliers/deodap/orders/:id` | Record the DeoDap order number, status and tracking |
 
 ### Error codes
@@ -675,17 +675,27 @@ on the store, products classify as `OTHER` or `UNKNOWN`. Once it is, inspect a
 real imported product and extend the markers in
 `src/suppliers/tradelle/tradelle.provider.ts`.
 
-**DeoDap:** products are recognised by the vendor/tag "DeoDap" or a configured SKU
-prefix. DeoDap publishes no verifiable API, so nothing is sent to DeoDap. Instead,
-under `/api/suppliers/deodap`:
+**DeoDap: the same model as Tradelle.** DeoDap publishes no public API either, so
+Trademart never calls it. DeoDap's own Shopify app is the bridge:
 
-- DeoDap credentials are stored encrypted with `TOKEN_ENCRYPTION_KEY`.
-- A DeoDap CSV is imported as Shopify **drafts**, with the DeoDap cost recorded per
-  variant.
-- A newer price list updates those costs.
-- DeoDap order numbers and tracking are recorded against Shopify orders.
+```
+Trademart -> Shopify API -> Shopify store -> DeoDap Shopify app -> DeoDap fulfilment
+```
 
-See [docs/DEODAP.md](docs/DEODAP.md), including where an API client plugs in.
+- **Recognition.** Products and order lines are recognised by a vendor, tag or
+  fulfillment service containing "DeoDap", or by a configured SKU prefix. The provider
+  declares the same capabilities as Tradelle.
+- **Orders.** `/api/suppliers/deodap/orders` shows each DeoDap order's progress and
+  tracking from Shopify. It flags orders that DeoDap's app has not dispatched within the
+  dropshipping processing SLA.
+- **Research.** Candidates can be researched on DeoDap and their availability verified
+  there.
+
+Stores that do not use the app can instead import a DeoDap CSV as Shopify **drafts**,
+update costs from a newer price list, and record DeoDap order numbers and tracking by
+hand. The order flow is a setting on the DeoDap page.
+
+See [docs/DEODAP.md](docs/DEODAP.md), including where an API client would plug in.
 
 ---
 
@@ -828,8 +838,8 @@ src/
 
 ## Not implemented (intentionally)
 
-Direct Tradelle API · a DeoDap API client (DeoDap is file-based, see
-[docs/DEODAP.md](docs/DEODAP.md)) · Meta/Google Ads · automated campaigns ·
+Direct Tradelle API · a direct DeoDap API client (DeoDap works through its Shopify app,
+see [docs/DEODAP.md](docs/DEODAP.md)) · Meta/Google Ads · automated campaigns ·
 automatic supplier ordering · payment processing · multi-tenant architecture ·
 subscription billing · microservices · Kafka · Redis · Kubernetes · queues ·
 AI recommendations · production deployment.

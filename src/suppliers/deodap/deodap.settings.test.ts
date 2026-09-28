@@ -23,11 +23,21 @@ function isValidationError(error: unknown): boolean {
 }
 
 describe('validateDeodapSettings', () => {
+  it('defaults to DeoDap\u2019s Shopify app placing orders, as with Tradelle', () => {
+    assert.equal(defaultDeodapSettings().orderFlow, 'SHOPIFY_APP');
+  });
+
+  it('switches the order flow, in any case', () => {
+    assert.equal(validateDeodapSettings({ orderFlow: 'manual' }, defaultDeodapSettings()).orderFlow, 'MANUAL');
+    assert.throws(() => validateDeodapSettings({ orderFlow: 'API' }, defaultDeodapSettings()), isValidationError);
+  });
+
   it('updates only the fields sent', () => {
     const next = validateDeodapSettings(
       { markupPercent: 80, skuPrefixes: [' DD- ', 'dd-', 'DEO'], currencyCode: 'inr' },
       defaultDeodapSettings(),
     );
+    assert.equal(next.orderFlow, 'SHOPIFY_APP');
     assert.equal(next.markupPercent, 80);
     assert.deepEqual(next.skuPrefixes, ['DD-', 'DEO']);
     assert.equal(next.currencyCode, 'INR');
@@ -63,7 +73,13 @@ describe('validateDeodapSettings', () => {
 
 describe('readStoredSettings', () => {
   it('falls back to defaults for missing or invalid stored fields only', () => {
-    const settings = readStoredSettings({ markupPercent: 70, priceRounding: 'bogus', skuPrefixes: ['DD-'] });
+    const settings = readStoredSettings({
+      markupPercent: 70,
+      priceRounding: 'bogus',
+      skuPrefixes: ['DD-'],
+      orderFlow: 'MANUAL',
+    });
+    assert.equal(settings.orderFlow, 'MANUAL');
     assert.equal(settings.markupPercent, 70);
     assert.equal(settings.priceRounding, 'integer');
     assert.deepEqual(settings.skuPrefixes, ['DD-']);

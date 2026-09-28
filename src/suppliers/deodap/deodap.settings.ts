@@ -4,8 +4,9 @@
  * Two different kinds of data live on the DeoDap connection record, and they are
  * handled very differently:
  *
- *   settings      Not secret. SKU prefixes, the currency DeoDap charges in, and the
- *                 defaults the CSV importer prices with. Returned by the API.
+ *   settings      Not secret. How orders reach DeoDap, SKU prefixes, the currency
+ *                 DeoDap charges in, and the defaults the CSV importer prices with.
+ *                 Returned by the API.
  *   credentials   Secret. An API key or a DeoDap account login. Encrypted with
  *                 TOKEN_ENCRYPTION_KEY before storage (common/crypto.ts), NEVER
  *                 returned by any route, and not used by anything yet, because there
@@ -34,7 +35,22 @@ import {
  */
 export type DeodapPricingMode = 'MARKUP' | 'RETAIL';
 
+/**
+ * How orders for DeoDap products reach DeoDap. The same bridge Trademart relies on for
+ * Tradelle, or the operator by hand.
+ *
+ *   SHOPIFY_APP  DeoDap's own Shopify app imports products into Shopify and picks up
+ *                the Shopify orders for them. Trademart manages the products and
+ *                watches the orders move in Shopify; it never talks to DeoDap.
+ *   MANUAL       The operator places every order with DeoDap and records it here.
+ *
+ * Products created by Trademart's CSV import are not known to DeoDap's app, so their
+ * orders are treated as MANUAL whichever flow is set (see deodap.orders.ts).
+ */
+export type DeodapOrderFlow = 'SHOPIFY_APP' | 'MANUAL';
+
 export interface DeodapSettings {
+  orderFlow: DeodapOrderFlow;
   /** SKU prefixes that identify a DeoDap product. Empty means "do not match on SKU". */
   skuPrefixes: string[];
   /** The currency DeoDap charges in. DeoDap is an Indian supplier, so INR by default. */
@@ -57,6 +73,10 @@ export interface DeodapSettings {
 }
 
 export const DEFAULT_DEODAP_SETTINGS: Readonly<DeodapSettings> = Object.freeze({
+  // The Tradelle model: the supplier's Shopify app does the ordering. Safe as a default
+  // because an order the app never picks up still surfaces - it breaches the
+  // dropshipping processing SLA and is flagged on the DeoDap orders page.
+  orderFlow: 'SHOPIFY_APP',
   skuPrefixes: [],
   currencyCode: 'INR',
   vendorName: DEODAP_VENDOR,
@@ -71,6 +91,7 @@ export const MAX_MARKUP_PERCENT = 1000;
 const MAX_VENDOR_LENGTH = 100;
 export const PRICE_ROUNDINGS: readonly PriceRounding[] = ['none', 'charm99', 'integer'];
 export const PRICING_MODES: readonly DeodapPricingMode[] = ['MARKUP', 'RETAIL'];
+export const ORDER_FLOWS: readonly DeodapOrderFlow[] = ['SHOPIFY_APP', 'MANUAL'];
 
 /** A fresh copy of the defaults, so callers can never mutate the frozen object's array. */
 export function defaultDeodapSettings(): DeodapSettings {
@@ -139,6 +160,14 @@ export function validatePricingMode(raw: unknown): DeodapPricingMode {
   return value as DeodapPricingMode;
 }
 
+export function validateOrderFlow(raw: unknown): DeodapOrderFlow {
+  const value = typeof raw === 'string' ? raw.trim().toUpperCase() : raw;
+  if (typeof value !== 'string' || !(ORDER_FLOWS as readonly string[]).includes(value)) {
+    fail(`orderFlow must be one of ${ORDER_FLOWS.join(', ')}.`);
+  }
+  return value as DeodapOrderFlow;
+}
+
 export function validateCurrencyCode(raw: unknown): string {
   if (!isExplicitCurrencyCode(raw)) {
     fail('currencyCode must be a 3-letter currency code, for example INR.');
@@ -167,6 +196,7 @@ export function validateDeodapSettings(
   current: DeodapSettings,
 ): DeodapSettings {
   const next: DeodapSettings = { ...current, skuPrefixes: [...current.skuPrefixes] };
+  if (body['orderFlow'] !== undefined) next.orderFlow = validateOrderFlow(body['orderFlow']);
   if (body['skuPrefixes'] !== undefined) next.skuPrefixes = validateSkuPrefixes(body['skuPrefixes']);
   if (body['currencyCode'] !== undefined) next.currencyCode = validateCurrencyCode(body['currencyCode']);
   if (body['vendorName'] !== undefined) next.vendorName = validateVendorName(body['vendorName']);

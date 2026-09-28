@@ -254,7 +254,7 @@ intelligenceWriteRouter.post(
 );
 
 /**
- * Record a supplier (Tradelle) verification: whether this product can be SOURCED.
+ * Record a supplier (Tradelle or DeoDap) verification: whether this product can be SOURCED.
  *
  * This is EVIDENCE recorded by a human who looked. `checkedAt` is set server-side to now,
  * so freshness ages from a genuine verification. The supplied URL is stored as evidence and

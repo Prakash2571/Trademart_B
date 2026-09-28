@@ -1,20 +1,25 @@
 /**
- * DeoDap provider.
+ * DeoDap provider - the same shape as Tradelle.
  *
- * DeoDap is an Indian wholesale and dropshipping supplier. It has not published an
- * API that could be verified (see deodap.api.ts), so, like Tradelle, the only
- * capability declared here is identification. Everything else is false, with the
- * reason and the manual way to do it written out for the Suppliers page.
+ * DeoDap is an Indian wholesale and dropshipping supplier. Like Tradelle, it has no
+ * public API that could be verified (see deodap.api.ts), but it does have its own
+ * Shopify app, listed on the Shopify App Store. So the working bridge is the same:
  *
- * What DOES work today is not a provider capability in this sense, because none of it
- * calls DeoDap:
- *   - importing a DeoDap product CSV into Shopify as drafts (deodap.service.ts)
- *   - updating recorded costs from a newer DeoDap price list
- *   - recording DeoDap order numbers and tracking against Shopify orders
+ *   Trademart -> Shopify API -> Shopify store -> DeoDap Shopify app -> DeoDap fulfilment
+ *
+ * DeoDap's app brings products into Shopify and picks up the Shopify orders for them.
+ * Trademart manages those products through Shopify and watches the orders move there;
+ * it never calls DeoDap. The two capabilities declared are therefore the Tradelle
+ * pair: identification, and products reaching Shopify through the supplier's app.
+ *
+ * What the app writes into Shopify has not been verified from here. Identification
+ * therefore also takes SKU prefixes the operator configures, and the orders page can
+ * be switched to MANUAL for a store that does not use the app (deodap.settings.ts).
  *
  * No method below returns an invented number. getSupplierCost/getShippingCost are
  * deliberately absent rather than returning null, so there is nothing for a caller to
- * mistake for a working feed.
+ * mistake for a working feed. Costs come from Shopify's cost per item (if the app
+ * fills it in), a manual cost, or a DeoDap price list.
  */
 
 import {
@@ -27,30 +32,31 @@ import { collectDeodapEvidence } from './deodap.identify';
 export const deodapProvider: SupplierProvider = {
   providerName: 'DEODAP',
 
+  // Declared, not inferred - the same honesty rule as Tradelle.
   capabilities: {
     ...NO_SUPPLIER_CAPABILITIES,
     identifyProduct: true,
+    shopifyIntegration: true,
   },
 
   limitations: {
-    shopifyIntegration:
-      'DeoDap lists apps on the Shopify App Store, but Trademart has not verified what they write into Shopify. DeoDap products reach Shopify through the Trademart CSV import instead.',
     searchProducts:
-      'DeoDap has no documented catalogue API. Download a product CSV from DeoDap and import it on the DeoDap import page.',
+      "Product discovery happens inside DeoDap's own Shopify app (or on DeoDap's website), which pushes products into Shopify. Trademart reads them from Shopify afterwards. A DeoDap product CSV can also be imported on the DeoDap import page.",
     getProduct:
-      'DeoDap has no documented catalogue API. Product details come from the CSV you import.',
+      'DeoDap publishes no catalogue API. Product details are read from Shopify once DeoDap\u2019s app has imported the product.',
     getSupplierCost:
-      'DeoDap has no documented cost API. The DeoDap cost in your CSV is recorded as a manual cost, and uploading a newer price list on the DeoDap cost sync page updates it.',
+      "DeoDap publishes no documented public API, so there is no cost endpoint to call. Use Shopify's cost per item (if DeoDap's app writes it on import), a manual cost, or a DeoDap price list on the cost sync page.",
     getShippingQuote:
-      'DeoDap shipping charges are not available from an API. Include a shipping column in the CSV to record them.',
+      'DeoDap shipping charges are a DeoDap-side value that no public API exposes. Record them with the manual cost, or include a shipping column in a DeoDap file.',
     getInventory:
-      'DeoDap has no live stock feed. Stock in an uploaded price list is shown for information and does not change Shopify stock.',
+      "Stock is kept in Shopify by DeoDap's app, where Trademart reads it. There is no DeoDap stock API.",
     createOrder:
-      'Orders cannot be sent to DeoDap automatically. Place them with DeoDap yourself, then record the DeoDap order number on the DeoDap orders page.',
-    cancelOrder: 'Cancel DeoDap orders with DeoDap directly.',
-    getOrder: 'DeoDap order status is recorded by hand on the DeoDap orders page.',
+      "DeoDap fulfils Shopify orders through its own Shopify app; there is no public order API for Trademart to call. Products imported through Trademart's CSV import are not known to that app, so their orders are placed by hand and recorded on the DeoDap orders page.",
+    cancelOrder: "Cancel with DeoDap, in DeoDap's app or with DeoDap directly.",
+    getOrder:
+      'Progress is read from the Shopify order that DeoDap\u2019s app updates. There is no DeoDap order API.',
     getTracking:
-      'Enter DeoDap tracking details on the DeoDap orders page. Trademart does not send them to Shopify yet, so fulfil the order in Shopify with the same tracking number.',
+      "DeoDap's app adds tracking to the Shopify order when it ships, and Trademart reads it from there. There is no DeoDap tracking API.",
   },
 
   identifyProduct(signals: ProductIdentitySignals): boolean {

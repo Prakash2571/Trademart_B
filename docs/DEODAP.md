@@ -1,107 +1,131 @@
 # DeoDap
 
-DeoDap is an Indian wholesale and dropshipping supplier. This integration lets Trademart
-recognise DeoDap products, import them into Shopify from a DeoDap product file, keep
-their supplier costs current, and track the orders placed with DeoDap.
+DeoDap is an Indian wholesale and dropshipping supplier. Trademart works with it the same
+way it works with Tradelle. DeoDap has no public API, so **Trademart never calls DeoDap**.
+Instead, DeoDap's own Shopify app is the bridge:
 
-**Nothing is sent to DeoDap automatically.** DeoDap has not published an API that could
-be verified, so Trademart does not call one. The flows below use files you upload and
-details you record. Where an API client would plug in is described at the end.
+```
+Trademart -> Shopify API -> Shopify store -> DeoDap Shopify app -> DeoDap fulfilment
+```
 
-## What works today
+DeoDap's app brings products into Shopify and picks up the Shopify orders for them.
+Trademart manages those products and watches the orders move, all through Shopify.
+
+## The two order flows
+
+Set on the DeoDap page (`orderFlow` in the DeoDap settings):
+
+| Flow | Who sends orders to DeoDap | What Trademart does |
+| --- | --- | --- |
+| **`SHOPIFY_APP`** (default, the Tradelle model) | DeoDap's Shopify app, for the products it imported | Shows each order's progress and tracking from Shopify, and flags orders that have not been dispatched within the dropshipping processing SLA |
+| `MANUAL` | You, on DeoDap | Flags orders not yet placed; you record DeoDap's order number, status and tracking |
+
+Products created by Trademart's **CSV import** are unknown to DeoDap's app, so their
+orders are always treated as manual, whichever flow is set. The import page and the
+orders page both say so.
+
+## What Trademart does with DeoDap
 
 | Feature | How |
 | --- | --- |
-| Recognise DeoDap products | Vendor or tag "DeoDap", or a SKU prefix you configure |
-| Store your DeoDap login or API key | Encrypted with `TOKEN_ENCRYPTION_KEY`, never returned by any route |
-| Import products | Upload a DeoDap CSV, preview the prices, create Shopify **drafts** |
-| Record supplier costs | Each imported variant's DeoDap cost becomes its manual cost |
-| Update costs | Upload a newer price list; changed costs are shown before anything is saved |
-| Orders | List Shopify orders with DeoDap products; record the DeoDap order number, status and tracking |
+| Recognise DeoDap products and order lines | Vendor, tag or fulfillment service containing "DeoDap", or a SKU prefix you configure. Never the title. |
+| Manage products | Prices, publishing, the review queue and automation all work through Shopify. Automation can target DeoDap products with the vendor or tag selection. |
+| Costs | Shopify's cost per item (if DeoDap's app writes it). Otherwise a manual cost, or for CSV-imported products a DeoDap price list. |
+| Orders | `/suppliers/deodap/orders` lists orders with DeoDap products, with Shopify's progress and tracking, and flags what needs you. |
+| Research | Candidates can be recorded as researched on DeoDap and verified as available in DeoDap, as for Tradelle. |
+| DeoDap account (optional) | Stored encrypted with `TOKEN_ENCRYPTION_KEY` and never returned. It is unused until DeoDap offers an API. |
+| CSV import and cost sync | For products you bring in from a DeoDap file instead of through the app. |
 
-Not available until DeoDap provides an API: catalogue search, live stock, automatic
-order placement, and automatic tracking. Tracking recorded in Trademart is **not** pushed
-to Shopify yet, so fulfil the order in Shopify with the same tracking number.
+## Setting it up
 
-## Using it
+1. Install DeoDap's app from the Shopify App Store and import products through it.
+2. Open an imported product in Trademart's Products page. If it does not show as
+   **DEODAP**, check what the app wrote. If the vendor and tags don't mention DeoDap,
+   add the app's SKU prefix on the DeoDap page, or bulk-add the tag `DeoDap` in Shopify.
+3. Place a test order and confirm DeoDap's app picks it up. Then check that tracking
+   appears on the Shopify order when DeoDap ships.
+4. If DeoDap's app keeps prices or stock updated in Shopify, don't also change them from
+   Trademart, or the app's next update will overwrite them. Exclude DeoDap products
+   from price automation with the selection rules.
 
-1. **Settings** (`/suppliers/deodap` in the console). Currency DeoDap charges in (INR),
-   default markup and rounding, the vendor name to write on imported products, and any
-   SKU prefixes that identify DeoDap products.
-2. **Import** (`/suppliers/deodap/import`). Choose a DeoDap CSV. Both a flat file (one
-   row per product) and a Shopify-style export (rows grouped by `Handle`, variants via
-   `Option1 Value`, extra image rows) are read. Check the column mapping. The DeoDap cost
-   column matters most; a column called just "Price" is used only as a flagged guess.
-   Choose the products and import them. They are created as drafts with the DeoDap tag
-   and appear in the review queue.
-3. **Cost sync** (`/suppliers/deodap/sync`). Upload a newer price list. Rows are matched
-   to imported products by product reference, then SKU. Pick the changes to save. Only
-   Trademart's recorded supplier cost changes. The Shopify selling price does not.
-4. **Orders** (`/suppliers/deodap/orders`). Orders that still need placing with DeoDap
-   are flagged. Place the order with DeoDap, then record the DeoDap order number, and
-   later the tracking details.
+## Without the app: file-based flow
+
+1. **Import** (`/suppliers/deodap/import`). Choose a DeoDap CSV. Two shapes are read:
+   - a flat file, with one row per product;
+   - a Shopify-style export, with rows grouped by `Handle`, variants via
+     `Option1 Value`, and extra image rows.
+
+   Check the column mapping. The DeoDap cost column matters most, and a column called
+   just "Price" is used only as a flagged guess. Products are created as drafts with the
+   DeoDap tag.
+2. **Cost sync** (`/suppliers/deodap/sync`). Upload a newer price list to update the
+   recorded costs of products imported this way. Shopify selling prices are not changed.
+3. **Orders.** Place each order with DeoDap, then record DeoDap's order number and
+   tracking. Tracking recorded in Trademart is not pushed to Shopify: fulfil the order
+   in Shopify with the same number. The orders page flags it until you do.
 
 ## How the pieces fit
 
 ```
 src/suppliers/deodap/
   deodap.identify.ts     pure  vendor / tag / fulfillment service / SKU prefix evidence
-  deodap.provider.ts     pure  SupplierProvider: identification only, every gap explained
+  deodap.provider.ts     pure  SupplierProvider: identification + Shopify bridge, like Tradelle
   deodap.api.ts          pure  the API seam: DeodapApiClient contract, returns null today
-  deodap.settings.ts     pure  settings + credential validation, masking
+  deodap.settings.ts     pure  order flow, settings + credential validation, masking
   deodap.csv.ts          pure  RFC 4180 CSV reader
   deodap.description.ts  pure  storefront-safe description HTML
   deodap.catalog.ts      pure  column mapping, rows to products, blocking issues
   deodap.pricing.ts      pure  markup / MRP pricing through common/money
   deodap.import.ts       pure  preview, drafts, import batch validation
   deodap.sync.ts         pure  price list vs import ledger
-  deodap.orders.ts       pure  DeoDap lines, supplier cost, what needs placing
+  deodap.orders.ts       pure  DeoDap lines, route per line, progress + attention
   deodap.service.ts            MongoDB, Shopify, encryption
   deodap.controller.ts         routes under /api/suppliers/deodap
+src/intelligence/providers/deodap.provider.ts   research source, every capability false
 ```
 
-Collections:
+Order progress uses `resolveShipment` from the dropshipping module, and "late" uses the
+dropshipping SLA settings. So the DeoDap orders page and the dropshipping dashboard
+always agree about an order.
 
-- `supplier_connections`: one per shop and provider. Settings, plus encrypted credentials.
-- `supplier_imports`: the import ledger. There is one row per DeoDap product, with a
-  unique index on `(shopDomain, provider, refKey)`. The import inserts a `CLAIMED` row
-  **before** its first Shopify write, so two imports of one product cannot both proceed.
-- `supplier_orders`: one per Shopify order. Holds DeoDap's order number, status and
+### Collections
+
+- **`supplier_connections`**: one per shop and provider. Holds the settings and the
+  encrypted credentials.
+- **`supplier_imports`**: the CSV import ledger, one row per product, with a unique index
+  on `(shopDomain, provider, refKey)`. The row is claimed **before** the first Shopify
+  write.
+- **`supplier_orders`**: one per Shopify order. Holds DeoDap's order number, status and
   tracking. No customer data.
 
-Costs are stored where every other manual cost is (`supplier_products`, `costSource:
-MANUAL`, `provider: DEODAP`), so pricing, automation and the dropshipping view use them
-without any DeoDap-specific code.
+Costs are stored where every other manual cost is: `supplier_products`, with
+`costSource: MANUAL` and `provider: DEODAP`.
 
 ## Safety properties
 
-- Every product is created as a **DRAFT**. Publishing stays in the review queue.
-- A missing or unreadable cost blocks a product. Nothing is ever priced from zero.
-- A selling price below the DeoDap cost is refused.
-- An import batch (max 10 products) is validated in full before the first Shopify
-  write. `Idempotency-Key` replays a lost response. The ledger claim and a Shopify SKU
-  check stop duplicates across retries.
-- Descriptions are sanitised. Scripts, event handlers and `javascript:` addresses are
-  removed, and links are dropped so the supplier's site is not advertised. Images are
-  kept only with an https `src`.
-- The store currency must match the DeoDap cost currency. Trademart does not convert.
-- Credentials are validated without echoing them, encrypted with AES-256-GCM, and never
-  logged, audited or returned. The UI and audit trail see only the kind, your label and
-  a masked identifier.
-- Every route requires an operator, reads included.
+- **Imports:**
+  - Every product is created as a **DRAFT**.
+  - A missing or unreadable cost blocks a product. A price below the DeoDap cost is refused.
+  - An import batch is validated in full before the first Shopify write.
+  - `Idempotency-Key`, the ledger claim and a Shopify SKU check stop duplicates.
+- **Orders:** an order DeoDap's app never picks up still surfaces, because it breaches the
+  processing SLA. That includes cash-on-delivery orders, which the paid-only dashboard
+  SLA would miss.
+- **Descriptions** are sanitised: no scripts, event handlers, `javascript:` or links.
+- **Currency:** the store currency must match the DeoDap currency. Trademart does not convert.
+- **Credentials:** encrypted with AES-256-GCM, and never logged, audited or returned.
+- **Access:** every route requires an operator, reads included.
 
-## Adding the DeoDap API later
+## Adding a DeoDap API later
 
-When DeoDap provides API documentation and access:
+If DeoDap provides API documentation and access:
 
-1. Implement `DeodapApiClient` in `deodap.api.ts` against the documented endpoints, and
-   return it from `createDeodapApiClient()`. Decrypt credentials with
+1. Implement `DeodapApiClient` in `deodap.api.ts` and return it from
+   `createDeodapApiClient()`. Decrypt credentials with
    `decryptSecret(row.credentialsEncrypted, decodeEncryptionKey(TOKEN_ENCRYPTION_KEY))`.
-2. Set `DEODAP_API_AVAILABILITY.available` to `true`, and flip the capabilities it
-   really supports in `deodap.provider.ts`. Keep a limitation for anything it does not.
-3. Stock and cost: feed `getStock()` results into `planCostSync()`, the same planner the
-   CSV sync uses.
-4. Orders: build a `DeodapOrderRequest` from `extractDeodapLines()`. Read the shipping
-   address from Shopify at the moment of placing, and do not store it. Write the result
-   to `supplier_orders` with `placedVia: API`.
-5. Add the routes to `docs/ROUTE_SECURITY.md` (the route inventory test enforces it).
+2. Set `DEODAP_API_AVAILABILITY.available` to `true`. Flip only the capabilities it
+   really supports, in `deodap.provider.ts` and `intelligence/providers/deodap.provider.ts`.
+3. Feed `getStock()` into `planCostSync()`. Place orders from `extractDeodapLines()`,
+   reading the address from Shopify at that moment and never storing it. Record the
+   result with `placedVia: API`.
+4. List new routes in `docs/ROUTE_SECURITY.md`. The route inventory test enforces this.

@@ -12,6 +12,7 @@ import { describe, it } from 'node:test';
 import { AppError } from '../../common/errors';
 import { readCatalog } from './deodap.catalog';
 import {
+  APP_FLOW_IMPORT_WARNING,
   MAX_IMPORT_BATCH,
   buildImportPreview,
   matchCreatedVariants,
@@ -25,7 +26,7 @@ import {
   type ImportDraft,
   type ImportItemResult,
 } from './deodap.import';
-import { defaultDeodapSettings } from './deodap.settings';
+import { defaultDeodapSettings, type DeodapOrderFlow } from './deodap.settings';
 
 const CSV = [
   'Product Name,SKU,Dropship Price,MRP,Image',
@@ -41,6 +42,7 @@ function isValidationError(error: unknown): boolean {
 function preview(
   existing: ReadonlyMap<string, ExistingImport> = new Map(),
   shopCurrency: string | null = 'INR',
+  orderFlow: DeodapOrderFlow = 'MANUAL',
 ) {
   const settings = defaultDeodapSettings();
   const request = validateImportPreviewRequest(
@@ -51,6 +53,7 @@ function preview(
     catalog: readCatalog(request.csv, request.mapping),
     request,
     vendor: settings.vendorName,
+    orderFlow,
     existing,
     ledgerChecked: true,
     shopCurrency,
@@ -110,6 +113,14 @@ describe('buildImportPreview', () => {
   it('reports a store in another currency as blocking', () => {
     assert.match(preview(new Map(), 'GBP').currencyProblem ?? '', /GBP/);
     assert.equal(preview(new Map(), 'INR').currencyProblem, null);
+  });
+
+  it('warns first, while DeoDap\u2019s app places orders, that it will not know these products', () => {
+    const appFlow = preview(new Map(), 'INR', 'SHOPIFY_APP');
+    assert.equal(appFlow.orderFlow, 'SHOPIFY_APP');
+    assert.equal(appFlow.warnings[0], APP_FLOW_IMPORT_WARNING);
+    assert.match(APP_FLOW_IMPORT_WARNING, /NOT sent to DeoDap automatically/);
+    assert.ok(!preview().warnings.includes(APP_FLOW_IMPORT_WARNING));
   });
 
   it('keeps only the file name of the upload', () => {

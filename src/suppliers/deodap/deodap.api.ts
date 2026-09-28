@@ -9,10 +9,14 @@
  * worse, sends a merchant's DeoDap login somewhere it should not go. So nothing in
  * Trademart calls DeoDap today, and the UI says so (DEODAP_API_AVAILABILITY).
  *
- * WHAT IS ALREADY BUILT ON THIS CONTRACT
- * --------------------------------------
- * The working features are fed by files the operator uploads and by what the operator
- * records by hand. Each already goes through the step an API client would feed:
+ * WHAT WORKS WITHOUT ONE
+ * ----------------------
+ * The main route is the one Tradelle uses: DeoDap's own Shopify app imports products
+ * and picks up their orders, and Trademart works through Shopify (deodap.provider.ts,
+ * deodap.orders.ts). No client is needed for that.
+ *
+ * The file-based features are fed by files the operator uploads and by what the
+ * operator records by hand. Each already goes through the step an API client would feed:
  *
  *   catalogue      deodap.catalog.ts turns supplier rows into CatalogProducts, and the
  *                  importer creates Shopify drafts from those. A catalogue API would
@@ -98,7 +102,7 @@ export const DEODAP_API_AVAILABILITY: Readonly<DeodapApiAvailability> = Object.f
   // Shown to the operator, so it says what to do rather than where the code is. The
   // developer's pointer is the header of this file and docs/DEODAP.md.
   reason:
-    'DeoDap has not published an API that Trademart can verify, so nothing is sent to DeoDap automatically. Import products from a DeoDap CSV, update costs from a newer price list, and record DeoDap order numbers and tracking by hand. If DeoDap gives you API access, it can be connected later.',
+    "DeoDap has not published an API that Trademart can verify, so Trademart never calls DeoDap. It works the way Tradelle does: DeoDap's own Shopify app brings products into Shopify and picks up their orders, and Trademart manages those products and watches the orders in Shopify. Without the app, import a DeoDap CSV and record DeoDap order numbers and tracking by hand. If DeoDap gives you API access, it can be connected later.",
 });
 
 /**

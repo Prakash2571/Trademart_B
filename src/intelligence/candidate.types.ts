@@ -49,26 +49,29 @@ export interface SignalGeography {
 /**
  * Where a candidate came from.
  *
- * TRADELLE is listed because the operator researches there, NOT because Trademart
- * has an interface to it. See TradelleProviderMode.
+ * TRADELLE and DEODAP are listed because the operator researches there, NOT because
+ * Trademart has an interface to either. See SupplierBridgeMode.
  */
 export type CandidateSource =
   /** An operator typed it in, from anywhere. */
   | 'MANUAL'
   /** Researched on Tradelle and entered by hand. */
   | 'TRADELLE'
+  /** Researched on DeoDap and entered by hand. */
+  | 'DEODAP'
   /** Derived from the store's own Shopify performance. */
   | 'SHOPIFY_PERFORMANCE'
   | 'GOOGLE_ADS'
   | 'GOOGLE_TRENDS';
 
 /**
- * How Trademart can reach Tradelle, stated honestly.
+ * How Trademart can reach a supplier that works through its own Shopify app - Tradelle
+ * and DeoDap both - stated honestly.
  *
- *   SHOPIFY_BRIDGE          Tradelle pushes products and fulfils orders THROUGH
+ *   SHOPIFY_BRIDGE          the supplier pushes products and fulfils orders THROUGH
  *                           Shopify. This is real and is how production works.
- *   MANUAL                  an operator reads Tradelle and types values in.
- *   DIRECT_API_UNAVAILABLE  there is no documented Tradelle API and none is
+ *   MANUAL                  an operator reads the supplier's site and types values in.
+ *   DIRECT_API_UNAVAILABLE  there is no documented supplier API and none is
  *                           configured. Reported so the UI can say so plainly
  *                           instead of implying an integration exists.
  *
@@ -76,7 +79,13 @@ export type CandidateSource =
  * credentialed interface exists would let the rest of the system start assuming
  * capabilities that are not there.
  */
-export type TradelleProviderMode = 'SHOPIFY_BRIDGE' | 'MANUAL' | 'DIRECT_API_UNAVAILABLE';
+export type SupplierBridgeMode = 'SHOPIFY_BRIDGE' | 'MANUAL' | 'DIRECT_API_UNAVAILABLE';
+
+/** Tradelle's modes. The name predates DeoDap and is kept for existing importers. */
+export type TradelleProviderMode = SupplierBridgeMode;
+
+/** DeoDap's modes: exactly Tradelle's, because it reaches Trademart the same way. */
+export type DeodapProviderMode = SupplierBridgeMode;
 
 /* ===========================================================================
  * Recommendation and status

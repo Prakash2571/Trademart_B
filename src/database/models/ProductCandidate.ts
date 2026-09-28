@@ -199,7 +199,7 @@ const pushIntentSchema = new Schema(
     analyzedInputRevision: { type: Number, default: null },
     supplierProvider: {
       type: String,
-      enum: ['TRADELLE', 'OTHER', 'UNKNOWN'],
+      enum: ['TRADELLE', 'DEODAP', 'OTHER', 'UNKNOWN'],
       default: 'UNKNOWN',
     },
     supplierProductId: { type: String, default: null },
@@ -246,7 +246,7 @@ const supplierInfoSchema = new Schema(
   {
     provider: {
       type: String,
-      enum: ['TRADELLE', 'OTHER', 'UNKNOWN'],
+      enum: ['TRADELLE', 'DEODAP', 'OTHER', 'UNKNOWN'],
       default: 'UNKNOWN',
     },
     supplierProductId: { type: String, default: null },
@@ -296,7 +296,7 @@ const productCandidateSchema = new Schema(
     source: {
       type: String,
       required: true,
-      enum: ['MANUAL', 'TRADELLE', 'SHOPIFY_PERFORMANCE', 'GOOGLE_ADS', 'GOOGLE_TRENDS'],
+      enum: ['MANUAL', 'TRADELLE', 'DEODAP', 'SHOPIFY_PERFORMANCE', 'GOOGLE_ADS', 'GOOGLE_TRENDS'],
       default: 'MANUAL',
     },
     sourceProductId: { type: String, default: null },

@@ -32,6 +32,7 @@ import { SupplierImportModel } from '../../database/models/SupplierImport';
 import { SupplierOrderModel } from '../../database/models/SupplierOrder';
 import { SupplierProductModel } from '../../database/models/SupplierProduct';
 import { getDatabaseStatus } from '../../database/mongo';
+import { loadSettings as loadDropshipSettings } from '../../dropshipping/dropshipping.settings.service';
 import {
   createProduct,
   type ProductCreateResult,
@@ -70,6 +71,7 @@ import {
   stageTimestamps,
   validateForwardingUpdate,
   type DeodapLineMatch,
+  type DeodapOrderContext,
   type DeodapOrderStatus,
   type DeodapOrderView,
   type ForwardingRecord,
@@ -80,6 +82,7 @@ import {
   validateDeodapCredentials,
   validateDeodapSettings,
   type DeodapCredentialKind,
+  type DeodapOrderFlow,
   type DeodapSettings,
 } from './deodap.settings';
 import {
@@ -519,6 +522,7 @@ export async function previewDeodapImport(body: Record<string, unknown>): Promis
     catalog,
     request,
     vendor: settings.vendorName,
+    orderFlow: settings.orderFlow,
     existing,
     ledgerChecked,
     shopCurrency,
@@ -973,9 +977,16 @@ export async function previewDeodapSync(body: Record<string, unknown>): Promise<
   const plan = planCostSync(catalog.products, ledger, await loadStoredCosts(ledger), request.currencyCode);
 
   const warnings = [...catalog.warnings];
+  if (settings.orderFlow === 'SHOPIFY_APP') {
+    // The ledger only knows what Trademart created. Products DeoDap's app imported are
+    // not in it, so a price list cannot be matched to them here.
+    warnings.push(
+      "Only products imported through Trademart's CSV import are matched. Products DeoDap's Shopify app imported take their cost from Shopify's cost per item (if the app fills it in) or from a manual cost on the product page.",
+    );
+  }
   if (ledger.length === 0) {
     warnings.push(
-      'Nothing has been imported from DeoDap yet, so there is nothing to update. Import products first.',
+      'Nothing has been imported from DeoDap through Trademart yet, so there is nothing to update here.',
     );
   }
   return {
@@ -1176,6 +1187,15 @@ function variantIdsOf(orders: readonly OrderDto[]): string[] {
   );
 }
 
+/**
+ * The DeoDap order flow and the dropshipping SLA, so this page judges "late" exactly as
+ * the dropshipping dashboard does. Both degrade to their defaults without a database.
+ */
+async function orderContext(): Promise<DeodapOrderContext> {
+  const [{ settings }, dropshipping] = await Promise.all([loadDeodapSettings(), loadDropshipSettings()]);
+  return { flow: settings.orderFlow, sla: dropshipping.sla, now: new Date() };
+}
+
 export interface DeodapOrdersPage {
   orders: DeodapOrderView[];
   meta: {
@@ -1183,6 +1203,10 @@ export interface DeodapOrdersPage {
     scanned: number;
     /** Of those, how many contain DeoDap products. */
     matched: number;
+    /** How orders reach DeoDap, from the DeoDap settings. */
+    orderFlow: DeodapOrderFlow;
+    /** Hours an order may wait for dispatch before it is flagged. */
+    processingWarningHours: number;
     hasNextPage: boolean;
     endCursor: string | null;
     degraded?: string[];
@@ -1206,9 +1230,10 @@ export async function listDeodapOrders(params: {
     ...(params.query === undefined ? {} : { query: params.query }),
   });
 
+  const context = await orderContext();
   const refs = await loadRefsByVariant(variantIdsOf(page.items));
   const matches = page.items
-    .map((order) => ({ order, match: extractDeodapLines(order, refs) }))
+    .map((order) => ({ order, match: extractDeodapLines(order, refs, context.flow) }))
     .filter((entry) => entry.match.lines.length > 0);
 
   const forwarding = await loadForwarding(matches.map((entry) => entry.order.shopifyOrderId));
@@ -1222,11 +1247,14 @@ export async function listDeodapOrders(params: {
         entry.match,
         forwarding.get(entry.order.shopifyOrderId) ?? null,
         costs,
+        context,
       ),
     ),
     meta: {
       scanned: page.items.length,
       matched: matches.length,
+      orderFlow: context.flow,
+      processingWarningHours: context.sla.processingWarningHours,
       hasNextPage: meta.hasNextPage,
       endCursor: meta.endCursor,
       ...(meta.degraded !== undefined && meta.degraded.length > 0 ? { degraded: meta.degraded } : {}),
@@ -1244,7 +1272,12 @@ export async function updateDeodapOrder(
   requireDatabase('Recording a DeoDap order');
 
   const order = await getOrder(shopifyOrderId);
-  const match = extractDeodapLines(order, await loadRefsByVariant(variantIdsOf([order])));
+  const context = await orderContext();
+  const match = extractDeodapLines(
+    order,
+    await loadRefsByVariant(variantIdsOf([order])),
+    context.flow,
+  );
   if (match.lines.length === 0) {
     throw new AppError(
       'VALIDATION_ERROR',
@@ -1326,5 +1359,6 @@ export async function updateDeodapOrder(
     match,
     saved === null ? null : toForwardingRecord(saved),
     await loadLineCosts(match.lines),
+    context,
   );
 }

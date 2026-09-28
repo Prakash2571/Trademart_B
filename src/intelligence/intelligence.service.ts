@@ -65,7 +65,9 @@ import {
   type SupplierVariantAvailability,
 } from './sourceability';
 import {
+  defaultVerificationProvider,
   validateSupplierVerification,
+  verificationEvidence,
   type SupplierVerificationInput,
 } from './supplier.validation';
 import {
@@ -517,7 +519,7 @@ export interface SupplierVerificationResult {
 }
 
 /**
- * Records an operator's supplier (Tradelle) verification onto a candidate.
+ * Records an operator's supplier (Tradelle or DeoDap) verification onto a candidate.
  *
  * This is the ONLY place `checkedAt` is set to now: it stamps the moment a human actually
  * verified availability, which is what freshness ages from. Opening a page never sets it.
@@ -543,9 +545,11 @@ export async function recordSupplierVerification(
 
   const now = new Date();
   const availability = input.availability ?? 'UNKNOWN';
+  // Unstated, the supplier is where the candidate was researched (DeoDap), else Tradelle.
+  const provider = input.provider ?? defaultVerificationProvider(existing.source);
 
   const supplier: SupplierInfo = {
-    provider: input.provider ?? 'TRADELLE',
+    provider,
     supplierProductId: nullableTrim(input.supplierProductId),
     sourceUrl: nullableTrim(input.sourceUrl),
     availability,
@@ -576,7 +580,7 @@ export async function recordSupplierVerification(
       }),
     ),
     evidence: [
-      { source: 'MANUAL_VERIFICATION', value: 'Operator verified availability in Tradelle' },
+      { source: 'MANUAL_VERIFICATION', value: verificationEvidence(provider) },
       ...(nullableTrim(input.sourceUrl) === null
         ? []
         : [{ source: 'SUPPLIER_URL', value: nullableTrim(input.sourceUrl) as string }]),

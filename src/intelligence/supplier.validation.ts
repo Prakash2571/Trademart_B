@@ -1,5 +1,5 @@
 /**
- * Validating an operator's supplier (Tradelle) verification.
+ * Validating an operator's supplier (Tradelle or DeoDap) verification.
  *
  * PURE, and separate from intelligence.service.ts for the usual reason: that module imports
  * the config singleton, which calls process.exit(1) at import, so nothing in it can be unit
@@ -15,10 +15,35 @@
  */
 
 import { isExplicitCurrencyCode } from '../common/money';
+import type { CandidateSource } from './candidate.types';
 import type {
   SupplierAvailability,
   SupplierProvider,
 } from './sourceability';
+
+/**
+ * The supplier a verification is for when the operator did not say.
+ *
+ * Where the candidate was researched, when that is DeoDap; otherwise Tradelle, which was
+ * the only supplier before DeoDap and so is what an existing caller means.
+ */
+export function defaultVerificationProvider(source: CandidateSource): SupplierProvider {
+  return source === 'DEODAP' ? 'DEODAP' : 'TRADELLE';
+}
+
+/** How the verification evidence names where the operator looked. */
+export function verificationEvidence(provider: SupplierProvider): string {
+  switch (provider) {
+    case 'TRADELLE':
+      return 'Operator verified availability in Tradelle';
+    case 'DEODAP':
+      return 'Operator verified availability in DeoDap';
+    case 'OTHER':
+    case 'UNKNOWN':
+    default:
+      return 'Operator verified availability with the supplier';
+  }
+}
 
 /** One variant's availability, as submitted by the operator. */
 export interface SupplierVariantInput {
@@ -48,7 +73,7 @@ export interface SupplierVerificationInput {
   note?: string | null;
 }
 
-const PROVIDERS: readonly SupplierProvider[] = ['TRADELLE', 'OTHER', 'UNKNOWN'];
+const PROVIDERS: readonly SupplierProvider[] = ['TRADELLE', 'DEODAP', 'OTHER', 'UNKNOWN'];
 const AVAILABILITIES: readonly SupplierAvailability[] = ['AVAILABLE', 'UNAVAILABLE', 'UNKNOWN'];
 
 const MAX_URL = 2048;

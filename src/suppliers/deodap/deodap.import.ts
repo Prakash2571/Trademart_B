@@ -44,7 +44,11 @@ import {
   resolvePricingRule,
   type PricingRule,
 } from './deodap.pricing';
-import { validateCurrencyCode, type DeodapSettings } from './deodap.settings';
+import {
+  validateCurrencyCode,
+  type DeodapOrderFlow,
+  type DeodapSettings,
+} from './deodap.settings';
 
 /** Products per import request. Each costs two or three Shopify calls. */
 export const MAX_IMPORT_BATCH = 10;
@@ -243,6 +247,8 @@ export interface ImportPreview {
   pricing: PricingRule;
   currencyCode: string;
   vendor: string;
+  /** How orders reach DeoDap. SHOPIFY_APP means products created here need manual orders. */
+  orderFlow: DeodapOrderFlow;
   shopCurrency: string | null;
   /** When set, nothing may be imported: prices would be in the wrong currency. */
   currencyProblem: string | null;
@@ -284,10 +290,19 @@ export function currencyProblemFor(shopCurrency: string | null, costCurrency: st
   return `Your Shopify store sells in ${shopCurrency}, but the DeoDap costs are in ${costCurrency}. Selling prices are worked out from the costs, so they would be in the wrong currency. Change the DeoDap currency if the file is in ${shopCurrency}; Trademart does not convert currencies.`;
 }
 
+/**
+ * Said on every preview while DeoDap's Shopify app is the order route. A product this
+ * importer creates is unknown to that app, so the app will not send its orders to
+ * DeoDap - which is easy to miss, and costs a customer their order when it is.
+ */
+export const APP_FLOW_IMPORT_WARNING =
+  "Orders are set to go to DeoDap through DeoDap's Shopify app, but the app does not know about products created here. Orders for them are NOT sent to DeoDap automatically: you place them yourself on the DeoDap orders page. To have DeoDap's app handle a product, import it through DeoDap's app instead.";
+
 export function buildImportPreview(input: {
   catalog: Catalog;
   request: ImportPreviewRequest;
   vendor: string;
+  orderFlow: DeodapOrderFlow;
   existing: ReadonlyMap<string, ExistingImport>;
   ledgerChecked: boolean;
   shopCurrency: string | null;
@@ -395,7 +410,8 @@ export function buildImportPreview(input: {
     };
   });
 
-  const warnings = [...catalog.warnings];
+  const warnings = input.orderFlow === 'SHOPIFY_APP' ? [APP_FLOW_IMPORT_WARNING] : [];
+  warnings.push(...catalog.warnings);
   if (!input.ledgerChecked) {
     warnings.push(
       'MongoDB is not connected, so Trademart could not check which products were already imported. Importing needs the database.',
@@ -419,6 +435,7 @@ export function buildImportPreview(input: {
     pricing,
     currencyCode: request.currencyCode,
     vendor,
+    orderFlow: input.orderFlow,
     shopCurrency: input.shopCurrency,
     currencyProblem: currencyProblemFor(input.shopCurrency, request.currencyCode),
     ledgerChecked: input.ledgerChecked,

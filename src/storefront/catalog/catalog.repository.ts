@@ -71,7 +71,7 @@ export async function loadCatalogEvidenceByProductIds(
 function toSupplierInfo(raw: unknown): SupplierInfo | null {
   if (!isObject(raw)) return null;
   return {
-    provider: enumValue(raw['provider'], ['TRADELLE', 'OTHER', 'UNKNOWN'], 'UNKNOWN'),
+    provider: enumValue(raw['provider'], ['TRADELLE', 'DEODAP', 'OTHER', 'UNKNOWN'], 'UNKNOWN'),
     supplierProductId: nullableString(raw['supplierProductId']),
     sourceUrl: nullableString(raw['sourceUrl']),
     availability: enumValue(

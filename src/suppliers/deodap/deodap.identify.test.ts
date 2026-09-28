@@ -19,6 +19,7 @@ import {
   setDeodapSkuPrefixes,
 } from './deodap.identify';
 import { deodapProvider } from './deodap.provider';
+import { tradelleProvider } from '../tradelle/tradelle.provider';
 
 describe('collectDeodapEvidence', () => {
   it('matches the vendor the importer writes', () => {
@@ -114,11 +115,17 @@ describe('deodapProvider', () => {
     assert.ok(providers.some((provider) => provider.providerName === 'DEODAP'));
   });
 
-  it('declares identification and nothing else', () => {
+  it('declares exactly what Tradelle declares: identification and the Shopify bridge', () => {
     const enabled = (Object.keys(deodapProvider.capabilities) as (keyof SupplierCapabilities)[]).filter(
       (key) => deodapProvider.capabilities[key],
     );
-    assert.deepEqual(enabled, ['identifyProduct']);
+    assert.deepEqual(enabled, ['identifyProduct', 'shopifyIntegration']);
+    assert.deepEqual(deodapProvider.capabilities, tradelleProvider.capabilities);
+  });
+
+  it('points order handling at DeoDap\u2019s Shopify app, and calls no API', () => {
+    assert.match(deodapProvider.limitations?.createOrder ?? '', /Shopify app/);
+    assert.match(deodapProvider.limitations?.getTracking ?? '', /Shopify order/);
   });
 
   it('explains every capability it does not have', () => {

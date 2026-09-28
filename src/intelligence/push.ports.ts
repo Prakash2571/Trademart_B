@@ -192,7 +192,7 @@ export interface CostRequest {
   supplierProductCost: number;
   supplierShippingCost: number | null;
   currencyCode: string;
-  provider: 'TRADELLE' | 'OTHER' | 'UNKNOWN';
+  provider: 'TRADELLE' | 'DEODAP' | 'OTHER' | 'UNKNOWN';
   note: string;
 }
 

@@ -182,7 +182,8 @@ MongoDB. They are POSTs only because a file does not fit in a query string. The 
 routes that do write in bulk - `import` (Shopify DRAFT products) and `sync` (recorded
 supplier costs) - honour `Idempotency-Key` and refuse outright without the database.
 Nothing on this surface calls DeoDap: there is no DeoDap API yet
-(`src/suppliers/deodap/deodap.api.ts`).
+(`src/suppliers/deodap/deodap.api.ts`). DeoDap orders reach DeoDap through DeoDap's own
+Shopify app, as Tradelle's do, and the `orders` read only reports what Shopify shows.
 
 ## Changes made in hardening pass 2
 
