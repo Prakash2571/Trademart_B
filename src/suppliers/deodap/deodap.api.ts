@@ -95,8 +95,10 @@ export interface DeodapApiAvailability {
 /** Whether anything in Trademart can call DeoDap. Shown on the DeoDap page. */
 export const DEODAP_API_AVAILABILITY: Readonly<DeodapApiAvailability> = Object.freeze({
   available: false,
+  // Shown to the operator, so it says what to do rather than where the code is. The
+  // developer's pointer is the header of this file and docs/DEODAP.md.
   reason:
-    'DeoDap has not published an API that Trademart can verify, so nothing is sent to DeoDap automatically. Import products from a DeoDap CSV, update costs from a newer price list, and record DeoDap order numbers and tracking by hand. When DeoDap provides API access, the client plugs in at src/suppliers/deodap/deodap.api.ts.',
+    'DeoDap has not published an API that Trademart can verify, so nothing is sent to DeoDap automatically. Import products from a DeoDap CSV, update costs from a newer price list, and record DeoDap order numbers and tracking by hand. If DeoDap gives you API access, it can be connected later.',
 });
 
 /**
