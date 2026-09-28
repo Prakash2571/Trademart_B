@@ -20,6 +20,7 @@ import {
   startStorefrontWorkers,
   stopStorefrontWorkers,
 } from './storefront/bootstrap';
+import { applyStoredDeodapSettings } from './suppliers/deodap/deodap.service';
 
 async function main(): Promise<void> {
   await connectDatabase();
@@ -28,6 +29,11 @@ async function main(): Promise<void> {
   // claim are enforced by unique indexes, so they must exist before traffic
   // arrives rather than being built lazily in the background.
   await ensureIndexes();
+
+  // DeoDap SKU prefixes live in MongoDB, but supplier classification is synchronous
+  // and runs inside the Shopify mappers, so they are loaded into memory once here
+  // (and replaced whenever the settings are saved). Never throws.
+  await applyStoredDeodapSettings();
 
   // Wired here rather than inside the queue so the queue carries no domain
   // knowledge and stays testable on its own.

@@ -524,6 +524,15 @@ document and the code disagree.
 | GET | `/api/costs` | List stored manual supplier costs (`?productId=`) |
 | PUT | `/api/costs` | Set a manual cost for a product/variant |
 | DELETE | `/api/costs` | Remove a manual cost (`?productId=&variantId=`) |
+| GET | `/api/suppliers/deodap/status` | DeoDap settings, connection (masked), API availability |
+| PUT | `/api/suppliers/deodap/settings` | SKU prefixes, currency, vendor, import pricing defaults |
+| PUT / DELETE | `/api/suppliers/deodap/credentials` | Store (encrypted) or remove a DeoDap login / API key |
+| POST | `/api/suppliers/deodap/import/preview` | Read and price a DeoDap CSV; writes nothing |
+| POST | `/api/suppliers/deodap/import` | Create up to 10 previewed products as Shopify drafts |
+| GET | `/api/suppliers/deodap/imports` | The DeoDap import ledger |
+| POST | `/api/suppliers/deodap/sync/preview` · `/sync` | Match a newer price list; record chosen cost changes |
+| GET | `/api/suppliers/deodap/orders` | Shopify orders with DeoDap products and what was recorded |
+| PUT | `/api/suppliers/deodap/orders/:id` | Record the DeoDap order number, status and tracking |
 
 ### Error codes
 
@@ -666,6 +675,18 @@ on the store, products classify as `OTHER` or `UNKNOWN`. Once it is, inspect a
 real imported product and extend the markers in
 `src/suppliers/tradelle/tradelle.provider.ts`.
 
+**DeoDap:** products are recognised by the vendor/tag "DeoDap" or a configured SKU
+prefix. DeoDap publishes no verifiable API, so nothing is sent to DeoDap. Instead,
+under `/api/suppliers/deodap`:
+
+- DeoDap credentials are stored encrypted with `TOKEN_ENCRYPTION_KEY`.
+- A DeoDap CSV is imported as Shopify **drafts**, with the DeoDap cost recorded per
+  variant.
+- A newer price list updates those costs.
+- DeoDap order numbers and tracking are recorded against Shopify orders.
+
+See [docs/DEODAP.md](docs/DEODAP.md), including where an API client plugs in.
+
 ---
 
 ## Webhooks
@@ -763,7 +784,8 @@ src/
 ├── analytics/             real-data aggregates + honest unavailability
 ├── pricing/               standalone margin engine
 ├── suppliers/             SupplierProvider + registry
-│   └── tradelle/
+│   ├── tradelle/
+│   └── deodap/            identification, CSV import, cost sync, order records
 ├── webhooks/              HMAC verification, receiver, registration
 ├── database/              Mongo connection + models
 ├── integrations/          shopify (done), meta + google (placeholders only)
@@ -806,7 +828,8 @@ src/
 
 ## Not implemented (intentionally)
 
-Direct Tradelle API · Meta/Google Ads · automated campaigns ·
+Direct Tradelle API · a DeoDap API client (DeoDap is file-based, see
+[docs/DEODAP.md](docs/DEODAP.md)) · Meta/Google Ads · automated campaigns ·
 automatic supplier ordering · payment processing · multi-tenant architecture ·
 subscription billing · microservices · Kafka · Redis · Kubernetes · queues ·
 AI recommendations · production deployment.

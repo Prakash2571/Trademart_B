@@ -14,7 +14,7 @@ const supplierProductSchema = new Schema(
     provider: {
       type: String,
       required: true,
-      enum: ['TRADELLE', 'OTHER', 'UNKNOWN'],
+      enum: ['TRADELLE', 'DEODAP', 'OTHER', 'UNKNOWN'],
       default: 'UNKNOWN',
     },
     shopifyProductId: { type: String, required: true, index: true },
